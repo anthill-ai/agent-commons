@@ -2737,7 +2737,7 @@ const COMMANDS: Record<string, Command> = {
       "api-port": { type: "string", help: "coordinator API port (default port + 1)" },
       "one-port": { type: "boolean", help: "with --coordinator: serve the API and the playground together on --port (a hosted service has one port)" },
       "loop-seconds": { type: "string", help: "with --coordinator: run a coordinator pass this often (default: never)" },
-      "trusted-proxy": { type: "list", help: "address (or IPv4 range, 10.0.0.0/8) of a reverse proxy in front of the API (repeatable); only its X-Forwarded-For is believed" },
+      "trusted-proxy": { type: "list", help: "address (or IPv4 range, 10.0.0.0/8, or cloudflare for Cloudflare's ranges) of a reverse proxy in front of the API (repeatable); only its X-Forwarded-For is believed" },
     },
     async (ctx) => {
       const f = ctx.flags;

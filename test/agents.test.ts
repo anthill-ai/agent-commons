@@ -263,6 +263,57 @@ test("trusted proxies: exact addresses and IPv4 ranges, IPv4-mapped peers includ
   assert.throws(() => proxyMatcher(["10.0.0.0/33"]));
   assert.throws(() => proxyMatcher(["10.0.0/8"]));
   assert.throws(() => proxyMatcher(["300.0.0.0/8"]));
+  // A Cloudflare edge that appends its own hop: its ranges, IPv4 and IPv6.
+  const cf = proxyMatcher(["10.0.0.0/8", "cloudflare"]);
+  assert.ok(cf("172.70.1.2"));
+  assert.ok(cf("::ffff:162.158.3.4"));
+  assert.ok(cf("2606:4700::1"));
+  assert.ok(!cf("203.0.113.9"));
+  assert.ok(!cf("2001:db8::1"));
+  assert.ok(!m("172.70.1.2"), "only when named");
+});
+
+test("behind a proxy, a Cloudflare hop is skipped only when trusted, and the first request logs the header's shape", async () => {
+  const shapes: string[] = [];
+  const original = console.error;
+  console.error = (...a: unknown[]) => void shapes.push(a.join(" "));
+  const servers: CoordinatorServer[] = [];
+  try {
+    const count = async (trustedProxies: string[]) => {
+      const dir = tmp("cf");
+      const coord = generateKeyPair();
+      const ledgerPath = path.join(dir, "ledger.jsonl");
+      Ledger.create(ledgerPath, { kind: "genesis", project: "p", admins: [generateKeyPair().publicKey], coordinator: coord.publicKey, rules: defaultRules() }, nowIso());
+      const server = createCoordinatorServer({
+        ledgerPath,
+        coordinatorKey: coord,
+        clock: nowIso,
+        patchesDir: path.join(dir, "patches"),
+        policy: { submitCredits: () => 1, prSlots: () => 1, claimStake: () => 1 },
+        limits: { ipRatePerMinute: 1 },
+        trustedProxies,
+      });
+      servers.push(server);
+      await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+      const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/head`;
+      const statuses: number[] = [];
+      // Two clients behind one Cloudflare edge address.
+      for (const client of ["203.0.113.9", "198.51.100.7"]) {
+        statuses.push((await fetch(url, { headers: { "X-Forwarded-For": `${client}, 172.70.1.2` } })).status);
+      }
+      return statuses;
+    };
+    assert.deepEqual(await count(["127.0.0.1"]), [200, 429], "one budget for everyone at the edge");
+    assert.match(shapes.join("\n"), /client addresses: 2 X-Forwarded-For entries .*Cloudflare edge address.*--trusted-proxy cloudflare/);
+    shapes.length = 0;
+    assert.deepEqual(await count(["127.0.0.1", "cloudflare"]), [200, 200]);
+    assert.match(shapes.join("\n"), /client addresses: 2 X-Forwarded-For entries on the first proxied request, 1 of them trusted/);
+    assert.equal(shapes.filter((l) => l.includes("client addresses")).length, 1, "once");
+    assert.ok(!shapes.join("").includes("203.0.113.9"), "no addresses in the log");
+  } finally {
+    console.error = original;
+    for (const s of servers) await new Promise((r) => s.close(() => r(undefined)));
+  }
 });
 
 // ---------------------------------------------------------------------------

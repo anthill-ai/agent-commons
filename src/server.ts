@@ -68,6 +68,7 @@
 
 import * as fs from "node:fs";
 import * as http from "node:http";
+import { BlockList, isIPv4, isIPv6 } from "node:net";
 import * as path from "node:path";
 import { canonical, isValidPublicKey, keyIdOf, sha256hex, verify } from "./crypto";
 import { parsePatch } from "./github";
@@ -310,9 +311,11 @@ export type CoordinatorServerOptions = {
   fallback?: http.RequestListener;
   // Addresses of reverse proxies in front of this server, exact or as IPv4
   // CIDR ranges (10.0.0.0/8: a hosting provider's load balancers connect from
-  // changing private addresses). A request from one of them is attributed to
-  // the last X-Forwarded-For hop that is not a trusted proxy; from anyone else
-  // the header is ignored.
+  // changing private addresses), or "cloudflare" for Cloudflare's published
+  // ranges (an edge that appends its own hop). A request from one of them is
+  // attributed to the last X-Forwarded-For hop that is not a trusted proxy;
+  // from anyone else the header is ignored. The first proxied request logs
+  // the header's shape once ("client addresses:"), without addresses.
   trustedProxies?: readonly string[];
 };
 
@@ -364,8 +367,13 @@ export function createCoordinatorServer(opts: CoordinatorServerOptions): Coordin
   const trusted = proxyMatcher(opts.trustedProxies ?? []);
   let inFlight = 0;
   const perIp = new Map<string, number>();
+  let loggedShape = false;
   const server = http.createServer((req, res) => {
     const ip = clientAddress(req, trusted);
+    if (!loggedShape && trusted(req.socket.remoteAddress ?? "")) {
+      loggedShape = true;
+      console.error(`coordinator: client addresses: ${forwardedShape(req, trusted)}`);
+    }
     // Anthill's relays (header comment): their own slots per address.
     const anthillWrite = req.method === "POST" && /^\/api\/anthill\/agent(?:-revoke)?(?:\?|$)/.test(req.url ?? "");
     const slot = anthillWrite ? `${ip} anthill-agent` : ip;
@@ -423,10 +431,49 @@ const MAX_BUCKETS = 10_000;
 function clientAddress(req: http.IncomingMessage, trusted: (ip: string) => boolean): string {
   const peer = req.socket.remoteAddress ?? "unknown";
   if (!trusted(peer)) return addressGroup(peer);
-  const header = req.headers["x-forwarded-for"];
-  const hops = (Array.isArray(header) ? header.join(",") : (header ?? "")).split(",").map((h) => h.trim()).filter((h) => h !== "");
+  const hops = forwardedHops(req);
   for (let i = hops.length - 1; i >= 0; i--) if (!trusted(hops[i] as string)) return addressGroup(hops[i] as string);
   return addressGroup(peer);
+}
+
+const forwardedHops = (req: http.IncomingMessage): string[] => {
+  const header = req.headers["x-forwarded-for"];
+  return (Array.isArray(header) ? header.join(",") : (header ?? "")).split(",").map((h) => h.trim()).filter((h) => h !== "");
+};
+
+// What the first proxied request's X-Forwarded-For looked like, for the
+// operator to check the --trusted-proxy setup (README, Hosting). No addresses.
+function forwardedShape(req: http.IncomingMessage, trusted: (ip: string) => boolean): string {
+  const hops = forwardedHops(req);
+  let right = hops.length;
+  while (right > 0 && trusted(hops[right - 1] as string)) right--;
+  const cloudflare = hops.slice(0, right).filter((h) => isCloudflare(h)).length;
+  return (
+    `${hops.length} X-Forwarded-For entries on the first proxied request, ${hops.length - right} of them trusted proxies on the right; ` +
+    (right > 0 && isCloudflare(hops[right - 1] as string)
+      ? "the client is read from a Cloudflare edge address, shared by everyone behind it: add --trusted-proxy cloudflare"
+      : `the client is read from the entry before those${cloudflare > 0 ? ` (${cloudflare} untrusted Cloudflare entries further left)` : ""}`)
+  );
+}
+
+// Cloudflare's published proxy ranges (cloudflare.com/ips), the list
+// anthill-backend's src/http.ts skips too.
+const CLOUDFLARE = new BlockList();
+for (const range of [
+  "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18",
+  "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "198.41.128.0/17",
+  "162.158.0.0/15", "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+  "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32",
+  "2a06:98c0::/29", "2c0f:f248::/32",
+]) {
+  const [address = "", prefix] = range.split("/");
+  CLOUDFLARE.addSubnet(address, Number(prefix), isIPv4(address) ? "ipv4" : "ipv6");
+}
+
+export function isCloudflare(ip: string): boolean {
+  const v4 = /^::ffff:/i.test(ip) && isIPv4(ip.slice(7)) ? ip.slice(7) : ip;
+  if (isIPv4(v4)) return CLOUDFLARE.check(v4, "ipv4");
+  return isIPv6(ip) && CLOUDFLARE.check(ip, "ipv6");
 }
 
 const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
@@ -440,12 +487,18 @@ function ipv4(ip: string): number | null {
 }
 
 // Whether an address is one of `entries`: exact addresses (an IPv4-mapped
-// IPv6 peer matches its IPv4 spelling) or IPv4 CIDR ranges. A malformed range
-// throws at startup rather than trusting nothing (or everything) silently.
+// IPv6 peer matches its IPv4 spelling), IPv4 CIDR ranges, or "cloudflare"
+// (its IPv4 and IPv6 ranges). A malformed range throws at startup rather than
+// trusting nothing (or everything) silently.
 export function proxyMatcher(entries: readonly string[]): (ip: string) => boolean {
   const exact = new Set<string>();
   const ranges: { base: number; mask: number }[] = [];
+  let cloudflare = false;
   for (const e of entries) {
+    if (e === "cloudflare") {
+      cloudflare = true;
+      continue;
+    }
     const cidr = /^([^/]+)\/(\d{1,2})$/.exec(e);
     if (cidr === null) {
       exact.add(e);
@@ -459,6 +512,7 @@ export function proxyMatcher(entries: readonly string[]): (ip: string) => boolea
   }
   return (ip) => {
     if (exact.has(ip)) return true;
+    if (cloudflare && isCloudflare(ip)) return true;
     const v4 = ipv4(ip);
     if (v4 === null) return false;
     if (exact.has(ip.replace(/^::ffff:/i, ""))) return true;
