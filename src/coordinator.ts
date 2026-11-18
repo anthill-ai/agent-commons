@@ -206,6 +206,9 @@ export type PlanOptions = {
   // (a majority at p >= CATCH_THRESHOLD), which still needs one. In every phase
   // a reproduced finding pays, slashes and records an escape only once an
   // operator confirmed it (findingDecision), and blocks until one decided.
+  // Used only when the rules leave humanMergeApproval out (every ledger before
+  // it existed): when the ledger's rules name it, they decide, so the ledger
+  // says what governed each merge and no flag can loosen it.
   phase?: 1 | 2;
   snapshotEvery?: number; // merged, unsnapshotted submissions that trigger a snapshot; absent = never
   // Binding and gates need the patch; while this says false they are not planned.
@@ -317,7 +320,14 @@ export function mergeReadiness(
     else if (status === "pending") waiting.push(`unresolved ${f.severity} finding ${fid}`);
   }
   if (!s.approval) {
-    if ((opts.phase ?? 1) === 1) waiting.push("awaiting human approval (mergeApproval)");
+    // rules.humanMergeApproval "unlessFlagged": any revealed review on the
+    // submission (assigned or open) at p >= CATCH_THRESHOLD sends it to a human.
+    const anyFlag = s.reviews.some((r) => r.verdict !== undefined && r.verdict.defectProbability >= CATCH_THRESHOLD);
+    const rule = state.rules.humanMergeApproval;
+    if (rule === "always") waiting.push("awaiting human approval (mergeApproval; rules.humanMergeApproval always)");
+    else if (rule === "unlessFlagged") {
+      if (anyFlag) waiting.push("a reviewer flagged a defect: awaiting human approval (mergeApproval; rules.humanMergeApproval unlessFlagged)");
+    } else if ((opts.phase ?? 1) === 1) waiting.push("awaiting human approval (mergeApproval)");
     else if (flagged) waiting.push("the assigned reviewers flagged a defect: awaiting human approval (mergeApproval)");
   }
   return { ready: waiting.length === 0, missing, waiting, ...(closeWindow ? { closeWindow } : {}) };

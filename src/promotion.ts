@@ -44,6 +44,7 @@ import { instantMs } from "./plants";
 import { criticalUpperBound90, seededRecall } from "./risk";
 import { verifyAssignment } from "./selection";
 import { ringOf } from "./gates/rings";
+import { isSolo } from "./rules";
 import { findingStatus } from "./findingStatus";
 import type { AgentState, CommonsState, FindingState, SnapshotState } from "./types";
 
@@ -177,6 +178,13 @@ export function evaluatePromotion(state: CommonsState, snapshotId: string, nowIs
   // agent its owner revoked keeps its verdicts: revocation is also routine key
   // rotation, and dropping them would let an owner withdraw vouching for free
   // when the ledger no longer lets anyone replace it.
+  //
+  // Solo (rules.mode "solo"): an agent of the author's owner counts too when
+  // it is not the author and declares another model family (the ledger takes
+  // its review on those terms), and the author's own family counts towards
+  // minModelFamilies: "written by one family, reviewed by another". Owners
+  // still count reviewers' owners only.
+  const solo = isSolo(rules);
   const suspended = new Set(state.honeytokens.map((h) => h.agent));
   for (const a of state.agents.values()) if (a.revokedBy === "coordinator") suspended.add(a.keyId);
   const short: string[] = [];
@@ -185,12 +193,16 @@ export function evaluatePromotion(state: CommonsState, snapshotId: string, nowIs
   for (const x of chain) {
     const attesters = x.attestations.filter((a) => a.verdict !== undefined).map((a) => a.reviewer);
     for (const s of x.submissionIds.flatMap((id) => state.submissions.get(id) ?? [])) {
-      const authorOwner = state.agents.get(s.author)?.owner;
+      const author = state.agents.get(s.author);
+      const authorOwner = author?.owner;
+      const counts = (a: AgentState): boolean =>
+        a.owner !== authorOwner || (solo && author !== undefined && a.keyId !== author.keyId && a.modelFamily !== author.modelFamily);
       const voters = [...s.reviews.filter((r) => r.verdict !== undefined).map((r) => r.reviewer), ...attesters]
         .filter((k) => !suspended.has(k))
         .map((k) => state.agents.get(k))
-        .filter((a): a is AgentState => a !== undefined && a.owner !== authorOwner);
+        .filter((a): a is AgentState => a !== undefined && counts(a));
       const families = new Set(voters.map((a) => a.modelFamily));
+      if (solo && author !== undefined && voters.length > 0) families.add(author.modelFamily);
       const owners = new Set(voters.map((a) => a.owner));
       minFamilies = Math.min(minFamilies, families.size);
       minOwners = Math.min(minOwners, owners.size);
@@ -209,7 +221,7 @@ export function evaluatePromotion(state: CommonsState, snapshotId: string, nowIs
         ? `short: ${short.join("; ")}`
         : subs.length === 0
           ? "no covered submissions"
-          : `${subs.length} covered submissions; fewest families ${minFamilies}, fewest other owners ${minOwners}`) +
+          : `${subs.length} covered submissions; fewest families ${minFamilies}${solo ? " (solo: the author's counted)" : ""}, fewest ${solo ? "reviewing" : "other"} owners ${minOwners}`) +
       missingNote,
   });
 
@@ -238,16 +250,20 @@ export function evaluatePromotion(state: CommonsState, snapshotId: string, nowIs
   // 3 and 4. Seeded recall and the critical bound over the rules' window.
   const since = new Date(now - p.recallWindowDays * DAY_MS).toISOString();
   const recall = seededRecall(state, since);
+  // Solo: shown, not enforced. Every plant is the custodian's owner's work
+  // and that owner's catches never count (plants.ts), so with one owner every
+  // plant reads as missed, and with no plant the critical bound is infinite.
+  const advisory = solo ? "solo test, not enforced: " : "";
   checks.push({
     name: "recall",
-    pass: recall.seeds >= p.minSeeds && recall.lower90 >= p.minRecallLowerBound90,
-    detail: `${recall.caught}/${recall.seeds} revealed plants caught since ${since}, lower90 ${fmt(recall.lower90)} (need >= ${p.minSeeds} seeds and lower90 >= ${p.minRecallLowerBound90})`,
+    pass: solo || (recall.seeds >= p.minSeeds && recall.lower90 >= p.minRecallLowerBound90),
+    detail: `${advisory}${recall.caught}/${recall.seeds} revealed plants caught since ${since}, lower90 ${fmt(recall.lower90)} (need >= ${p.minSeeds} seeds and lower90 >= ${p.minRecallLowerBound90})`,
   });
   const critical = criticalUpperBound90(state, since);
   checks.push({
     name: "criticals",
-    pass: critical < p.maxCriticalUpperBound90,
-    detail: `90% upper bound on undiscovered criticals ${fmt(critical)} (need < ${p.maxCriticalUpperBound90})`,
+    pass: solo || critical < p.maxCriticalUpperBound90,
+    detail: `${advisory}90% upper bound on undiscovered criticals ${fmt(critical)} (need < ${p.maxCriticalUpperBound90})`,
   });
 
   // 5. Open issues, over findings on a covered submission or covered snapshot.
@@ -277,7 +293,8 @@ export function evaluatePromotion(state: CommonsState, snapshotId: string, nowIs
     detail: issues.length === 0 ? "every finding on covered work is resolved and none is a defect" : issues.sort().join("; "),
   });
 
-  // 6. Kernel sign-off. Counted against the current rules: a signer removed by
+  // 6. Kernel sign-off. With kernelSignoffs 0 (solo) it always passes, so no
+  // signer's own ring-0 work can hold main back. Counted against the current rules: a signer removed by
   // a rulesChange no longer counts, nor does one who owns covered work that
   // touches ring 0 (the ledger checked that at signoff time over the same
   // ancestry). A signer's own non-kernel work does not disqualify it.

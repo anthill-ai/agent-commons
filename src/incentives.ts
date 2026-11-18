@@ -74,8 +74,9 @@ export function prSlots(reputation: number): number {
 // Submit credits left for an owner. Each revealed review by any of the owner's
 // agents earns 1 / reviewsPerSubmitCredit of a credit. On a merged submission
 // only a reveal before the merge counts: one held back until the outcome is
-// known did no review work anyone could use. Every owner starts with one free
-// credit, so a newcomer can submit once before reviewing. Each submission by
+// known did no review work anyone could use. Every owner starts with
+// rules.freeSubmitCredits free credits (1 when absent, as on every ledger
+// before the field), so a newcomer can submit before reviewing. Each submission by
 // any of the owner's agents spends one. Attestations do not earn credits. The
 // result can be negative if the ledger holds submissions the server would have
 // refused. Callers allow a submission only at >= 1.
@@ -88,7 +89,7 @@ export function submitCredits(state: CommonsState, owner: OwnerId): number {
       if (revealedInTime(r, s.merged?.seq) && ownerOf(state, r.reviewer) === owner) reviews += 1;
     }
   }
-  return Math.floor(reviews / state.rules.reviewsPerSubmitCredit) + 1 - submissions;
+  return Math.floor(reviews / state.rules.reviewsPerSubmitCredit) + (state.rules.freeSubmitCredits ?? 1) - submissions;
 }
 
 // How a bounty is split among n duplicate findings, in filing order. Weights

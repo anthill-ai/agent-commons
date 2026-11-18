@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { ringOf } from "../src/gates/rings";
 import { clopperPearsonOneSided, poissonUpper } from "../src/risk";
-import { claimStake, defaultRules, globToRegExp, phase1Rules, validateRules } from "../src/rules";
+import { claimStake, defaultRules, globToRegExp, isPresetName, isSolo, phase1Rules, PRESETS, SOLO_NOTICE, soloRules, validateRules } from "../src/rules";
 import type { Ring, Rules } from "../src/types";
 
 function withRules(edit: (r: Rules) => void): string[] {
@@ -413,4 +413,78 @@ test("phase1Rules: ten seeds pass recall and the critical bound only if all ten 
   assert.equal(passes(10, 10), true);
   assert.equal(passes(9, 10), false, "the bounds are wide: one miss in ten fails");
   assert.equal(passes(9, 9), false, "fewer than minSeeds");
+});
+
+// --- solo ---------------------------------------------------------------------
+
+const OPTIONAL = ["mode", "humanMergeApproval", "freeSubmitCredits"];
+
+test("soloRules: valid, Phase 1 plus only what one person needs", () => {
+  const base = defaultRules();
+  base.rings = [{ glob: "src/kernel/**", ring: 0 }, ...base.rings];
+  base.kernelSigners = ["erin"];
+  const r = soloRules(base);
+  assert.deepEqual(validateRules(r), []);
+  assert.equal(r.mode, "solo");
+  assert.ok(isSolo(r));
+  assert.equal(r.requireOtherModelFamily, true);
+  assert.equal(r.assignedReviewers, 1);
+  assert.equal(r.reviewsPerSubmitCredit, 1);
+  assert.equal(r.freeSubmitCredits, 10);
+  assert.equal(r.humanMergeApproval, "unlessFlagged");
+  assert.equal(r.stake.allowance, 2 * claimStake(r.maxLinesPerSubmission, 0, r) + 20 * r.stake.review);
+  assert.deepEqual(
+    { ...r.promotion },
+    { ...phase1Rules(base).promotion, minModelFamilies: 2, minDistinctOwners: 1, minSeeds: 0, minRecallLowerBound90: 0, maxCriticalUpperBound90: 1, kernelSignoffs: 0 },
+  );
+  // Everything else is Phase 1's, and the base's rings, locked paths, families and signers stay.
+  const p = phase1Rules(base);
+  for (const k of ["rings", "lockedPaths", "modelFamilies", "kernelSigners", "minTreeDistance", "plantRate", "rewards", "vesting", "review", "maxLinesPerSubmission"] as const) {
+    assert.deepEqual(r[k], p[k], k);
+  }
+  assert.ok(!Object.hasOwn(base, "mode"), "the base is not mutated");
+  assert.deepEqual(soloRules(r), r, "idempotent");
+  assert.match(SOLO_NOTICE, /^solo test: your own agents review each other$/);
+});
+
+test("phase1Rules and defaultRules carry none of the optional fields; phase1 of a solo set leaves solo entirely", () => {
+  for (const r of [defaultRules(), phase1Rules()]) for (const k of OPTIONAL) assert.equal(Object.hasOwn(r, k), false, k);
+  assert.deepEqual(phase1Rules(soloRules()), phase1Rules());
+  assert.deepEqual(phase1Rules(phase1Rules()), phase1Rules(), "idempotent");
+  assert.deepEqual(Object.keys(PRESETS).sort(), ["phase1", "solo"]);
+  assert.ok(isPresetName("solo") && isPresetName("phase1") && !isPresetName("none") && !isPresetName("constructor"));
+});
+
+test("validateRules: the optional fields, alone and in a solo set", () => {
+  assert.deepEqual(withRules((r) => Object.assign(r, { humanMergeApproval: "always" })), []);
+  assert.deepEqual(withRules((r) => Object.assign(r, { humanMergeApproval: "unlessFlagged", freeSubmitCredits: 3 })), [], "outside solo too");
+  assert.deepEqual(withRules((r) => Object.assign(r, { mode: undefined, humanMergeApproval: undefined })), [], "undefined is absent");
+  rejects((r) => Object.assign(r, { mode: "duo" }), /rules\.mode must be "solo" or absent/);
+  rejects((r) => Object.assign(r, { mode: 1 }), /rules\.mode must be "solo"/);
+  rejects((r) => Object.assign(r, { humanMergeApproval: "sometimes" }), /humanMergeApproval must be/);
+  rejects((r) => Object.assign(r, { freeSubmitCredits: 0 }), /freeSubmitCredits must be an integer >= 1/);
+  rejects((r) => Object.assign(r, { freeSubmitCredits: 1.5 }), /freeSubmitCredits/);
+  rejects((r) => Object.assign(r, { freeSubmitCredits: "10" }), /freeSubmitCredits/);
+  rejects((r) => Object.assign(r, { solo: true }), /rules\.solo is not a known field/);
+});
+
+test("validateRules: a solo set must keep the model-family rule, two families and one reviewing owner", () => {
+  const solo = (edit: (r: Rules) => void) => {
+    const r = soloRules();
+    edit(r);
+    return validateRules(r);
+  };
+  const has = (problems: string[], re: RegExp) => assert.ok(problems.some((p) => re.test(p)), JSON.stringify(problems));
+  has(solo((r) => (r.requireOtherModelFamily = false)), /mode solo needs rules\.requireOtherModelFamily true/);
+  has(solo((r) => (r.promotion.minModelFamilies = 1)), /mode solo needs rules\.promotion\.minModelFamilies >= 2/);
+  has(solo((r) => (r.promotion.minDistinctOwners = 0)), /mode solo needs rules\.promotion\.minDistinctOwners >= 1/);
+  // The same values without mode solo are what they always were: valid.
+  const plain = soloRules();
+  delete plain.mode;
+  plain.requireOtherModelFamily = false;
+  plain.promotion.minModelFamilies = 1;
+  plain.promotion.minDistinctOwners = 0;
+  assert.deepEqual(validateRules(plain), []);
+  // A solo set may be stricter than the preset.
+  assert.deepEqual(solo((r) => Object.assign(r, { humanMergeApproval: "always", assignedReviewers: 2 })), []);
 });

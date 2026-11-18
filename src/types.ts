@@ -295,6 +295,24 @@ export type Rules = {
     kernelSignoffs: number; // k
   };
   kernelSigners: OwnerId[]; // the n
+  // The fields below are optional: every ledger made before they existed
+  // leaves them out, and absent means exactly what those ledgers did.
+  //
+  // "solo" (rules.ts soloRules): one person testing the commons with their
+  // own agents. The author's own owner's agents may review (and file
+  // findings on) its submissions, but only those of another model family
+  // than the author agent, never the author itself; promotion counts the
+  // author's family with its reviewers'; seeded recall is shown, not
+  // enforced. Absent: independent review, the author's owner never reviews.
+  mode?: "solo";
+  // Who decides that a merge needs a human mergeApproval entry. "always":
+  // every merge. "unlessFlagged": none, unless a revealed review on the
+  // submission flags a defect (p >= CATCH_THRESHOLD). Absent: the
+  // coordinator's --phase option (1 = every merge, 2 = a majority flag).
+  humanMergeApproval?: "always" | "unlessFlagged";
+  // Submit credits every owner starts with before reviewing (incentives.
+  // submitCredits). Absent: 1.
+  freeSubmitCredits?: number;
 };
 
 // ---------------------------------------------------------------------------

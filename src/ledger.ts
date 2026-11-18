@@ -42,7 +42,7 @@ import {
 import { MEMBER_ROOT, memberDigest, treeFromParents } from "./members";
 import { commitDeadlineMs, plantCommitment } from "./plants";
 import { assignmentBeacon, type CommitSubject, commitmentFor, validateVerdict } from "./review";
-import { claimStake, validateRules } from "./rules";
+import { claimStake, isSolo, validateRules } from "./rules";
 import type {
   CommonsState,
   EntryBody,
@@ -58,6 +58,7 @@ import type {
   SettlementReason,
   Severity,
   SnapshotState,
+  SubmissionState,
 } from "./types";
 
 export type LedgerErrorCode =
@@ -1064,7 +1065,9 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       for (const r of body.reviewers) {
         const agent = state.agents.get(r);
         if (!agent?.active) return reject("invalid-reviewers", `reviewer ${r} is not an active agent`);
-        if (agent.owner === authorOwner) reject("invalid-reviewers", `reviewer ${r} shares the author's owner`);
+        if (agent.owner === authorOwner && !soloSelfReviewer(s, r)) {
+          reject("invalid-reviewers", `reviewer ${r} shares the author's owner${isSolo(state.rules) ? " and is the author or of the author's model family" : ""}`);
+        }
         // Distinct owners, not just distinct keys: one person running several
         // agents must not fill several review seats.
         if (owners.has(agent.owner)) reject("invalid-reviewers", `owner ${agent.owner} holds two seats`);
@@ -1088,7 +1091,9 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
     case "reviewCommit": {
       const s = submission(body.submissionId);
       if (s.merged) reject("merged", "submission already merged");
-      checkCommit(s.reviews, ownerSet([s.id]), body.commitment, body.stake, reviewCommitsClosedBy(state, s.id, ms));
+      // Solo: an agent of the author's owner of another family reviews too.
+      const authors = soloSelfReviewer(s, signer) ? new Set<OwnerId>() : ownerSet([s.id]);
+      checkCommit(s.reviews, authors, body.commitment, body.stake, reviewCommitsClosedBy(state, s.id, ms));
       // The owner's seat is its assigned agent's: a commit by another of its
       // agents would leave that seat unfillable (one commit per owner). A
       // seated agent since revoked can fill nothing, so it holds nothing.
@@ -1127,7 +1132,9 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       let targetSubmission: string | null = null;
       if (Object.hasOwn(target, "submissionId") && id(target.submissionId)) {
         const s = submission(target.submissionId as string);
-        if (ownerOf(s.author) === ownerOf(signer)) reject("same-owner", "cannot file a finding on your owner's work");
+        if (ownerOf(s.author) === ownerOf(signer) && !soloSelfReviewer(s, signer)) {
+          reject("same-owner", "cannot file a finding on your owner's work");
+        }
         targetSubmission = s.id;
       } else if (Object.hasOwn(target, "snapshotId") && id(target.snapshotId)) {
         const snap = snapshot(target.snapshotId as string);
@@ -1435,6 +1442,19 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
     }
     if (closedBy !== null) reject("commit-closed", `commits are closed: ${closedBy}`);
     if (stake < state.rules.stake.review) reject("stake", `review stake below ${state.rules.stake.review}`);
+  }
+
+  // Solo rules only (rules.mode "solo"): `agent` may review, or file a
+  // finding on, the submission although it shares the author's owner,
+  // because it is not the author and declares another model family. Without
+  // mode "solo" never, so every ledger before it replays as it did. Only
+  // reviews of a submission and findings on it: attestations, snapshot
+  // findings and decisions keep the owner rule.
+  function soloSelfReviewer(s: SubmissionState, agent: KeyId): boolean {
+    if (!isSolo(state.rules) || agent === s.author) return false;
+    const a = state.agents.get(agent);
+    const author = state.agents.get(s.author);
+    return a !== undefined && author !== undefined && a.owner === author.owner && a.modelFamily !== author.modelFamily;
   }
 
   function ownerSet(submissionIds: readonly string[]): Set<OwnerId> {

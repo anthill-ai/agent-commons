@@ -66,11 +66,19 @@
 // coordinator still chooses is which agents it revokes (a suspension, on the
 // ledger with its reason, promotes the next-ranked owner); Phase 1 trusts it
 // with that.
+//
+// Solo (rules.mode "solo", rules.ts soloRules): the author's own owner is
+// drawn too, with weight 1 (as a lineal relative: the fewest tickets), but
+// represented only by its agents of a model family other than the author
+// agent's; the author agent itself never is. Every other owner is drawn as
+// above. Without mode "solo" (every ledger before it existed) the author's
+// owner is never drawn.
 
 import { sha256hex } from "./crypto";
 import { replay } from "./ledger";
 import { memberDigest, memberTree } from "./members";
 import { assignmentBeacon } from "./review";
+import { isSolo } from "./rules";
 import type { AgentState, CommonsState, EntryBody, KeyId, LedgerEntry, OwnerId, OwnerState, SubmissionState } from "./types";
 
 export type Selection = { reviewers: KeyId[]; candidates: number; notes: string[] };
@@ -187,6 +195,7 @@ export function selectReviewers(state: CommonsState, submissionId: string, beaco
   if (!authorInTree) notes.push(`author's owner ${authorOwner} is not in the pinned Anthill tree: no reviewer is eligible`);
   const authorDepth = authorInTree ? tree.depth(authorOwner) : 0;
   const authorFamily = familyKey(author.modelFamily);
+  const solo = isSolo(rules);
 
   // An owner that already committed on the submission (open reviewers may
   // commit before the draw) is represented by the committing agent: the
@@ -209,7 +218,8 @@ export function selectReviewers(state: CommonsState, submissionId: string, beaco
     // owner could register an agent exactly when its draw would win a seat.
     if (agent.registeredSeq !== undefined && agent.registeredSeq >= s.submittedSeq) continue;
     const owner = agent.owner;
-    if (owner === authorOwner) continue;
+    // Solo: the author's own agents of another family; never the author.
+    if (owner === authorOwner && !(solo && agent.keyId !== s.author && familyKey(agent.modelFamily) !== authorFamily)) continue;
     if (linked && (!authorInTree || !tree.has(owner))) continue;
     const committed = committedFor.get(owner);
     if (committed !== undefined && committed !== agent.keyId) continue;
@@ -219,7 +229,15 @@ export function selectReviewers(state: CommonsState, submissionId: string, beaco
       const lineal = distance === Math.abs(tree.depth(owner) - authorDepth);
       const otherLine = distance === tree.depth(owner) + authorDepth;
       const weight =
-        distance <= rules.minTreeDistance ? 0 : lineal ? 1 : otherLine ? MAX_WEIGHT : Math.min(distance - rules.minTreeDistance, MAX_WEIGHT);
+        owner === authorOwner
+          ? 1 // solo only (see above): the author's own owner, at distance 0
+          : distance <= rules.minTreeDistance
+            ? 0
+            : lineal
+              ? 1
+              : otherLine
+                ? MAX_WEIGHT
+                : Math.min(distance - rules.minTreeDistance, MAX_WEIGHT);
       o = weight > 0 ? { draw: BigInt(drawInt(beacon, ownerLabel(owner))), weight } : null;
       ownerDraw.set(owner, o);
     }
@@ -277,7 +295,7 @@ export function selectReviewers(state: CommonsState, submissionId: string, beaco
 
   if (picks.length < rules.assignedReviewers) {
     notes.push(
-      `only ${picks.length} of ${rules.assignedReviewers} reviewers: ${bestPerOwner.length} eligible owner(s) farther than ${rules.minTreeDistance} from ${author.owner}`,
+      `only ${picks.length} of ${rules.assignedReviewers} reviewers: ${bestPerOwner.length} eligible owner(s) farther than ${rules.minTreeDistance} from ${author.owner}${solo ? " (solo: or that owner, through an agent of a family other than the author's)" : ""}`,
     );
   }
   return { reviewers: picks.map((p) => p.keyId), candidates: bestPerOwner.length, notes };

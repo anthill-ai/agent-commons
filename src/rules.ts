@@ -266,8 +266,85 @@ export function phase1Rules(base: Rules = defaultRules()): Rules {
     soakFloorHours: 24,
     kernelSignoffs: 1,
   };
+  // Phase 1 is independent review: none of a solo set's fields carry over
+  // (rules set --preset phase1 on a solo ledger leaves solo).
+  delete r.mode;
+  delete r.humanMergeApproval;
+  delete r.freeSubmitCredits;
   return r;
 }
+
+// What the playground and GET /api/head say about a solo ledger, so nobody
+// takes its reviews for independent ones.
+export const SOLO_NOTICE = "solo test: your own agents review each other";
+
+export const isSolo = (rules: Pick<Rules, "mode">): boolean => rules.mode === "solo";
+
+// The solo preset: one person testing the commons alone, with their own
+// agents of at least two model families (say a Claude Code agent and a Codex
+// agent, both theirs), and no owner key. It is Phase 1 (on top of `base`,
+// so the project's rings, locked paths and families stay) with only what one
+// person needs to run the whole loop, and nothing looser:
+//
+// - mode "solo": the author's own owner's agents may hold a review seat (and
+//   file a finding on a submission), but only an agent of another model
+//   family than the author agent, never the author itself. Other owners are
+//   drawn as in Phase 1 (minTreeDistance 1), and the author's own owner
+//   holds the fewest tickets (weight 1, as a lineal relative), so once a
+//   second person joins, their agents are preferred. requireOtherModelFamily
+//   stays true: it is the one independence rule a solo ledger keeps, and
+//   validateRules refuses a solo set without it.
+// - assignedReviewers 1: one owner fills one seat (the ledger never gives an
+//   owner two), so a larger panel would only be short.
+// - Promotion: minDistinctOwners 1, and minModelFamilies 2 counting the
+//   author's family with its reviewers' (solo only), so every covered
+//   submission needs a revealed review by another family. kernelSignoffs 0:
+//   no human signs off kernel changes, so a signer's own ring-0 work cannot
+//   freeze main and no kernel signer need be named. Seeded recall: a plant is
+//   the custodian's owner's work, and catches by that owner's agents never
+//   count (plants.ts), so in a one-person commons every plant reads as
+//   missed. minSeeds 0 and minRecallLowerBound90 0, and promotion shows the
+//   recall and critical-bound checks without enforcing them (solo only).
+//   Plants still work: committed, submitted and revealed like anywhere, a
+//   revealed plant still blocks its merge and its snapshot, and recall is
+//   still computed and shown.
+// - humanMergeApproval "unlessFlagged": merges need no mergeApproval unless a
+//   revealed review flags a defect; reproduced findings still wait for an
+//   operator's decision, as everywhere.
+// - Credits and stakes: freeSubmitCredits 10 (each reviewed submission earns
+//   back the credit it spent, at reviewsPerSubmitCredit 1, so the ten are
+//   headroom for submissions that fail a gate), and stake.allowance covers
+//   both agents holding the largest claim at once plus twenty review stakes
+//   (740 at the defaults): one owner backs every stake.
+//
+// Leaving solo is an admin-signed rulesChange (commons rules set --preset
+// phase1). Promotion is judged by the rules in force, so solo-reviewed work
+// that is not on main by then needs independent coverage under Phase 1.
+export function soloRules(base: Rules = defaultRules()): Rules {
+  const r = phase1Rules(base);
+  r.mode = "solo";
+  r.requireOtherModelFamily = true;
+  r.assignedReviewers = 1;
+  r.reviewsPerSubmitCredit = 1;
+  r.freeSubmitCredits = 10;
+  r.stake.allowance = Math.max(r.stake.allowance, 2 * claimStake(r.maxLinesPerSubmission, 0, r) + 20 * r.stake.review);
+  r.promotion = {
+    ...r.promotion,
+    minModelFamilies: 2,
+    minDistinctOwners: 1,
+    minSeeds: 0,
+    minRecallLowerBound90: 0,
+    maxCriticalUpperBound90: 1,
+    kernelSignoffs: 0,
+  };
+  r.humanMergeApproval = "unlessFlagged";
+  return r;
+}
+
+// The named presets init, rules set and commons host apply on top of a base.
+export const PRESETS = { phase1: phase1Rules, solo: soloRules } as const satisfies Record<string, (base: Rules) => Rules>;
+export type PresetName = keyof typeof PRESETS;
+export const isPresetName = (name: string): name is PresetName => Object.hasOwn(PRESETS, name);
 
 // The stake a claim must lock (docs/protocol.md §5.3): superlinear in the
 // task's size estimate, scaled by its ring. Lives here, beside the numbers it
@@ -282,11 +359,22 @@ export function claimStake(lines: number, ring: Ring, rules: Rules): number {
 // lines, so this must not assume the value really has the Rules shape: it
 // first checks the shape against defaultRules() (same keys, same leaf types,
 // every number finite and >= 0) and only then the relations between values.
+//
+// The optional fields (mode, humanMergeApproval, freeSubmitCredits) are not
+// in the template: a rules object without them, as every ledger made before
+// they existed has, is checked exactly as before.
 export function validateRules(rules: Rules): string[] {
   const problems: string[] = [];
-  checkShape(rules, defaultRules(), "rules", problems);
+  let required: unknown = rules;
+  if (isPlainObject(rules)) {
+    const copy: Record<string, unknown> = { ...rules };
+    for (const k of OPTIONAL_FIELDS) delete copy[k];
+    required = copy;
+  }
+  checkShape(required, defaultRules(), "rules", problems);
   if (problems.length > 0) return problems;
   const r = rules;
+  checkOptional(r, problems);
 
   r.rings.forEach((entry, i) => {
     const at = `rules.rings[${i}]`;
@@ -368,6 +456,32 @@ export function validateRules(rules: Rules): string[] {
     problems.push("rules.promotion.kernelSignoffs exceeds the number of kernelSigners");
   }
   return problems;
+}
+
+const OPTIONAL_FIELDS = ["mode", "humanMergeApproval", "freeSubmitCredits"] as const;
+
+// The optional fields, and what a solo set must keep. An undefined value is
+// absent, as checkShape treats it.
+function checkOptional(r: Rules, problems: string[]): void {
+  const raw = r as Record<string, unknown>;
+  if (raw.mode !== undefined && raw.mode !== "solo") problems.push('rules.mode must be "solo" or absent');
+  if (raw.humanMergeApproval !== undefined && raw.humanMergeApproval !== "always" && raw.humanMergeApproval !== "unlessFlagged") {
+    problems.push('rules.humanMergeApproval must be "always", "unlessFlagged" or absent');
+  }
+  if (raw.freeSubmitCredits !== undefined && !(Number.isInteger(raw.freeSubmitCredits) && (raw.freeSubmitCredits as number) >= 1)) {
+    problems.push("rules.freeSubmitCredits must be an integer >= 1 or absent");
+  }
+  if (raw.mode !== "solo") return;
+  // Solo lets the author's own owner review: the model family is then the
+  // only independence left, so it must be required, and promotion must ask
+  // for a family besides the author's and at least one reviewing owner.
+  if (r.requireOtherModelFamily !== true) problems.push("rules.mode solo needs rules.requireOtherModelFamily true (the one independence rule solo keeps)");
+  if (Number.isInteger(r.promotion.minModelFamilies) && r.promotion.minModelFamilies < 2) {
+    problems.push("rules.mode solo needs rules.promotion.minModelFamilies >= 2 (the author's family and another)");
+  }
+  if (Number.isInteger(r.promotion.minDistinctOwners) && r.promotion.minDistinctOwners < 1) {
+    problems.push("rules.mode solo needs rules.promotion.minDistinctOwners >= 1");
+  }
 }
 
 // Structural comparison with the template. Arrays only get a type check here;
