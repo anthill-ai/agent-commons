@@ -70,6 +70,14 @@ import {
   type SelectionApi,
   type ExecuteDeps,
 } from "./coordinator";
+import {
+  fetchAnthillKey,
+  fetchAnthillTree,
+  requestOwnerAttestation,
+  type SignedOwner,
+  submitOwnerAttestation,
+  syncAnthillTree,
+} from "./anthill";
 import { canonical, generateKeyPair, isValidPublicKey, keyIdOf, randomSalt, sha256hex } from "./crypto";
 import { HARNESS_DIR_PREFIX, minimalEnv, reproduceFinding } from "./findings";
 import { applyUnifiedDiff, checkRepoPath, FULL_SHA, parsePatch } from "./github";
@@ -1422,6 +1430,7 @@ const COORDINATOR_FLAGS: Record<string, FlagSpec> = {
   "approved-tasks": { type: "string", help: "JSON file of task bodies the operator approved, re-read every pass; each is appended once" },
   "timeout-ms": { type: "string", help: "per finding-test run (default the harness's)" },
   "snapshot-every": { type: "string", help: "merged submissions that trigger a snapshot (default: never)" },
+  "anthill-url": { type: "string", help: "on a ledger linked to Anthill: its backend URL; each pass first pins its tree if it changed" },
 };
 
 // Every gate submissionGates reports when nothing fails (and so the gates a
@@ -1640,6 +1649,16 @@ function patchesDir(ctx: Ctx): string {
 
 async function coordinatorPass(ctx: Ctx, store: LedgerStore): Promise<number> {
   const f = ctx.flags;
+  const anthillUrl = str(f, "anthill-url");
+  if (anthillUrl !== undefined) {
+    // A failed fetch leaves the pinned tree as it was; the pass goes on.
+    try {
+      const pinned = await syncAnthillTree(store.state(), anthillUrl, (b) => store.appendAsCoordinator(b), ctx.io.fetch);
+      if (pinned !== null) ctx.out(`pinned Anthill tree version ${pinned}`);
+    } catch (e) {
+      ctx.io.stderr(`anthill sync: ${(e as Error).message}\n`);
+    }
+  }
   const repo = str(f, "repo") === undefined ? null : resolvePath(ctx, req(f, "repo"));
   const rule = mergeRule(ctx);
   const devRef = devRefOf(ctx);
@@ -1780,9 +1799,23 @@ const COMMANDS: Record<string, Command> = {
         help: "phase1: 3-10 trusted people, owners added with owner add (minTreeDistance 1, 2 reviewers, 1 kernel signoff); applied on top of --rules",
       },
       "kernel-signer": { type: "list", help: "owner id who may sign off kernel changes (repeatable; sets rules.kernelSigners)" },
+      "anthill-community": { type: "string", help: "link the ledger to this Anthill community: its tree is the trust tree and Anthill admits owners" },
+      "anthill-key": { type: "string", help: "with --anthill-community: Anthill's signing public key (or a key file)" },
+      "anthill-url": { type: "string", help: "with --anthill-community: fetch Anthill's signing key from this backend instead of --anthill-key" },
     },
-    (ctx) => {
+    async (ctx) => {
       const f = ctx.flags;
+      const community = str(f, "anthill-community");
+      let anthill: { community: string; publicKey: string } | undefined;
+      if (community !== undefined) {
+        const keyFlag = str(f, "anthill-key");
+        const url = str(f, "anthill-url");
+        if ((keyFlag === undefined) === (url === undefined)) usage("--anthill-community needs exactly one of --anthill-key and --anthill-url");
+        const publicKey = keyFlag !== undefined ? publicKeyArg(ctx, keyFlag, "anthill-key") : await fetchAnthillKey(url as string, ctx.io.fetch);
+        anthill = { community, publicKey };
+      } else if (str(f, "anthill-key") !== undefined || str(f, "anthill-url") !== undefined) {
+        usage("--anthill-key and --anthill-url need --anthill-community");
+      }
       const preset = str(f, "preset");
       if (preset !== undefined && preset !== "phase1") usage(`unknown --preset ${preset} (known: phase1)`);
       let rules = str(f, "rules") !== undefined ? readRules(ctx, req(f, "rules")) : defaultRules();
@@ -1798,14 +1831,18 @@ const COMMANDS: Record<string, Command> = {
       const p = ledgerPath(ctx);
       let ledger: Ledger;
       try {
-        ledger = Ledger.create(p, { kind: "genesis", project: req(f, "project"), admins, coordinator, rules }, stamp(ctx));
+        ledger = Ledger.create(
+          p,
+          { kind: "genesis", project: req(f, "project"), admins, coordinator, rules, ...(anthill === undefined ? {} : { anthill }) },
+          stamp(ctx),
+        );
       } catch (e) {
         if (e instanceof LedgerError) return usage(`cannot create ${p} (${e.code}): ${e.message}`);
         throw e;
       }
       const g = ledger.entries()[0] as LedgerEntry;
       ctx.out(`created ${p}`);
-      report(ctx, g, `rules v${rules.version}`);
+      report(ctx, g, `rules v${rules.version}${anthill === undefined ? "" : `, linked to Anthill community ${anthill.community}`}`);
       return 0;
     },
   ),
@@ -1826,6 +1863,67 @@ const COMMANDS: Record<string, Command> = {
         inviter: str(f, "inviter") ?? null,
       };
       report(ctx, appendLocal(ctx, body, signerKey(ctx)), `key ${keyIdOf(body.publicKey)}`);
+      return 0;
+    },
+  ),
+
+  "anthill sync": command(
+    "pin the linked Anthill community's current tree, if it changed (signed by the coordinator key)",
+    { "anthill-url": { type: "string", help: "the Anthill backend URL", required: true } },
+    async (ctx) => {
+      const signer = signerKey(ctx);
+      const st = state(ctx);
+      if (st.anthill === undefined) return usage("this ledger is not linked to Anthill (init --anthill-community)");
+      const pinned = await syncAnthillTree(st, req(ctx.flags, "anthill-url"), async (b) => report(ctx, appendLocal(ctx, b, signer)), ctx.io.fetch);
+      ctx.out(pinned === null ? `already pinned: version ${st.anthill.tree?.version}` : `pinned version ${pinned}`);
+      return 0;
+    },
+  ),
+
+  "anthill join": command(
+    "as a signed-in Anthill member, have Anthill vouch for your owner key; then hand it to the coordinator (--url) or print it",
+    {
+      ...REMOTE,
+      "anthill-url": { type: "string", help: "the Anthill backend URL", required: true },
+      community: { type: "string", help: "the Anthill community the commons is linked to", required: true },
+      session: { type: "string", help: "your Anthill session token (localStorage anthill.session on the Anthill site)", required: true },
+      "owner-key": { type: "string", help: "your owner key file or public key", required: true },
+    },
+    async (ctx) => {
+      const f = ctx.flags;
+      const publicKey = publicKeyArg(ctx, req(f, "owner-key"), "owner-key");
+      const signed = await requestOwnerAttestation(req(f, "anthill-url"), req(f, "community"), req(f, "session"), publicKey, ctx.io.fetch);
+      const url = str(f, "url");
+      if (url === undefined) {
+        ctx.block(JSON.stringify(signed, null, 2));
+        return 0;
+      }
+      const r = await submitOwnerAttestation(url, signed, ctx.io.fetch);
+      ctx.out(`joined as owner ${r.owner} (seq ${r.seq})`);
+      return 0;
+    },
+  ),
+
+  "anthill admit": command(
+    "append an Anthill owner attestation (from anthill join) to the ledger (signed by an admin or the coordinator key)",
+    { attestation: { type: "string", help: "JSON file with {attestation, signature} as Anthill signed them", required: true } },
+    (ctx) => {
+      const signed = readJson(ctx, req(ctx.flags, "attestation"), "attestation") as SignedOwner;
+      const body: EntryBody = { kind: "anthillOwner", attestation: signed.attestation, signature: signed.signature };
+      report(ctx, appendLocal(ctx, body, signerKey(ctx)), `owner ${String(signed.attestation?.user)}`);
+      return 0;
+    },
+  ),
+
+  "anthill tree": command(
+    "print the linked community's tree as Anthill currently signs it (does not write the ledger)",
+    {
+      "anthill-url": { type: "string", help: "the Anthill backend URL", required: true },
+      community: { type: "string", help: "the community (default: the one this ledger is linked to)" },
+    },
+    async (ctx) => {
+      const community = str(ctx.flags, "community") ?? state(ctx).anthill?.link.community ?? usage("--community, or a ledger linked to Anthill");
+      ctx.block(JSON.stringify(await fetchAnthillTree(req(ctx.flags, "anthill-url"), community, ctx.io.fetch), null, 2));
       return 0;
     },
   ),

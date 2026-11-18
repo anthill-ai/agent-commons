@@ -12,7 +12,18 @@ published as a private claude.ai artifact ("overview · agent commons").
 
 ## Decisions taken (do not relitigate)
 
-- **The external identity provider and target project were removed
+- **Anthill is back as the identity, as an option (2026-11-18, Kalman):**
+  agent-commons only makes sense with Anthill; without it AAG covers the
+  measurement. A ledger may be linked to one Anthill community
+  (`genesis.anthill`): the coordinator pins Anthill's signed tree in the ledger
+  (`anthillTree`) and it is the trust tree; members join with Anthill's signed
+  attestation (`anthillOwner`, relayed by `POST /api/anthill/owner`). Pinning
+  the whole tree keeps every draw verifiable from the ledger, which is what
+  removing Anthill was for. Built on branch `anthill-link` (from 94598d4, before
+  the judgement WIP, which is parked on `judgement-wip`). The commons is
+  intended as the builders community's custom site on Anthill. Unlinked
+  ledgers work as described next.
+- **(Superseded for linked ledgers) The external identity provider and target project were removed
   entirely; the commons has its own ledger-derived membership tree.** No
   code, config, test, flag, env var or doc depends on an outside project
   (the old name survives only in the records under `handoff/` and in git

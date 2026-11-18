@@ -4,13 +4,17 @@
 //
 // Conventions:
 // - Ids are strings. An OwnerId names a person (or organisation) the admin
-//   registered with an ownerKey entry; owners and their inviters form the
-//   commons' trust tree (members.ts). A KeyId is the hex sha256 of a raw ed25519 public
+//   registered with an ownerKey entry, or, on a ledger linked to an Anthill
+//   community, an Anthill user id admitted with an anthillOwner entry. The
+//   trust tree (members.ts) is the owners under their inviters, or the latest
+//   pinned Anthill tree on a linked ledger. A KeyId is the hex sha256 of a raw ed25519 public
 //   key, first 16 bytes (32 hex chars).
 // - Time is an ISO-8601 string passed in by the caller. Core modules never read
 //   the clock; the CLI stamps entries. This keeps replay deterministic.
 // - Reputation amounts are integers (points). No floats in the ledger except
 //   probabilities in reviews.
+
+import type { AnthillLink, AnthillOwnerAttestation, AnthillTreeSnapshot } from "./anthill";
 
 export type OwnerId = string;
 export type KeyId = string;
@@ -52,12 +56,25 @@ export type EntryBody =
       admins: string[]; // raw ed25519 public keys, base64url (SPKI DER)
       coordinator: string; // raw public key, base64url (SPKI DER)
       rules: Rules;
+      // Optional. Links the ledger to one Anthill community: its signed tree
+      // becomes the trust tree, and Anthill vouches for owners (anthill.ts).
+      // publicKey is Anthill's signing key, base64url SPKI DER.
+      anthill?: { community: string; publicKey: string };
     }
   // signer: admin. Admits an owner and binds it to a signing key. `inviter` is
   // the existing owner who vouched for it, or null; it is the owner's parent
   // in the trust tree (members.memberTree). The admin's ownerKey entries are
   // the allowlist: nobody else can admit an owner.
   | { kind: "ownerKey"; owner: OwnerId; publicKey: string; inviter: OwnerId | null }
+  // signer: coordinator, on a linked ledger only. Pins Anthill's signed tree of
+  // the linked community; from here on it is the trust tree. `version` must
+  // grow. The whole tree is kept so draws stay verifiable from the ledger.
+  | { kind: "anthillTree"; snapshot: AnthillTreeSnapshot; signature: string }
+  // signer: admin or coordinator, on a linked ledger only. Admits the Anthill
+  // user Anthill vouched for as owner `attestation.user`, bound to
+  // `attestation.publicKey`. Anyone may relay it; Anthill's signature is what
+  // admits them.
+  | { kind: "anthillOwner"; attestation: AnthillOwnerAttestation; signature: string }
   // signer: owner (the owner named). Registers an agent key under the owner.
   | { kind: "agentRegistered"; owner: OwnerId; publicKey: string; modelFamily: ModelFamily; harness: string }
   // signer: the agent's owner, or coordinator (automatic suspension)
@@ -390,6 +407,11 @@ export type CommonsState = {
   honeytokens: { agent: KeyId; tokenId: string; seq: number; at: string }[];
   escapes: { findingId: string; snapshotId: string; seq: number; at: string }[];
   settlements: { owner: OwnerId; delta: number; reason: SettlementReason; ref: string; seq: number; at: string }[];
+  // Set on a ledger linked to Anthill (genesis.anthill); `tree` is the latest
+  // pinned anthillTree, absent until the first one, and `history` every pin,
+  // oldest first, so a past draw can be recomputed over the tree it used
+  // (always set by replay; absent in hand-built states).
+  anthill?: { link: AnthillLink; tree?: AnthillTreeSnapshot & { seq: number }; history?: (AnthillTreeSnapshot & { seq: number })[] };
   headHash: string;
   length: number;
 };

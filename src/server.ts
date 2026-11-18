@@ -443,6 +443,7 @@ async function handle(ctx: Ctx, req: http.IncomingMessage, res: http.ServerRespo
   try {
     if (method === "GET" && p === "/api/head") return send(res, 200, ctx.store.head());
     if (method === "POST" && p === "/api/entries") return send(res, 201, await postEntry(ctx, req));
+    if (method === "POST" && p === "/api/anthill/owner") return send(res, 201, await postAnthillOwner(ctx, req));
     if (method === "GET" && p === "/api/assignments") return send(res, 200, assignments(ctx, url));
     if (method === "GET" && p === "/api/tasks") return send(res, 200, tasks(ctx, url));
     const task = /^\/api\/tasks\/([^/]+)$/.exec(p);
@@ -669,6 +670,34 @@ async function postEntry(ctx: Ctx, req: http.IncomingMessage): Promise<{ seq: nu
       throw e;
     }
   });
+}
+
+// A member joining with Anthill's attestation (anthill.ts): they have no key
+// on the ledger yet, so they cannot sign an entry; the coordinator relays it
+// as an anthillOwner entry. Anthill's signature is what admits them, and the
+// ledger checks it, so the relay adds no trust. The per-address limits every
+// request passes apply.
+async function postAnthillOwner(ctx: Ctx, req: http.IncomingMessage): Promise<{ seq: number; hash: string; owner: OwnerId }> {
+  const before = ctx.store.state();
+  if (before.anthill === undefined) throw new HttpError(404, "not-linked", "this commons is not linked to Anthill");
+  const raw = await readBody(req, ctx.limits.entryBytes, ctx.limits.minBodyBytesPerSecond, ctx.limits.bodyGraceMs);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.toString("utf8"));
+  } catch {
+    throw new HttpError(400, "malformed", "body is not JSON");
+  }
+  if (!isObject(parsed) || Object.keys(parsed).sort().join(",") !== "attestation,signature" || typeof parsed.signature !== "string") {
+    throw new HttpError(400, "malformed", "expected {attestation, signature} as Anthill signed them");
+  }
+  const body = { kind: "anthillOwner", attestation: parsed.attestation, signature: parsed.signature } as EntryBody;
+  try {
+    const stored = await ctx.store.appendAsCoordinator(body);
+    return { seq: stored.seq, hash: stored.hash, owner: (parsed.attestation as { user: OwnerId }).user };
+  } catch (e) {
+    if (e instanceof LedgerError) throw new HttpError(e.code === "torn" || e.code === "stale" ? 503 : 400, e.code, e.message);
+    throw e;
+  }
 }
 
 // An open submission still occupies a PR slot: not merged and not dead (a

@@ -23,7 +23,15 @@ import * as fs from "node:fs";
 import { canonical, isValidPublicKey, keyIdOf, sha256hex, sign, verify } from "./crypto";
 import { isConfirmedDefect, isReproducedOpen } from "./findingStatus";
 import { ringOf } from "./gates/rings";
-import { MEMBER_ROOT, memberDigest } from "./members";
+import {
+  attestationProblems,
+  type AnthillOwnerAttestation,
+  type AnthillTreeSnapshot,
+  snapshotProblems,
+  verifyOwner,
+  verifyTree,
+} from "./anthill";
+import { MEMBER_ROOT, memberDigest, treeFromParents } from "./members";
 import { commitDeadlineMs, plantCommitment } from "./plants";
 import { assignmentBeacon, type CommitSubject, commitmentFor, validateVerdict } from "./review";
 import { claimStake, validateRules } from "./rules";
@@ -340,6 +348,8 @@ const reason: Check = (v) => REASONS.includes(v as SettlementReason);
 const SHAPES: { [K in EntryKind]: Record<string, Check> } = {
   genesis: { project: id, admins: listOf(Number.MAX_SAFE_INTEGER, str), coordinator: str, rules: any },
   ownerKey: { owner: id, publicKey: str, inviter: idOrNull },
+  anthillTree: { snapshot: any, signature: str },
+  anthillOwner: { attestation: any, signature: str },
   agentRegistered: { owner: id, publicKey: str, modelFamily: text(L.name), harness: text(L.name) },
   agentRevoked: { agent: id, reason: text(L.text, true) },
   proposal: { id, title: text(L.title), evidence: listOf(L.evidence, any) },
@@ -393,6 +403,9 @@ const SHAPES: { [K in EntryKind]: Record<string, Check> } = {
 // only so that the "authors may not set planted" rule can reject it with its
 // own code instead of a shape error.
 const OPTIONAL: Partial<Record<EntryKind, Record<string, Check>>> = {
+  genesis: {
+    anthill: (v) => isPlainObject(v) && fieldProblem(v, { community: id, publicKey: str }) === null,
+  },
   submission: { planted: any },
   findingResult: { harnessError: text(L.text) },
 };
@@ -495,6 +508,9 @@ export function emptyState(genesis: LedgerEntry | GenesisBody, at: string = EPOC
   if (new Set(adminKeys).size !== adminKeys.length) fail("duplicate-key", "admin keys repeat");
   const problems = validateRules(body.rules);
   if (problems.length > 0) fail("invalid-rules", problems.join("; "));
+  if (body.anthill !== undefined && !isValidPublicKey(body.anthill.publicKey)) {
+    fail("invalid-key", "anthill.publicKey is not a canonical ed25519 SPKI key");
+  }
 
   // The coordinator may also be an admin; separating those duties is a
   // deployment choice, not something the ledger can verify.
@@ -521,6 +537,7 @@ export function emptyState(genesis: LedgerEntry | GenesisBody, at: string = EPOC
     honeytokens: [],
     escapes: [],
     settlements: [],
+    ...(body.anthill === undefined ? {} : { anthill: { link: { ...body.anthill }, history: [] } }),
     headHash: entry.hash,
     length: 1,
     headAt: entry.at,
@@ -626,10 +643,12 @@ function headAtOf(state: CommonsState): string {
 // operator = a genesis admin key, or the key of an owner named in
 // rules.kernelSigners: the humans who decide what a machine cannot (whether a
 // reproduction is a real defect, whether a merge may go ahead).
-type Role = "admin" | "coordinator" | "owner" | "agent" | "agentOrOwner" | "ownerOrCoordinator" | "operator";
+type Role = "admin" | "coordinator" | "adminOrCoordinator" | "owner" | "agent" | "agentOrOwner" | "ownerOrCoordinator" | "operator";
 
 const SIGNERS: { [K in Exclude<EntryKind, "genesis">]: Role } = {
   ownerKey: "admin",
+  anthillTree: "coordinator",
+  anthillOwner: "adminOrCoordinator",
   agentRegistered: "owner",
   agentRevoked: "ownerOrCoordinator",
   proposal: "agentOrOwner",
@@ -669,6 +688,8 @@ function hasRole(state: CommonsState, signer: KeyId, role: Role): boolean {
       return state.adminKeys.includes(signer);
     case "coordinator":
       return isCoordinator;
+    case "adminOrCoordinator":
+      return isCoordinator || state.adminKeys.includes(signer);
     case "owner":
       return isOwner;
     case "agent":
@@ -731,6 +752,9 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       return reject("genesis", "genesis is only valid at seq 0");
 
     case "ownerKey": {
+      // A linked ledger's owners are Anthill users; an owner the admin named
+      // could never be in the Anthill tree, so could never review.
+      if (state.anthill !== undefined) reject("unauthorised", "this ledger is linked to Anthill: owners join with anthillOwner");
       if (state.owners.has(body.owner)) reject("duplicate-id", `owner ${body.owner} already has a key`);
       // Ids are chosen by people, who type them in any case. Two
       // spellings of one member would be two owners here (two tickets, two
@@ -746,6 +770,46 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       state.publicKeys.set(keyId, body.publicKey);
       state.owners.set(body.owner, { id: body.owner, keyId, inviter: body.inviter, reputationDelta: 0, lockedStake: 0, registeredSeq: seq });
       state.ownerByKey.set(keyId, body.owner);
+      return;
+    }
+
+    case "anthillTree": {
+      const linked = state.anthill ?? reject("unauthorised", "this ledger is not linked to Anthill");
+      const problems = snapshotProblems(body.snapshot);
+      if (problems.length > 0) reject("invalid-value", problems.join("; "));
+      const snap = body.snapshot as AnthillTreeSnapshot;
+      if (snap.community !== linked.link.community) reject("invalid-value", `snapshot is of ${snap.community}, not ${linked.link.community}`);
+      if (!verifyTree(linked.link, snap, body.signature)) reject("signature", "Anthill's signature on the snapshot does not verify");
+      const previous = linked.tree;
+      if (previous !== undefined && snap.version <= previous.version) {
+        // Not "stale": that code means the ledger file moved under a writer.
+        reject("invalid-value", `snapshot version ${snap.version} is not newer than the pinned ${previous.version}`);
+      }
+      if (previous !== undefined && Date.parse(snap.at) < Date.parse(previous.at)) reject("time", "snapshot is older than the pinned one");
+      if (Date.parse(snap.at) > ms) reject("time", "snapshot is signed after this entry");
+      try {
+        treeFromParents(snap.parents);
+      } catch (e) {
+        reject("invalid-value", (e as Error).message);
+      }
+      linked.tree = { ...snap, parents: { ...snap.parents }, seq };
+      (linked.history ??= []).push(linked.tree);
+      return;
+    }
+
+    case "anthillOwner": {
+      const linked = state.anthill ?? reject("unauthorised", "this ledger is not linked to Anthill");
+      const problems = attestationProblems(body.attestation);
+      if (problems.length > 0) reject("invalid-value", problems.join("; "));
+      const a = body.attestation as AnthillOwnerAttestation;
+      if (a.community !== linked.link.community) reject("invalid-value", `attestation is for ${a.community}, not ${linked.link.community}`);
+      if (!verifyOwner(linked.link, a, body.signature)) reject("signature", "Anthill's signature on the attestation does not verify");
+      if (Date.parse(a.at) > ms) reject("time", "attestation is signed after this entry");
+      if (state.owners.has(a.user)) reject("duplicate-id", `owner ${a.user} already has a key`);
+      const keyId = newKey(a.publicKey);
+      state.publicKeys.set(keyId, a.publicKey);
+      state.owners.set(a.user, { id: a.user, keyId, inviter: null, reputationDelta: 0, lockedStake: 0, registeredSeq: seq });
+      state.ownerByKey.set(keyId, a.user);
       return;
     }
 

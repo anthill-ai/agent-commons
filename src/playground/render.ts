@@ -245,9 +245,10 @@ function unavailable(what: string): Html {
 }
 
 // null when an agent is unknown (a review entry names a key the page has no
-// agent for); every agent's owner is a member of the tree.
+// agent for), or, on a ledger linked to Anthill, when an owner is not in the
+// pinned tree.
 function treeDistance(tree: TreeView, a: OwnerId | undefined, b: OwnerId | undefined): number | null {
-  return a === undefined || b === undefined ? null : tree.distance(a, b);
+  return a === undefined || b === undefined || !tree.has(a) || !tree.has(b) ? null : tree.distance(a, b);
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +372,10 @@ export function sentence(state: CommonsState, entry: LedgerEntry): Html {
       return b.inviter === null
         ? h`owner ${ownerLink(b.owner)} joined`
         : h`owner ${ownerLink(b.owner)} joined, invited by ${ownerLink(b.inviter)}`;
+    case "anthillTree":
+      return h`pinned Anthill's tree of ${code(b.snapshot.community)}, version ${String(b.snapshot.version)} (${plural(Object.keys(b.snapshot.parents).length, "member")})`;
+    case "anthillOwner":
+      return h`owner ${ownerLink(b.attestation.user)} joined, vouched for by Anthill`;
     case "agentRegistered": {
       const keyId = keyIdOf(b.publicKey);
       return h`owner ${ownerLink(b.owner)} registered agent ${idLink(agentHref(keyId), keyId)} (${line(b.modelFamily)}, harness ${line(b.harness)})`;

@@ -24,6 +24,17 @@
 // reviewer selection iterates them and its result must not depend on Map
 // insertion order.
 //
+// On a ledger linked to Anthill (genesis.anthill) the tree is instead the
+// latest Anthill tree the ledger pinned (an anthillTree entry), rooted at the
+// community's root, and inviters play no part. That tree changes: people
+// climb, move and leave, so distances between owners change with each pin,
+// and an owner who left the community, or joined Anthill's tree only after
+// the latest pin, is not a node at all. Callers ask has() first and treat an
+// owner outside the tree as ineligible (no review seat, no distance-based
+// credit). Before the first pin the tree is the virtual root alone. Each draw
+// still records treeDigest of the tree it used, and that tree is in the
+// ledger prefix, so draws stay verifiable.
+//
 // Structural queries (parent, children, depth, distance) throw on an id that
 // is not a node. Every owner of a replayed state is a member, and every
 // agent's owner is an owner, so only a corrupt, hand-built state reaches the
@@ -42,7 +53,11 @@ export const MEMBER_ROOT = "(commons)";
 
 // The tree of the owners in `state`. A state from replay is always a valid
 // forest; a hand-built one with an unknown inviter or a cycle throws.
-export function memberTree(state: Pick<CommonsState, "owners">): TreeView {
+export function memberTree(state: Pick<CommonsState, "owners" | "anthill">): TreeView {
+  if (state.anthill !== undefined) {
+    const pinned = state.anthill.tree?.parents;
+    return pinned === undefined ? makeView(buildStructure(new Map([[MEMBER_ROOT, null]]))) : treeFromParents(pinned);
+  }
   const parents = new Map<OwnerId, OwnerId | null>([[MEMBER_ROOT, null]]);
   for (const [id, o] of state.owners) {
     if (id === MEMBER_ROOT) throw new Error(`tree: ${MEMBER_ROOT} is reserved for the virtual root`);
@@ -61,7 +76,7 @@ export function treeDigest(tree: TreeView): string {
 }
 
 // treeDigest(memberTree(state)): the digest a draw over `state` records.
-export function memberDigest(state: Pick<CommonsState, "owners">): string {
+export function memberDigest(state: Pick<CommonsState, "owners" | "anthill">): string {
   return treeDigest(memberTree(state));
 }
 

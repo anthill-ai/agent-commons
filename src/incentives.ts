@@ -221,7 +221,7 @@ export function settleFinding(
 
   const book = new Book(state);
   const finder = ownerOf(state, f.finder);
-  if (finder !== undefined && farEnough(memberTree(state), finder, subject.authors, rules.minTreeDistance)) {
+  if (finder !== undefined && farEnough(memberTree(state), finder, subject.authors, rules.minTreeDistance, state.anthill !== undefined)) {
     book.credit(finder, "bounty", `finding:${f.id}`, shares[cls.early.indexOf(f)] ?? 0);
   }
   if (cls.leader === f) {
@@ -368,8 +368,11 @@ function targetKey(f: FindingState): string {
 // The finder must be farther than minTreeDistance from every author's owner
 // in the member tree. Every owner is a member; the tree throws on anything
 // else (only a corrupt, hand-built state), so no settlement guesses a distance.
-function farEnough(tree: TreeView, finder: OwnerId, authors: OwnerId[], minDistance: number): boolean {
-  return authors.every((a) => tree.distance(finder, a) > minDistance);
+// On a ledger linked to Anthill an owner outside the pinned tree has no
+// distance at all, so is never far enough: no distance-based credit.
+function farEnough(tree: TreeView, finder: OwnerId, authors: OwnerId[], minDistance: number, linked: boolean): boolean {
+  if (linked && !tree.has(finder)) return false;
+  return authors.every((a) => (!linked || tree.has(a)) && tree.distance(finder, a) > minDistance);
 }
 
 // ---------------------------------------------------------------------------
@@ -480,7 +483,7 @@ export function settleCleanReviews(state: CommonsState, snapshotId: string, nowI
     for (const r of s.reviews) {
       const owner = ownerOf(state, r.reviewer);
       if (r.verdict === undefined || owner === undefined || author === undefined || !revealedInTime(r, s.merged.seq)) continue;
-      if (!farEnough(tree, owner, [author], state.rules.minTreeDistance)) continue;
+      if (!farEnough(tree, owner, [author], state.rules.minTreeDistance, state.anthill !== undefined)) continue;
       const p = clamp01(r.verdict.defectProbability);
       book.credit(owner, "cleanReview", `review:${s.id}`, Math.round(c - c * p * p));
     }

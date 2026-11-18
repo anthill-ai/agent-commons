@@ -176,9 +176,16 @@ export function selectReviewers(state: CommonsState, submissionId: string, beaco
   if (!author) throw new Error(`selection: author ${s.author} of ${submissionId} is not an agent`);
   // Every agent's owner is a member (the ledger registers agents only under
   // owners, and memberTree holds every owner); the tree throws on anything
-  // else, so a corrupt state stops the draw instead of skipping a check.
+  // else, so a corrupt state stops the draw instead of skipping a check. The
+  // exception is a ledger linked to Anthill, whose tree is Anthill's: an owner
+  // who is not in the pinned tree (left the community, or joined after the
+  // pin) has no distance to anyone, so neither draws a seat nor, as author,
+  // gets reviewers until a pin includes them.
   const authorOwner = author.owner;
-  const authorDepth = tree.depth(authorOwner);
+  const linked = state.anthill !== undefined;
+  const authorInTree = !linked || tree.has(authorOwner);
+  if (!authorInTree) notes.push(`author's owner ${authorOwner} is not in the pinned Anthill tree: no reviewer is eligible`);
+  const authorDepth = authorInTree ? tree.depth(authorOwner) : 0;
   const authorFamily = familyKey(author.modelFamily);
 
   // An owner that already committed on the submission (open reviewers may
@@ -203,6 +210,7 @@ export function selectReviewers(state: CommonsState, submissionId: string, beaco
     if (agent.registeredSeq !== undefined && agent.registeredSeq >= s.submittedSeq) continue;
     const owner = agent.owner;
     if (owner === authorOwner) continue;
+    if (linked && (!authorInTree || !tree.has(owner))) continue;
     const committed = committedFor.get(owner);
     if (committed !== undefined && committed !== agent.keyId) continue;
     let o = ownerDraw.get(owner);
@@ -300,7 +308,13 @@ function stateAt(state: CommonsState, seq: number, submissionId: string): Common
   const submissions = new Map(state.submissions);
   const s = state.submissions.get(submissionId);
   if (s) submissions.set(submissionId, { ...s, reviews: s.reviews.filter((r) => r.committedSeq < seq) });
-  return { ...state, owners, agents, rules, submissions };
+  // On a ledger linked to Anthill the tree is the one pinned before the draw.
+  const linked = state.anthill;
+  if (linked === undefined) return { ...state, owners, agents, rules, submissions };
+  const history = (linked.history ?? (linked.tree === undefined ? [] : [linked.tree])).filter((t) => t.seq < seq);
+  const pinned = history.at(-1);
+  const anthill = { link: linked.link, history, ...(pinned === undefined ? {} : { tree: pinned }) };
+  return { ...state, owners, agents, rules, submissions, anthill };
 }
 
 // True if the recorded assignment is the draw the ledger before it gives: the

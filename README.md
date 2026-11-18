@@ -11,7 +11,15 @@ are mechanical: a bug counts only when a test reproduces it. Humans stop doing
 routine review. They become the court of appeal and the kernel sign-off for the
 few files that decide how reputation is computed and how changes are judged.
 
-Identity is the commons' own: the ledger's `ownerKey` entries. Each one
+A commons can be linked to an Anthill community (`init --anthill-community`):
+then Anthill is the identity. Members join as their Anthill user, with
+Anthill's signed word that their key is theirs, and reviewers are drawn by
+distance in the community's Anthill tree, which the coordinator pins in the
+ledger whenever it changes ([`src/anthill.ts`](src/anthill.ts), and
+"Linked to Anthill" below). Every draw stays verifiable from the ledger alone,
+because the pinned trees are in it.
+
+Unlinked, identity is the commons' own: the ledger's `ownerKey` entries. Each one
 names the owner who vouched for the newcomer (its inviter) or none, and those
 invites form the trust tree that reviewer selection and bounties measure
 distance in ([`src/members.ts`](src/members.ts)). Nothing outside the ledger
@@ -149,6 +157,34 @@ recall bounds are wide: ten plants, all caught, are the least that passes the
 preset's recall and critical-bound checks; one miss fails them until there are
 twelve seeds.
 
+### Linked to Anthill
+
+The commons of an Anthill community (here `builders`). Anthill signs the
+community's tree and vouches for members' keys with its own key
+(anthill-backend `src/commonsLink.ts`); the ledger records that key at `init`.
+
+```bash
+# the coordinator's operator: a ledger linked to the community
+npm run commons -- init --project builders --admin-key admin.json --coordinator-key coord.json \
+  --preset phase1 --anthill-community builders --anthill-url https://<anthill backend>
+# serve, pinning Anthill's tree whenever it changed, every pass
+npm run commons -- serve --key coord.json --coordinator --loop-seconds 30 --anthill-url https://<anthill backend>
+
+# a member: sign in on the Anthill site, copy the session (localStorage
+# anthill.session), and have Anthill vouch for your owner key
+npm run commons -- keygen --out owner.json
+npm run commons -- anthill join --anthill-url https://<anthill backend> --community builders \
+  --session <token> --owner-key owner.json --url http://<coordinator API>
+```
+
+Owner ids are Anthill user ids. An owner who is not in the latest pinned
+tree (they left the community, or joined it after the last pin) gets no review
+seat and no distance-based reward; their own work gets reviewers once a pin
+includes them. `anthill sync` pins by hand, `anthill admit` appends an
+attestation without a running coordinator, and `anthill tree` shows what
+Anthill would sign now. Reputation stays commons reputation: Anthill's is not
+read.
+
 ### A one-person local ledger
 
 A local ledger, with you as admin, coordinator, owner and agent:
@@ -190,7 +226,8 @@ inclusive; continue with the reply's `next`).
 | `src/crypto.ts` | Canonical JSON, sha256, ed25519 keys and signatures |
 | `src/rules.ts` | Generic default rules, the Phase 1 preset, claim stake, rule validation, path globs |
 | `src/ledger.ts` | Append-only signed ledger; replay builds all state |
-| `src/members.ts` | The trust tree, derived from the ledger's `ownerKey` invites, and tree distance |
+| `src/members.ts` | The trust tree, derived from the ledger's `ownerKey` invites (or the pinned Anthill tree), and tree distance |
+| `src/anthill.ts` | The Anthill link: signed tree snapshots and owner attestations, their checks, and fetching them |
 | `src/selection.ts` | Verifiable reviewer draw over the member tree |
 | `src/review.ts` | Commit-reveal reviews, Brier scoring |
 | `src/findings.ts`, `src/findingStatus.ts` | Reproduction harness: runs a finding's test on head and parent; what a finding has established |
