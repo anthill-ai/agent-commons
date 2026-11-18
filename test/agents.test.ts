@@ -386,7 +386,13 @@ test("commons-agent pair: claims with a proof, prints the fingerprint, waits for
     errs.length = 0;
     const family = ["pair", "--anthill", anthill.url, "--community", "builders", "--code", code, "--harness", "h", "--key", keyFile, "--model-family", "Claude Opus"];
     assert.equal(await agentMain(family, {}, io), 2);
-    assert.match(errs.join(""), /--model-family must be one lowercase word/);
+    assert.match(errs.join(""), /--model-family must be one lowercase family name/);
+    // The harness rule Anthill and the ledger apply: printable ASCII, single spaces.
+    for (const bad of ["", " claude-code", "claude  code", "claude\tcode", "cl\u00e4ude", "x".repeat(65)]) {
+      errs.length = 0;
+      const harness = ["pair", "--anthill", anthill.url, "--community", "builders", "--code", code, "--model-family", "claude", "--key", keyFile, "--harness", bad];
+      assert.equal(await agentMain(harness, {}, io), 2, JSON.stringify(bad));
+    }
     assert.equal(anthill.pairings.size, 1);
   } finally {
     await anthill.close();

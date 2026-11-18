@@ -421,6 +421,11 @@ test("anthillAgent: refused for another community, a bad signature, an unknown f
   refused(w, { kind: "anthillAgent", ...w.signedAgent(A, key, { modelFamily: "anthropic" }) }, "invalid-value");
   refused(w, { kind: "anthillAgent", ...w.signedAgent(A, key, { harness: "claude\ncode" }) }, "invalid-value");
   refused(w, { kind: "anthillAgent", ...w.signedAgent(A, key, { harness: "x".repeat(65) }) }, "invalid-value");
+  // One rule with the kit and Anthill: printable ASCII words, single spaces.
+  refused(w, { kind: "anthillAgent", ...w.signedAgent(A, key, { harness: "claude  code" }) }, "invalid-value");
+  refused(w, { kind: "anthillAgent", ...w.signedAgent(A, key, { harness: " claude-code" }) }, "invalid-value");
+  refused(w, { kind: "anthillAgent", ...w.signedAgent(A, key, { harness: "cl\u00e4ude" }) }, "invalid-value");
+  refused(w, { kind: "anthillAgent", ...w.signedAgent(A, key, { modelFamily: "-claude" }) }, "invalid-value");
   refused(w, { kind: "anthillAgent", ...w.signedAgent(A, key, { at: "2026-01-01T00:00:00Z" }) }, "invalid-value");
   refused(w, { kind: "anthillAgent", ...w.signedAgent("alice", key) }, "invalid-value");
   refused(w, { kind: "anthillAgent", ...w.signedAgent(A, key, { at: iso(9_999) }) }, "time");

@@ -20,7 +20,8 @@ export const DEFAULT_MODEL_FAMILIES: readonly string[] = [
 ];
 
 // A family name: lowercase, at most 64 characters (the ledger's name limit).
-const FAMILY_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+// Also what an agent may declare when it pairs through Anthill (anthill.ts).
+export const FAMILY_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 // Generic starting values for any target repository, for a group with
 // strangers in it: minTreeDistance 2 needs real social distance in the member

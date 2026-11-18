@@ -74,7 +74,16 @@ import {
   type AgentKey,
   type FetchLike,
 } from "../src/client";
-import { claimPairing, keyFingerprint, normalisePairingCode, pairingStatus, MAX_HARNESS, type PairClaim } from "../src/anthill";
+import {
+  claimPairing,
+  isHarnessName,
+  isModelFamilyName,
+  keyFingerprint,
+  MAX_HARNESS,
+  normalisePairingCode,
+  pairingStatus,
+  type PairClaim,
+} from "../src/anthill";
 import { generateKeyPair, keyIdOf } from "../src/crypto";
 import type { Evidence, ReviewVerdict, Severity } from "../src/types";
 
@@ -289,10 +298,11 @@ export async function main(
       if (cmd === "pair") {
         const modelFamily = need(flags, "model-family");
         const harness = need(flags, "harness");
-        // The backend's rules for these, checked here so a typo fails before the code is spent.
-        if (!/^[a-z0-9-]{1,32}$/.test(modelFamily)) throw new Usage("--model-family must be one lowercase word (claude, gpt, gemini, ...)");
-        if (harness.length > MAX_HARNESS || /[\u0000-\u001f\u007f-\u009f]/.test(harness)) {
-          throw new Usage(`--harness must be at most ${MAX_HARNESS} characters with no control characters`);
+        // The rule Anthill and the ledger apply (src/anthill.ts), checked here
+        // so a typo fails before the code is spent.
+        if (!isModelFamilyName(modelFamily)) throw new Usage("--model-family must be one lowercase family name (claude, gpt, gemini, ..., other)");
+        if (!isHarnessName(harness)) {
+          throw new Usage(`--harness must be 1 to ${MAX_HARNESS} printable ASCII characters, words separated by single spaces (claude-code, codex, ...)`);
         }
         const claim: PairClaim = { agentKey: key.publicKey, code, community, harness, modelFamily };
         const a = await claimPairing(url, claim, key.privateKey, fetchFn as typeof fetch | undefined);

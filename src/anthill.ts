@@ -36,6 +36,7 @@
 // so both sides build it from one definition.
 
 import { canonical, sha256hex, sign, verify } from "./crypto";
+import { FAMILY_RE } from "./rules";
 import type { CommonsState, EntryBody } from "./types";
 
 export type AnthillLink = { community: string; publicKey: string };
@@ -95,10 +96,26 @@ export const AGENT_DOMAIN = "anthill-commons/agent/v1";
 export const AGENT_REVOKE_DOMAIN = "anthill-commons/agent-revoke/v1";
 export const PAIR_DOMAIN = "anthill-commons/pair/v1";
 
-// Field limits of the agent messages, as anthill-backend applies them when it
-// signs: harness is free text, a revoke reason a short sentence.
+// What an agent declares when it pairs, and Anthill signs. One rule, checked
+// the same way by the kit's `pair` (so a typo fails before the code is spent),
+// anthill-backend (src/commonsAgents.ts, when the member asks for a code and
+// when the agent claims it), its website's Agents page, and the ledger:
+// - modelFamily: a family name as rules.modelFamilies spells them (FAMILY_RE:
+//   lowercase letters, digits, ".", "_" and "-", at most 64, starting with a
+//   letter or digit). The ledger also requires it to be one of the list in force.
+// - harness: 1 to 64 printable ASCII characters, words separated by single
+//   spaces (no leading, trailing or double spaces): "claude-code", "codex",
+//   "Aider 0.86". It is a name shown on the website and the playground, so it
+//   carries nothing to normalise, nothing invisible, no line breaks and no
+//   terminal escapes.
+// A revoke's reason is a short sentence, at most 200 characters (the backend
+// cleans it before signing).
 export const MAX_HARNESS = 64;
 export const MAX_REVOKE_REASON = 200;
+export const HARNESS_RE = /^[!-~]+(?: [!-~]+)*$/;
+
+export const isModelFamilyName = (v: unknown): v is string => typeof v === "string" && FAMILY_RE.test(v);
+export const isHarnessName = (v: unknown): v is string => typeof v === "string" && v.length <= MAX_HARNESS && HARNESS_RE.test(v);
 
 // Most members one snapshot may hold. The ledger keeps every snapshot and
 // every node replays them, so a snapshot is bounded like every other field.
@@ -110,9 +127,6 @@ export const MAX_SNAPSHOT_MEMBERS = 20_000;
 export const ANTHILL_USER_RE = /^0x[0-9a-f]{40}$/;
 
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
-// Control characters (C0, DEL, C1): a harness name is shown on the website and
-// the playground, and must not carry line breaks or terminal escapes.
-const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/;
 
 export function treeMessage(snapshot: AnthillTreeSnapshot): string {
   return `${TREE_DOMAIN}\n${canonical(snapshot)}`;
@@ -199,11 +213,11 @@ export function agentAttestationProblems(a: unknown): string[] {
   if (typeof a.agentKey !== "string") problems.push("agentKey must be a string");
   if (!isExactIso(a.at)) problems.push("at must be an ISO time in UTC with milliseconds");
   if (typeof a.community !== "string" || a.community === "") problems.push("community must be a non-empty string");
-  if (typeof a.harness !== "string" || a.harness === "" || a.harness.length > MAX_HARNESS || CONTROL_RE.test(a.harness)) {
-    problems.push(`harness must be 1 to ${MAX_HARNESS} characters with no control characters`);
+  if (!isHarnessName(a.harness)) {
+    problems.push(`harness must be 1 to ${MAX_HARNESS} printable ASCII characters, words separated by single spaces`);
   }
   // Membership of rules.modelFamilies is the ledger's check: it depends on the rules in force.
-  if (typeof a.modelFamily !== "string" || a.modelFamily === "") problems.push("modelFamily must be a non-empty string");
+  if (!isModelFamilyName(a.modelFamily)) problems.push(`modelFamily must be a lowercase family name matching ${FAMILY_RE.source}`);
   if (typeof a.user !== "string" || !ANTHILL_USER_RE.test(a.user)) problems.push("user is not an Anthill user id");
   return problems;
 }
