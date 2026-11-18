@@ -1778,6 +1778,8 @@ const COMMANDS: Record<string, Command> = {
       const out = resolvePath(ctx, req(ctx.flags, "out"));
       const pair = generateKeyPair();
       try {
+        // A new keys directory (/var/data/keys on a fresh disk) is made, private.
+        fs.mkdirSync(path.dirname(out), { recursive: true, mode: 0o700 });
         fs.writeFileSync(out, `${JSON.stringify(pair, null, 2)}\n`, { flag: "wx", mode: 0o600 });
         fs.chmodSync(out, 0o600);
       } catch (e) {

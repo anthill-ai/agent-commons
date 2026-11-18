@@ -235,6 +235,10 @@ test("spawned: keygen, init, owner add, agent register, propose, task, claim, su
   const again = spawnCli(dir, "keygen", "--out", "admin.json");
   assert.equal(again.status, 2);
   assert.match(again.stderr, /already exists/);
+  // Into a directory that does not exist yet (a fresh disk's keys/): made, private.
+  ok(spawnCli(dir, "keygen", "--out", "keys/nested/coord.json"));
+  assert.equal(fs.statSync(path.join(dir, "keys/nested/coord.json")).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(path.join(dir, "keys/nested")).mode & 0o777, 0o700);
 
   // --at far from the clock would freeze the ledger (and settle/promote judge
   // "now" by it): refused unless --force-time, and nothing is created.
