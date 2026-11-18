@@ -167,6 +167,7 @@ test("GET /api/agents?owner= lists an owner's agents with their public keys, old
       agents: [
         {
           keyId: keyIdOf(first.publicKey),
+          owner: A,
           publicKey: first.publicKey,
           modelFamily: "claude",
           harness: "claude-code",
@@ -175,9 +176,15 @@ test("GET /api/agents?owner= lists an owner's agents with their public keys, old
           revokedBy: "owner",
           registeredAt: entries[1]?.at,
         },
-        { keyId: keyIdOf(second.publicKey), publicKey: second.publicKey, modelFamily: "gpt", harness: "codex", active: true, registeredAt: entries[2]?.at },
+        { keyId: keyIdOf(second.publicKey), owner: A, publicKey: second.publicKey, modelFamily: "gpt", harness: "codex", active: true, registeredAt: entries[2]?.at },
       ],
     });
+    // one agent by key id, as commons-agent status asks
+    const one = (await (await fetch(`${c.url}/api/agents?agent=${keyIdOf(second.publicKey)}`)).json()) as { agent: string; agents: { owner: string; active: boolean }[] };
+    assert.equal(one.agent, keyIdOf(second.publicKey));
+    assert.deepEqual(one.agents.map((a) => [a.owner, a.active]), [[A, true]]);
+    assert.deepEqual(await (await fetch(`${c.url}/api/agents?agent=${"0".repeat(32)}`)).json(), { agent: "0".repeat(32), agents: [] });
+    assert.equal((await fetch(`${c.url}/api/agents?owner=${A}&agent=${keyIdOf(second.publicKey)}`)).status, 400);
     assert.deepEqual(await (await fetch(`${c.url}/api/agents?owner=${user(0xc)}`)).json(), { owner: user(0xc), agents: [] });
     assert.equal((await fetch(`${c.url}/api/agents`)).status, 400);
   } finally {
@@ -374,6 +381,20 @@ test("commons-agent pair: claims with a proof, prints the fingerprint, waits for
     const st = Ledger.open(c.ledgerPath).state();
     assert.equal(st.agents.get(keyIdOf(key.publicKey))?.owner, A);
     assert.equal(st.agents.get(keyIdOf(key.publicKey))?.harness, "claude-code");
+    // status: the paired agent may act; an unknown key, and later a revoked one, may not
+    const env = { COMMONS_URL: c.url, COMMONS_KEY_FILE: keyFile };
+    outs.length = 0;
+    assert.equal(await agentMain(["status"], env, io), 0, errs.join(""));
+    assert.deepEqual(JSON.parse(outs.pop() ?? "{}"), { keyId: keyIdOf(key.publicKey), owner: A, modelFamily: "claude", harness: "claude-code", active: true });
+    const strangerFile = path.join(dir, "stranger.json");
+    assert.equal(await agentMain(["keygen", "--out", strangerFile], {}, io), 0);
+    assert.equal(await agentMain(["status"], { COMMONS_URL: c.url, COMMONS_KEY_FILE: strangerFile }, io), 1);
+    assert.match(errs.join(""), /does not know this key/);
+    await postJson(`${c.url}/api/anthill/agent-revoke`, signedRevoke(c.anthill, A, key.publicKey, "done"));
+    outs.length = 0;
+    assert.equal(await agentMain(["status"], env, io), 1);
+    assert.equal((JSON.parse(outs.pop() ?? "{}") as { active?: boolean }).active, false);
+    assert.match(errs.join(""), /this agent is revoked: done; stop/);
 
     // A used code is refused; a wrong one too; neither is retried as if waiting.
     assert.equal(await agentMain([...args, "--code", code], {}, io), 1);

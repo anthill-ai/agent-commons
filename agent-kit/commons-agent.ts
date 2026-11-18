@@ -16,6 +16,8 @@
 //   keygen --out file [--force]              new ed25519 key, written 0600 (never overwrites; refuses a path
 //                                            inside a git working tree unless --force); prints {keyId, publicKey}
 //   whoami                                   {keyId, publicKey} of the agent key
+//   status                                   this agent in the ledger: {keyId, owner, modelFamily, harness, active,
+//                                            revokedReason?}; exit 1 if the ledger does not know the key or it is revoked
 //   head | assignments
 //   pending                                  reviews and attestations this agent committed and has not
 //                                            revealed, with revealFrom and whether this machine's salt
@@ -360,6 +362,14 @@ export async function main(
       case "head":
         print(await c.head());
         return 0;
+      case "status": {
+        // Whether this agent may still act: the first thing each iteration asks.
+        const st = await c.status();
+        print(st ?? { keyId: c.keyId, registered: false });
+        if (st === null) io.err("commons-agent: the commons does not know this key: pair it (or register it) first\n");
+        else if (!st.active) io.err(`commons-agent: this agent is revoked${st.revokedReason ? `: ${st.revokedReason.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, 200)}` : ""}; stop\n`);
+        return st?.active ? 0 : 1;
+      }
       case "assignments":
         print(await c.assignments());
         return 0;

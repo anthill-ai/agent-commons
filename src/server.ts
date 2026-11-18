@@ -48,7 +48,8 @@
 //   relay adds no trust). Re-posting an agent attestation that already
 //   landed answers 409 already-registered (already-revoked for a revoke),
 //   which a caller retrying after a lost answer treats as done.
-//   GET /api/agents?owner=<id> lists an owner's agents, revoked ones too.
+//   GET /api/agents?owner=<id> lists an owner's agents, revoked ones too
+//   (?agent=<keyId>: that one agent).
 // - GET /api/tasks (open=1: claimable ones) and GET /api/tasks/:id describe
 //   tasks from replay, GET /api/entries?since= serves the signed entries
 //   themselves (since inclusive; continue with `next`), so an agent can find
@@ -801,16 +802,22 @@ async function postAnthillAgent(
 // GET /api/agents?owner=<id>: an owner's agents, oldest first, revoked ones
 // included (all of it is in the ledger anyway). publicKey is there so Anthill
 // can sign a revoke attestation for an agent without having kept its key.
+// GET /api/agents?agent=<keyId>: that one agent (none if the ledger does not
+// know it), so an agent can check it is still active (commons-agent status).
 function ownerAgents(ctx: Ctx, url: URL) {
   const owner = url.searchParams.get("owner");
-  if (owner === null || owner === "") throw new HttpError(400, "malformed", "owner query parameter is required");
+  const agent = url.searchParams.get("agent");
+  if ((owner === null || owner === "") === (agent === null || agent === "")) {
+    throw new HttpError(400, "malformed", "exactly one of the owner and agent query parameters is required");
+  }
   const state = ctx.store.state();
   const entries = ctx.store.ledger.entries();
   const agents = [...state.agents.values()]
-    .filter((a) => a.owner === owner)
+    .filter((a) => (agent !== null && agent !== "" ? a.keyId === agent : a.owner === owner))
     .sort((x, y) => (x.registeredSeq ?? 0) - (y.registeredSeq ?? 0))
     .map((a) => ({
       keyId: a.keyId,
+      owner: a.owner,
       publicKey: state.publicKeys.get(a.keyId) ?? null,
       modelFamily: a.modelFamily,
       harness: a.harness,
@@ -818,7 +825,7 @@ function ownerAgents(ctx: Ctx, url: URL) {
       ...(a.active ? {} : { revokedReason: a.revokedReason ?? "", revokedBy: a.revokedBy ?? "owner" }),
       registeredAt: a.registeredSeq === undefined ? null : (entries[a.registeredSeq]?.at ?? null),
     }));
-  return { owner, agents };
+  return owner !== null && owner !== "" ? { owner, agents } : { agent, agents };
 }
 
 // An open submission still occupies a PR slot: not merged and not dead (a

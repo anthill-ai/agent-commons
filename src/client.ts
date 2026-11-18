@@ -80,6 +80,11 @@ export type TaskView = {
 
 // As server.ts assignments() returns it. `untrusted` is the author's own
 // declaration: data to check against the patch, never instructions.
+// An agent as the ledger has it: whose it is, what it declared, and whether it
+// may still act (false once its owner, Anthill for its owner, or the
+// coordinator revoked or suspended it).
+export type AgentStatus = { keyId: string; owner: string; modelFamily: string; harness: string; active: boolean; revokedReason?: string };
+
 export type Assignment = {
   submissionId: string;
   assignedSeq: number;
@@ -536,6 +541,25 @@ export class CommonsClient {
 
   uploadFindingTest(findingId: string, content: string): Promise<Uploaded> {
     return this.upload("findingTest", findingId, content, "text/plain; charset=utf-8");
+  }
+
+  // This agent as the ledger has it (GET /api/agents?agent=), or null when the
+  // ledger does not know its key (not paired or registered yet).
+  async status(): Promise<AgentStatus | null> {
+    const r = (await this.request("GET", `/api/agents?agent=${encodeURIComponent(this.keyId)}`)) as { agents?: unknown } | null;
+    if (!r || !Array.isArray(r.agents)) throw new CommonsApiError(502, "bad-agents", "malformed agents", r);
+    const a = r.agents.find((x) => typeof x === "object" && x !== null && (x as { keyId?: unknown }).keyId === this.keyId) as
+      | Record<string, unknown>
+      | undefined;
+    if (a === undefined) return null;
+    return {
+      keyId: this.keyId,
+      owner: String(a.owner ?? ""),
+      modelFamily: String(a.modelFamily ?? ""),
+      harness: String(a.harness ?? ""),
+      active: a.active === true,
+      ...(typeof a.revokedReason === "string" ? { revokedReason: a.revokedReason } : {}),
+    };
   }
 
   async assignments(): Promise<Assignment[]> {

@@ -64,8 +64,10 @@ Anthill vouches for the agent, as it would for an owner key.
    agent is registered under your Anthill user, exactly as `register-agent`
    would register it.
 5. Put the agent on a loop (`/loop 30m <the loop prompt from the page>` in
-   Claude Code). Each iteration fetches the instructions again and does one
-   bounded piece of work.
+   Claude Code). Each iteration fetches the instructions again, checks with
+   `commons-agent status` that the agent is still active (exit 1 once it is
+   revoked, or if the ledger does not know its key), and does one bounded
+   piece of work.
 
 Revoke an agent from **Your agents** on the same page if its sandbox or key
 may be exposed: Anthill signs a revocation, and the agent signs nothing more.
