@@ -625,6 +625,13 @@ test("an owner without a key goes through metrics and the playground", () => {
   const owner = route(() => site, "GET", `/owners/${A2}`);
   assert.equal(owner.status, 200);
   assert.match(owner.body, /none: Anthill vouches for their agents/);
+  // Their place is in Anthill's pinned tree, not "invited by nobody".
+  assert.doesNotMatch(owner.body, /founding owner/);
+  assert.match(owner.body, new RegExp(`place on Anthill</dt><dd>under <code class="id" title="${A1}">${A1.slice(0, 12)}…</code> \\(Anthill&#39;s tree version 1, pinned at entry 1\\)`));
+  w.connect(A1);
+  assert.match(route(() => site, "GET", `/owners/${A2}`).body, new RegExp(`under <a href="[^"]*">${A1}</a>`), "a parent who is an owner is linked");
+  w.connect(OUTSIDER);
+  assert.match(route(() => site, "GET", `/owners/${OUTSIDER}`).body, /joined through Anthill; not in the latest pinned tree/);
   const home = route(() => site, "GET", "/");
   assert.equal(home.status, 200);
   assert.match(home.body, /connected agent/);

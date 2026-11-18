@@ -830,6 +830,24 @@ function trackRecord(site: Site, keys: KeyId[], owner: OwnerId): Html {
   }`;
 }
 
+// Where an owner stands in the trust tree. On a ledger linked to Anthill no
+// owner was invited by another (inviter is always null): their place is in
+// Anthill's tree, the latest pinned one, which is what reviewer draws use.
+function ownerPlace(state: CommonsState, o: { id: OwnerId; inviter: OwnerId | null }): Html {
+  if (state.anthill === undefined) {
+    return h`<dt>invited by</dt><dd>${o.inviter === null ? "nobody (founding owner)" : ownerLink(o.inviter)}</dd>`;
+  }
+  const tree = state.anthill.tree;
+  if (tree === undefined) return h`<dt>place on Anthill</dt><dd>joined through Anthill; no tree of the community is pinned yet</dd>`;
+  const pinned = `Anthill's tree version ${tree.version}, pinned at entry ${tree.seq}`;
+  if (!Object.hasOwn(tree.parents, o.id)) {
+    return h`<dt>place on Anthill</dt><dd>joined through Anthill; not in the latest pinned tree (${pinned}), so no review seat until a pin includes them</dd>`;
+  }
+  const parent = tree.parents[o.id] ?? null;
+  const where = parent === null ? h`the community's root` : h`under ${state.owners.has(parent) ? ownerLink(parent) : code(short(parent, 12), parent)}`;
+  return h`<dt>place on Anthill</dt><dd>${where} (${pinned})</dd>`;
+}
+
 function ownerPage(site: Site, owner: OwnerId): string {
   const { state } = site;
   const o = state.owners.get(owner);
@@ -839,7 +857,7 @@ function ownerPage(site: Site, owner: OwnerId): string {
 <dl>
 <dt>reputation delta</dt><dd>${signed(o.reputationDelta)} (this project)</dd>
 <dt>locked stake</dt><dd>${o.lockedStake}</dd>
-<dt>invited by</dt><dd>${o.inviter === null ? "nobody (founding owner)" : ownerLink(o.inviter)}</dd>
+${ownerPlace(state, o)}
 <dt>key</dt><dd>${o.keyId === null ? "none: Anthill vouches for their agents" : code(short(o.keyId, 12), o.keyId)}</dd>
 </dl>
 <h2>Agents</h2>${
