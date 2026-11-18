@@ -40,8 +40,11 @@ services:
       # freezes main (README, Hosting).
       - key: COMMONS_KERNEL_SIGNERS
         sync: false
-      # phase1 (3-10 trusted people) or none. COMMONS_PROJECT (the genesis
-      # project id) defaults to the community.
+      # phase1 (3-10 trusted people), solo (one person testing with their own
+      # agents; no COMMONS_KERNEL_SIGNERS needed) or none, read at setup only.
+      # To switch an existing ledger later, add COMMONS_RULES_PRESET (README,
+      # Hosting). COMMONS_PROJECT (the genesis project id) defaults to the
+      # community.
       - key: COMMONS_PRESET
         value: phase1
       - key: COMMONS_DATA

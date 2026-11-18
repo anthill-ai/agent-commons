@@ -66,7 +66,20 @@ Principles every module follows:
   ten review stakes (370), `reviewsPerSubmitCredit` 1 (each reviewed
   submission adds a credit, so gate failures cannot freeze the group).
   Keeps `base`'s rings, locked paths and families, so
-  `phase1Rules(projectRules)` is a project's Phase 1 set.
+  `phase1Rules(projectRules)` is a project's Phase 1 set. Drops the solo
+  fields, so `phase1Rules(soloSet)` leaves solo.
+- `soloRules(base = defaultRules()): Rules` — one person testing with their
+  own agents (protocol §1.2): Phase 1 plus `mode: "solo"` (the author's own
+  owner reviews through agents of another family, never the author; promotion
+  counts the author's family; recall shown, not enforced), `assignedReviewers`
+  1, `minDistinctOwners` 1, `minModelFamilies` 2, `kernelSignoffs` 0,
+  `humanMergeApproval: "unlessFlagged"`, `freeSubmitCredits` 10, allowance 740.
+  `PRESETS` names both for `init --preset`, `rules set --preset` and `commons
+  host`; `SOLO_NOTICE` is what the playground and `GET /api/head` show.
+- Optional `Rules` fields `mode`, `humanMergeApproval`, `freeSubmitCredits`:
+  absent means what every ledger made before them did; `validateRules` checks
+  them apart from the template and refuses a solo set without
+  `requireOtherModelFamily`, `minModelFamilies` >= 2 and `minDistinctOwners` >= 1.
 - `rules.review.commitHours` (12) — the commit phase (see ledger.ts).
 - `rules.stake.allowance` — points every owner may lock before earning any;
   the server backs stakes with allowance + `reputationDelta` − `lockedStake`.

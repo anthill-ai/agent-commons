@@ -87,7 +87,7 @@ import { DEFAULT_MAX_SKEW_MS, isCanonicalPath, isRefSafeId, Ledger, LedgerError,
 import { plantCommitment, reviewWindowClosed } from "./plants";
 import { commitmentFor } from "./review";
 import { ringOf } from "./gates/rings";
-import { claimStake, defaultRules, phase1Rules, validateRules } from "./rules";
+import { claimStake, defaultRules, isPresetName, isSolo, PRESETS, SOLO_NOTICE, validateRules } from "./rules";
 import { createCoordinatorServer, findingTestFile, LedgerStore, patchFile, proxyMatcher, SAFE_ID, type SubmitPolicy, summarisePatch } from "./server";
 import type {
   CommonsState,
@@ -1422,7 +1422,7 @@ const SANDBOX_FLAGS: Record<string, FlagSpec> = {
 // coordinator take the same ones, so both apply the same rule.
 const MERGE_RULE_FLAGS: Record<string, FlagSpec> = {
   "review-window-hours": { type: "string", help: "hours reviewers have to reveal (default 48)" },
-  phase: { type: "string", help: "1 (every merge needs an `approve` entry, default) or 2 (only flagged ones do)" },
+  phase: { type: "string", help: "1 (every merge needs an `approve` entry, default) or 2 (only flagged ones do); ignored when the ledger's rules set humanMergeApproval, as solo does" },
   "required-gate": { type: "list", help: "gate every submission must pass (repeatable; default declaredChange, rings, airlock, size, specSeparation)" },
   "dev-ref": { type: "string", help: `the dev branch in --repo: bases must be on it, merges land on it (default ${DEFAULT_DEV_REF})` },
 };
@@ -1807,7 +1807,10 @@ const COMMANDS: Record<string, Command> = {
       rules: { type: "string", help: "rules JSON, e.g. the target project's .commons/rules.json with its kernel paths (default: built-in generic rules)" },
       preset: {
         type: "string",
-        help: "phase1: 3-10 trusted people, owners added with owner add (minTreeDistance 1, 2 reviewers, 1 kernel signoff); applied on top of --rules",
+        help:
+          "phase1: 3-10 trusted people, owners added with owner add (minTreeDistance 1, 2 reviewers, 1 kernel signoff); " +
+          "solo: one person testing alone, whose own agents of another model family review each other (rules.mode solo; no kernel signoff, no mergeApproval unless a reviewer flags a defect); " +
+          "applied on top of --rules",
       },
       "kernel-signer": { type: "list", help: "owner id who may sign off kernel changes (repeatable; sets rules.kernelSigners)" },
       "anthill-community": { type: "string", help: "link the ledger to this Anthill community: its tree is the trust tree and Anthill admits owners" },
@@ -1828,9 +1831,9 @@ const COMMANDS: Record<string, Command> = {
         usage("--anthill-key and --anthill-url need --anthill-community");
       }
       const preset = str(f, "preset");
-      if (preset !== undefined && preset !== "phase1") usage(`unknown --preset ${preset} (known: phase1)`);
+      if (preset !== undefined && !isPresetName(preset)) usage(`unknown --preset ${preset} (known: ${Object.keys(PRESETS).join(", ")})`);
       let rules = str(f, "rules") !== undefined ? readRules(ctx, req(f, "rules")) : defaultRules();
-      if (preset === "phase1") rules = phase1Rules(rules);
+      if (preset !== undefined) rules = PRESETS[preset](rules);
       const signers = list(f, "kernel-signer");
       if (signers.length > 0) {
         rules = { ...rules, kernelSigners: signers };
@@ -1854,6 +1857,58 @@ const COMMANDS: Record<string, Command> = {
       const g = ledger.entries()[0] as LedgerEntry;
       ctx.out(`created ${p}`);
       report(ctx, g, `rules v${rules.version}${anthill === undefined ? "" : `, linked to Anthill community ${anthill.community}`}`);
+      if (isSolo(rules)) ctx.out(`${SOLO_NOTICE} (rules.mode solo; leave it with commons rules set --preset phase1)`);
+      return 0;
+    },
+  ),
+
+  "rules set": command(
+    "change the ledger's rules: an admin-signed rulesChange with a preset applied to the current rules (or to --rules), checked by the ledger like any rulesChange",
+    {
+      preset: { type: "string", help: `${Object.keys(PRESETS).join(" or ")}, applied on top of the ledger's current rules (or of --rules); phase1 leaves solo` },
+      rules: { type: "string", help: "a whole rules JSON file to switch to (with --preset, the preset is applied on top of it)" },
+      "kernel-signer": { type: "list", help: "owner id who may sign off kernel changes (repeatable; replaces rules.kernelSigners)" },
+      "admin-key": { type: "string", help: "a genesis admin's key file, which signs the rulesChange (or --key; with --data default <data>/keys/admin.json)" },
+      data: { type: "string", help: "a commons host data directory: its ledger and, unless --admin-key, its keys/admin.json (instead of --ledger)" },
+      "poll-id": { type: "string", help: "the rulesChange's pollId (default rules-v<new version>)" },
+    },
+    (ctx) => {
+      const f = ctx.flags;
+      const data = str(f, "data");
+      if (data !== undefined && str(f, "ledger") !== undefined) usage("--data names the ledger: drop --ledger");
+      if (str(f, "admin-key") !== undefined && str(f, "key") !== undefined) usage("give the admin key once: --admin-key or --key");
+      const layout = data === undefined ? null : hostLayout(resolvePath(ctx, data));
+      if (layout !== null) f.ledger = layout.ledger;
+      const keyFile = str(f, "admin-key") ?? str(f, "key") ?? layout?.adminKey ?? usage("rules set needs --admin-key (a genesis admin's key file)");
+      const preset = str(f, "preset");
+      if (preset !== undefined && !isPresetName(preset)) usage(`unknown --preset ${preset} (known: ${Object.keys(PRESETS).join(", ")})`);
+      if (preset === undefined && str(f, "rules") === undefined) usage("rules set needs --preset or --rules");
+      const st = state(ctx);
+      const current = st.rules;
+      let next: Rules = str(f, "rules") !== undefined ? readRules(ctx, req(f, "rules")) : structuredClone(current);
+      if (preset !== undefined) next = PRESETS[preset](next);
+      const signers = list(f, "kernel-signer");
+      if (signers.length > 0) next = { ...next, kernelSigners: signers };
+      // Same rules but for the version: nothing to append (commons host
+      // applies its rules preset at every start, so this must be a no-op).
+      const same = (a: Rules, b: Rules) => canonical({ ...a, version: 0 }) === canonical({ ...b, version: 0 });
+      if (same(next, current)) {
+        ctx.out(`rules unchanged: v${current.version} already ${preset === undefined ? "holds these rules" : `is the ${preset} preset of itself`}${isSolo(current) ? ` (${SOLO_NOTICE})` : ""}`);
+        return 0;
+      }
+      next = { ...next, version: Math.max(next.version, current.version + 1) };
+      const problems = validateRules(next);
+      if (problems.length > 0) usage(`the new rules are invalid:\n  ${problems.join("\n  ")}`);
+      const pollId = str(f, "poll-id") ?? `rules-v${next.version}`;
+      const signer = readKey(ctx, resolvePath(ctx, keyFile));
+      if (!st.adminKeys.includes(keyIdOf(signer.publicKey))) usage(`${keyFile} is not a genesis admin key of this ledger; only an admin signs a rulesChange`);
+      const entry = appendLocal(ctx, { kind: "rulesChange", rules: next, pollId }, signer);
+      const mode = (r: Rules) => (isSolo(r) ? "solo" : "independent review");
+      report(ctx, entry, `rules v${current.version} -> v${next.version} (${mode(current)} -> ${mode(next)})`);
+      if (isSolo(next)) ctx.out(SOLO_NOTICE);
+      else if (next.promotion.kernelSignoffs > 0 && next.kernelSigners.length === 0) {
+        ctx.out(`warning: kernelSignoffs is ${next.promotion.kernelSignoffs} but no kernel signer is named, so nothing touching ring 0 can be promoted (rules set --kernel-signer)`);
+      }
       return 0;
     },
   ),
@@ -2836,8 +2891,12 @@ const COMMANDS: Record<string, Command> = {
       community: { type: "string", help: "the Anthill community (env ANTHILL_COMMUNITY; default builders)" },
       project: { type: "string", help: "setup: the project id in the genesis (env COMMONS_PROJECT; default the community)" },
       "target-repo": { type: "string", help: "setup: public https URL of the repository to build, no credentials (env COMMONS_TARGET_REPO)" },
-      "kernel-signer": { type: "list", help: "setup: Anthill user id (0x + 40 hex) who signs off kernel changes; name two (env COMMONS_KERNEL_SIGNERS, comma-separated)" },
-      preset: { type: "string", help: "setup: phase1 or none (env COMMONS_PRESET; default phase1)" },
+      "kernel-signer": { type: "list", help: "setup: Anthill user id (0x + 40 hex) who signs off kernel changes; name two, none with preset solo (env COMMONS_KERNEL_SIGNERS, comma-separated)" },
+      preset: { type: "string", help: "setup: phase1, solo (one person testing with their own agents) or none (env COMMONS_PRESET; default phase1)" },
+      "rules-preset": {
+        type: "string",
+        help: "on every start over an existing ledger: switch its rules to this preset (phase1 or solo) unless they already are it, an admin-signed rulesChange with keys/admin.json; with --kernel-signer (or its env) those become the kernel signers (env COMMONS_RULES_PRESET)",
+      },
       "base-path": { type: "string", help: "serve under this path behind a reverse proxy, e.g. /commons/builders (env COMMONS_BASE_PATH)" },
       "public-url": { type: "string", help: "the coordinator's public URL, for the COMMONS_SITES line setup prints (env COMMONS_PUBLIC_URL; default RENDER_EXTERNAL_URL + base path)" },
       "trusted-proxy": { type: "list", help: "as serve --trusted-proxy (loopback for a parent process proxying on this machine)" },
@@ -2962,6 +3021,37 @@ const COMMANDS: Record<string, Command> = {
         if (missing.length > 0) {
           say(`the ledger exists, but ${missing.join(" and ")} is missing; setup never runs over a ledger`);
           return fail("This commons cannot start; the operator has the details in the logs.");
+        }
+      }
+
+      // The rules preset: switch an existing ledger's rules (leaving solo, say)
+      // with the one command an operator with no shell can run: set the
+      // variable and restart. `rules set` appends nothing if they already are it.
+      const rulesPreset = pick("rulesPreset")?.trim();
+      if (rulesPreset !== undefined && rulesPreset !== "") {
+        const signerIds = (signerFlags.length > 0 ? signerFlags : envSigners === undefined ? [] : [envSigners])
+          .flatMap((x) => x.split(","))
+          .map((x) => x.trim().toLowerCase())
+          .filter((x) => x !== "");
+        say(`rules: switching to the ${rulesPreset} preset if they are not already (${settingName("rulesPreset")})`);
+        const code = await main(
+          ["rules", "set", "--data", layout.data, "--preset", rulesPreset, ...signerIds.flatMap((id) => ["--kernel-signer", id])],
+          { ...ctx.io, stdout: (t) => ctx.io.stderr(`commons host: ${t}`) },
+        );
+        if (code !== 0) {
+          say(`cannot switch the rules to ${rulesPreset} (exit ${code}; its error is above): unset ${settingName("rulesPreset")} to serve as they are`);
+          return fail("This commons cannot start; the operator has the details in the logs.");
+        }
+      } else if (!fresh && pick("preset") !== undefined) {
+        // COMMONS_PRESET is read at setup only: say so when it no longer matches.
+        let solo: boolean | null = null;
+        try {
+          solo = isSolo(Ledger.open(layout.ledger).state().rules);
+        } catch {
+          // serve reports a ledger it cannot read
+        }
+        if (solo !== null && solo !== (pick("preset")?.trim() === "solo")) {
+          say(`note: ${settingName("preset")} is read at setup only; this ledger's rules are ${solo ? "solo" : "not solo"}. To switch them set ${settingName("rulesPreset")}`);
         }
       }
 

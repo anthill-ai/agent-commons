@@ -32,6 +32,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { ANTHILL_USER_RE, fetchAnthillKey, fetchAnthillTree, treeMessage } from "./anthill";
 import { generateKeyPair, keyIdOf, sign, verify } from "./crypto";
+import { SOLO_NOTICE } from "./rules";
 
 export type HostLayout = {
   data: string;
@@ -62,8 +63,14 @@ export type HostSettings = {
   project: string;
   targetRepo: string;
   kernelSigners: string[];
-  preset: "phase1" | "none";
+  preset: HostPreset;
 };
+
+// The setup presets: the rules presets (rules.ts PRESETS) or none, the
+// generic defaults. Solo is one person testing with their own agents: no
+// kernel signer is needed (kernelSignoffs 0).
+export const HOST_PRESETS = ["phase1", "solo", "none"] as const;
+export type HostPreset = (typeof HOST_PRESETS)[number];
 
 // Each setting as a flag and as an environment variable (a flag wins).
 export const HOST_SETTINGS = {
@@ -73,6 +80,10 @@ export const HOST_SETTINGS = {
   targetRepo: { flag: "target-repo", env: "COMMONS_TARGET_REPO" },
   kernelSigners: { flag: "kernel-signer", env: "COMMONS_KERNEL_SIGNERS" },
   preset: { flag: "preset", env: "COMMONS_PRESET" },
+  // Not a setup setting: on every start over an existing ledger, its rules
+  // are switched to this preset (an admin-signed rulesChange with
+  // keys/admin.json, through `commons rules set`) unless they already are it.
+  rulesPreset: { flag: "rules-preset", env: "COMMONS_RULES_PRESET" },
 } as const;
 
 export const settingName = (k: keyof typeof HOST_SETTINGS) => `${HOST_SETTINGS[k].env} (--${HOST_SETTINGS[k].flag})`;
@@ -95,7 +106,7 @@ const COMMUNITY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const ONE_SIGNER_WARNING =
   "only one kernel signer is named. A kernel signer may not sign off a snapshot that holds their own ring-0 work, " +
   "so once a ring-0 change of theirs (or of an agent of theirs) merges to dev, no snapshot holding it can be signed off: " +
-  "main stops moving until an admin-signed rulesChange (which no CLI command writes yet) or a new ledger adds a second signer. " +
+  "main stops moving until an admin-signed rulesChange (commons rules set --kernel-signer) or a new ledger adds a second signer. " +
   "Until then that signer should keep their own work out of ring 0. Signing off also takes an owner key (anthill join): " +
   "a member admitted only through the Agents page has none.";
 
@@ -168,11 +179,14 @@ export function readHostSettings(raw: RawHostSettings, opts: { allowFileTarget?:
     if (signers.includes(id)) problems.push(`${settingName("kernelSigners")} names ${id} twice`);
     else signers.push(id);
   }
-  if (signers.length === 0 && !problems.some((p) => p.startsWith(HOST_SETTINGS.kernelSigners.env))) missing.push(settingName("kernelSigners"));
-  if (signers.length === 1) warnings.push(`${settingName("kernelSigners")}: ${ONE_SIGNER_WARNING}`);
-
   const preset = val(raw.preset) ?? "phase1";
-  if (preset !== "phase1" && preset !== "none") problems.push(`${settingName("preset")} must be phase1 or none`);
+  const knownPreset = (HOST_PRESETS as readonly string[]).includes(preset);
+  if (!knownPreset) problems.push(`${settingName("preset")} must be phase1, solo or none`);
+  // Solo requires no kernel sign-off, so it needs no signer, and one cannot freeze main.
+  const solo = preset === "solo";
+  if (!solo && signers.length === 0 && !problems.some((p) => p.startsWith(HOST_SETTINGS.kernelSigners.env))) missing.push(settingName("kernelSigners"));
+  if (!solo && signers.length === 1) warnings.push(`${settingName("kernelSigners")}: ${ONE_SIGNER_WARNING}`);
+  if (solo) warnings.push(`${settingName("preset")} solo: ${SOLO_NOTICE}. Reviews are by the author's own agents of another model family; leave solo with ${settingName("rulesPreset")} phase1, or commons rules set --data <data> --preset phase1`);
 
   if (missing.length > 0 || problems.length > 0) return { missing, problems, warnings };
   return {
@@ -182,7 +196,7 @@ export function readHostSettings(raw: RawHostSettings, opts: { allowFileTarget?:
       project,
       targetRepo: targetRepo as string,
       kernelSigners: signers,
-      preset: preset as "phase1" | "none",
+      preset: preset as HostPreset,
     },
     missing,
     problems,
@@ -435,7 +449,7 @@ export async function setUp(l: HostLayout, s: HostSettings, deps: SetupDeps): Pr
     "--coordinator-key",
     l.coordKey,
     ...(rules === null ? [] : ["--rules", rules]),
-    ...(s.preset === "phase1" ? ["--preset", "phase1"] : []),
+    ...(s.preset === "none" ? [] : ["--preset", s.preset]),
     ...s.kernelSigners.flatMap((id) => ["--kernel-signer", id]),
     "--anthill-community",
     s.community,
@@ -459,7 +473,7 @@ export async function setUp(l: HostLayout, s: HostSettings, deps: SetupDeps): Pr
   }
   const url = deps.publicUrl ?? "https://<this coordinator's public URL>";
   deps.log(`setup done: ledger ${l.ledger}, coordinator key ${keyIdOf(keys.coord)}, admin key ${keyIdOf(keys.admin)} (${l.adminKey}; README, Hosting: moving it off the disk)`);
-  deps.log(`kernel signers: ${s.kernelSigners.join(", ")}; preset ${s.preset}`);
+  deps.log(`kernel signers: ${s.kernelSigners.length === 0 ? "none" : s.kernelSigners.join(", ")}; preset ${s.preset}${s.preset === "solo" ? ` (${SOLO_NOTICE})` : ""}`);
   deps.log(`public URL: ${url}${deps.publicUrl === undefined ? " (not known here: set --public-url or COMMONS_PUBLIC_URL)" : ""}`);
   deps.log(`set COMMONS_SITES on the anthill-backend service to (or add this community's key to the object it holds):`);
   deps.log(sitesValue(s, url));

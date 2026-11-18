@@ -72,6 +72,54 @@ only when every plant was caught until twelve seeds (from twelve, 11 of 12
 passes), which says "almost nothing has slipped through", not that recall was
 measured.
 
+### 1.2 Solo: one person testing alone
+
+Before a group exists, one person can run the whole loop with their own
+agents of two model families (a Claude Code agent and a Codex agent, say),
+with no owner key of their own: `soloRules()`, `commons init --preset solo`,
+or `COMMONS_PRESET=solo` for `commons host` (§1.1's Phase 1 plus only what one
+person needs). It is marked in the rules, `rules.mode` `"solo"`, and
+`GET /api/head`, `/api/state` and every playground page say so: "solo test:
+your own agents review each other". It is not independent review.
+
+- **Reviewers.** The author's own owner is drawn too, with the fewest
+  tickets (weight 1, §5.6), but only through its agents of another model
+  family than the author agent, never the author itself; every other owner
+  is drawn as in Phase 1, so once a second person joins, their agents are
+  preferred. The ledger accepts that agent's assignment, review commit and
+  finding on the submission; attestations, snapshot findings and decisions
+  keep the owner rule. `requireOtherModelFamily` is the one independence
+  rule left, and `validateRules` refuses a solo set without it.
+- **Promotion** (§5.11): `minDistinctOwners` 1 and `minModelFamilies` 2,
+  where solo counts the author's own family with its reviewers' (written by
+  one family, reviewed by another); an own-owner reviewer of the author's
+  family never counts. `kernelSignoffs` 0: no sign-off, so no signer's own
+  ring-0 work can freeze main, and no kernel signer need be named. Seeded
+  recall is shown but not enforced (`minSeeds` 0): every plant is the
+  custodian's owner's work and that owner's catches never count (§7.1), so
+  with one owner every plant reads as missed. Plants still commit, submit,
+  reveal and block their merge and their snapshot.
+- **Merges** (§5.9): `rules.humanMergeApproval` `"unlessFlagged"`: no
+  `mergeApproval` unless a revealed review flags a defect (p ≥ 0.5). The rule
+  is in the ledger's rules, so no coordinator flag is needed and the ledger
+  says what governed each merge.
+- **Credits and stakes**: `freeSubmitCredits` 10 (each reviewed submission
+  earns back its credit at `reviewsPerSubmitCredit` 1; the ten are headroom
+  for submissions that fail a gate), `assignedReviewers` 1 (one owner fills
+  one seat), and a stake allowance (740) for both agents holding the largest
+  claim at once plus twenty review stakes. Reviewing your own agents earns no
+  clean-review reward or bounty (distance 0).
+
+`mode`, `humanMergeApproval` and `freeSubmitCredits` are optional rules
+fields: absent (every ledger made before them) means exactly what those
+ledgers did. **Leaving solo** is an admin-signed `rulesChange`: `commons rules
+set --preset phase1 --admin-key <admin key> [--kernel-signer <id> ...]` (or
+`--rules <file>`), or, for `commons host`, `--data <data dir>` instead of the
+key, or `COMMONS_RULES_PRESET=phase1` and a restart. Promotion is judged
+under the rules in force, so solo-reviewed work not yet on main then needs
+independent coverage; draws made under solo still verify under the rules
+they ran under.
+
 ## 2. Roles, identities and keys
 
 Every signer is an ed25519 key, and every key belongs to a role fixed by the ledger.
@@ -124,7 +172,8 @@ need some admin key; genesis may list several.
   and open reviewers alike.
 - An owner's agents may not review, attest, sign off or file findings on that
   owner's work. For a snapshot, "that owner's work" is any submission the
-  snapshot covers (§5.10).
+  snapshot covers (§5.10). Under solo rules (§1.2) an agent of another model
+  family than the author may review and file findings on the submission.
 - A revoked agent cannot sign anything afterwards. Its past entries stay valid.
 - An owner has exactly one key. Owner key rotation is **not built**.
 - Keep the owner key off the machine where agents run. Agent keys are cheap to
@@ -191,10 +240,10 @@ disagree, the code is right and this table is stale.
 | `claim` | agent | Lock on a task until `until`, with stake | Task exists and not merged; stake ≥ `max(1, claimStake)` (§5.3); `until` after `at` and at most 7 days after it; no live claim by another active agent (a claim is live through its `until` instant; the holder may extend, but an unbroken run of extensions is capped at 7 days unless the holder submitted for the task since its previous claim, and a re-claim at exactly `until` is an extension). Every claim is kept (`claimHistory`), so a lapsed one is settled even after it is replaced |
 | `submission` | agent | A change: base and head commits, changed files, lines changed | Unique id, also ignoring letter case (it names the patch file), and a valid git ref name component (no `:`, `..`, or `.`/`.lock` ending: it names `refs/commons/<id>`); if it names a task, the task has not merged and the signer holds a live claim on it; if it names no task, it touches no ring 0 path; changed files non-empty, canonical, distinct; `planted` never set |
 | `gateResult` | coordinator | One gate's pass/fail and reason | Submission exists |
-| `reviewAssignment` | coordinator | Beacon, entropy, tree digest and drawn reviewers | Not merged; no earlier assignment; `treeDigest` = the member-tree digest of the state before the entry; beacon = `assignmentBeacon(submissionId, headCommit, entropy)` (§5.6); at least one reviewer; active agents; distinct owners; none of the author's owner; no seat for an agent whose owner already committed through another agent |
-| `reviewCommit` | agent | Hash of a verdict, with stake | Not merged; not the author's owner; one per owner (and an owner holding a seat commits through its seated agent); a commitment not already posted on the submission; stake ≥ `stake.review`; closed at the end of the commit phase (`review.commitHours` after the assignment), once any review on it is revealed, once it is a revealed plant, or while a reproduction on it stands undismissed |
+| `reviewAssignment` | coordinator | Beacon, entropy, tree digest and drawn reviewers | Not merged; no earlier assignment; `treeDigest` = the member-tree digest of the state before the entry; beacon = `assignmentBeacon(submissionId, headCommit, entropy)` (§5.6); at least one reviewer; active agents; distinct owners; none of the author's owner (solo, §1.2: unless of another model family than the author, never the author); no seat for an agent whose owner already committed through another agent |
+| `reviewCommit` | agent | Hash of a verdict, with stake | Not merged; not the author's owner (solo: unless of another family than the author, never the author); one per owner (and an owner holding a seat commits through its seated agent); a commitment not already posted on the submission; stake ≥ `stake.review`; closed at the end of the commit phase (`review.commitHours` after the assignment), once any review on it is revealed, once it is a revealed plant, or while a reproduction on it stands undismissed |
 | `reviewReveal` | the committing agent | Verdict and salt | The submission has an assignment, and every assigned reviewer committed or the commit phase ended; matches the commit; valid verdict; cited findings target this submission |
-| `finding` | agent | Claimed defect, severity, test path and command, stake | Unique id, also ignoring letter case (it names the test file); target is exactly one submission or snapshot; not the finder's owner's work; canonical test path; stake ≥ `stake.finding` |
+| `finding` | agent | Claimed defect, severity, test path and command, stake | Unique id, also ignoring letter case (it names the test file); target is exactly one submission or snapshot; not the finder's owner's work (solo: a submission may take one from an agent of another family than its author); canonical test path; stake ≥ `stake.finding` |
 | `findingResult` | coordinator | Harness output, or `harnessError` when the harness could not judge | One per finding; `reproduced = failsOnHead && passesOnParent`; with `harnessError`, `reproduced` is false |
 | `findingAttempt` | coordinator | One harness run that could not judge a finding | Finding exists and has no result. The count drives `maxHarnessErrors` across restarts |
 | `findingDecision` | operator: an admin, or an owner in `rules.kernelSigners` | A reproduction confirmed as a real defect, or dismissed as testing the intended change, with a reason | Finding reproduced; not decided yet; an owner decides neither its own finding nor one on its own work |
@@ -211,7 +260,7 @@ disagree, the code is right and this table is stale.
 | `honeytokenTriggered` | coordinator | An agent obeyed a decoy instruction | Agent exists |
 | `escape` | coordinator | A confirmed defect found in a promoted snapshot | Finding reproduced and confirmed; snapshot promoted; finding is on something that snapshot or its ancestors shipped; once per finding |
 | `settlement` | coordinator | A reputation movement: owner, delta, reason, ref | Owner exists; the same (owner, reason, ref) never twice |
-| `rulesChange` | admin | New rules and the id of the group decision (poll) that ratified them | Rules valid; version increases. The poll id is recorded, not checked |
+| `rulesChange` | admin | New rules and the id of the group decision (poll) that ratified them (`commons rules set`) | Rules valid; version increases. The poll id is recorded, not checked |
 
 What replay does not check:
 
@@ -564,7 +613,7 @@ The coordinator merges when `mergeReadiness` in `src/coordinator.ts` reports no 
 | Plant grace | While a plant commitment is unrevealed, the merge waits `plantRevealGraceHours` (1) after the entry that closed the review window on the ledger: the custodian may reveal only once the window is closed there (§7.1), so it can always reveal before a plant merges |
 | Findings | No finding without a result, and no reproduction that is undecided or confirmed |
 | Not a plant | A revealed plant never merges |
-| Human approval | A `mergeApproval` entry by an operator who is not the author's owner. Phase 1: every merge. Phase 2: only a submission a majority of its revealed assigned reviewers flagged |
+| Human approval | A `mergeApproval` entry by an operator who is not the author's owner. When the rules name `humanMergeApproval`, they decide: `"always"` every merge, `"unlessFlagged"` (solo, §1.2) only a submission a revealed review flagged. Otherwise the coordinator's `--phase`: Phase 1 every merge, Phase 2 only a submission a majority of its revealed assigned reviewers flagged |
 | Merges cleanly | A bound head that conflicts with dev is not retried for ever: the coordinator records a failed `merge` gate, which closes the submission (its PR slot and review stakes are released), and the author resubmits on the new dev. The local bridge merges without rename detection and refuses (as a conflict) a merge that would change any path outside the gated change `baseCommit..head`: otherwise an edit to a file dev renamed since the base would follow the rename into a path, perhaps ring 0, that no gate or reviewer saw |
 
 Approvals and finding decisions are ledger entries (`commons approve`,

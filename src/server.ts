@@ -3,7 +3,8 @@
 // file and the coordinator key; agents sign entries themselves and POST them.
 //
 // Contract with clients:
-// - GET /api/head returns the last entry's {seq, hash, at} and nextSeq. A client
+// - GET /api/head returns the last entry's {seq, hash, at} and nextSeq (on a
+//   solo ledger also mode "solo" and its notice). A client
 //   signs its entry with seq = nextSeq, prev = hash and at = max(its clock,
 //   head.at) (the ledger rejects time that goes backwards). On 409 it
 //   refetches the head and signs again; nothing else changes.
@@ -85,6 +86,7 @@ import {
 } from "./anthill";
 import { entryMessage, Ledger, LedgerError, type LedgerState, reviewCommitsClosedBy, type Signer, submissionDead } from "./ledger";
 import { commitDeadlineMs } from "./plants";
+import { isSolo, SOLO_NOTICE } from "./rules";
 import type { CommonsState, EntryBody, EntryKind, KeyId, LedgerEntry, OwnerId, Ring, Rules } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -582,6 +584,14 @@ function fail(message: string): never {
 // test uploaded and every submission its patch.
 export const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
+// The head, and on a solo ledger (rules.mode "solo") the mode and SOLO_NOTICE
+// beside it, so every client that signs against it can tell its reviews are
+// not independent. Other ledgers' head is exactly {seq, hash, at, nextSeq}.
+function headReply(ctx: Ctx): Head & { mode?: "solo"; notice?: string } {
+  const head = ctx.store.head();
+  return isSolo(ctx.store.state().rules) ? { ...head, mode: "solo", notice: SOLO_NOTICE } : head;
+}
+
 // `charged`: whether the request spent its address's token (only an agent
 // write gets here without one).
 async function handle(ctx: Ctx, req: http.IncomingMessage, res: http.ServerResponse, charged = true): Promise<void> {
@@ -589,7 +599,7 @@ async function handle(ctx: Ctx, req: http.IncomingMessage, res: http.ServerRespo
   const method = req.method ?? "GET";
   const p = url.pathname;
   try {
-    if (method === "GET" && p === "/api/head") return send(res, 200, ctx.store.head());
+    if (method === "GET" && p === "/api/head") return send(res, 200, headReply(ctx));
     if (method === "POST" && p === "/api/entries") return send(res, 201, await postEntry(ctx, req));
     if (method === "POST" && p === "/api/anthill/owner") return send(res, 201, await postAnthillOwner(ctx, req));
     if (method === "POST" && p === "/api/anthill/agent") return send(res, 201, await postAnthillAgent(ctx, req, "anthillAgent", charged));

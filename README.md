@@ -51,6 +51,17 @@ each other, so under the default rules (`minTreeDistance` 2) nobody is
 eligible to review ([§5.6](docs/protocol.md#56-reviewer-assignment)).
 The checklist for a first Phase 1 week is in [HANDOFF.md](HANDOFF.md).
 
+Before a group exists, one person can test the whole loop alone with the
+`solo` preset (`init --preset solo`, or `COMMONS_PRESET=solo` for `commons
+host`): their own agents of two model families review each other (never the
+author, never the author's family), promotion needs no kernel sign-off, and
+merges need no `commons approve` unless a reviewer flags a defect. The
+ledger's rules say `mode: "solo"`, and `GET /api/head` and every playground
+page say "solo test: your own agents review each other": it is not
+independent review. An admin leaves it with one command, `commons rules set
+--preset phase1 --admin-key admin.json --kernel-signer <id> ...`
+([protocol §1.2](docs/protocol.md#12-solo-one-person-testing-alone)).
+
 | Part | State |
 | --- | --- |
 | `crypto`, `rules`, `ledger`, `members` (the trust tree) | Written, tested |
@@ -224,10 +235,11 @@ Each setting is also read from the environment (a flag wins):
 | --- | --- | --- |
 | `ANTHILL_URL` | `--anthill-url` | required: the Anthill backend's own URL (the API, e.g. `https://api.anthill.example`, not the website) |
 | `COMMONS_TARGET_REPO` | `--target-repo` | required for setup: the public https URL of the repository to build. Checked strictly: https only, no `user:token@`, no query or fragment (it is logged and shown to every agent) |
-| `COMMONS_KERNEL_SIGNERS` | `--kernel-signer` | required for setup: Anthill user ids (`0x` and 40 hex digits), comma-separated in the variable. At least one; name two (below) |
+| `COMMONS_KERNEL_SIGNERS` | `--kernel-signer` | required for setup (not with preset `solo`): Anthill user ids (`0x` and 40 hex digits), comma-separated in the variable. At least one; name two (below) |
 | `ANTHILL_COMMUNITY` | `--community` | default `builders` |
 | `COMMONS_PROJECT` | `--project` | the genesis project id; default the community |
-| `COMMONS_PRESET` | `--preset` | `phase1` (default) or `none` |
+| `COMMONS_PRESET` | `--preset` | setup only: `phase1` (default), `solo` (one person testing with their own agents, below) or `none` |
+| `COMMONS_RULES_PRESET` | `--rules-preset` | on every start over an existing ledger: switch its rules to `phase1` or `solo` unless they already are it (an admin-signed `rulesChange` with `<data>/keys/admin.json`; with `COMMONS_KERNEL_SIGNERS` set, those become the kernel signers). Unset it once switched, or leave it: a start that finds the rules already switched appends nothing |
 | `COMMONS_BASE_PATH` | `--base-path` | serve under a path behind a reverse proxy, e.g. `/commons/builders` |
 | `COMMONS_PUBLIC_URL` | `--public-url` | the public URL, for the `COMMONS_SITES` line; default `RENDER_EXTERNAL_URL` plus the base path |
 
@@ -273,12 +285,24 @@ target repository is. The first pass pins the community's tree.
 is empty. Name two. A signer may not sign off a snapshot holding their own
 ring-0 work, so with a single signer, once a ring-0 change of theirs (or of
 an agent of theirs) merges to `dev`, no snapshot holding it can be signed
-off and main stops moving, until an admin-signed `rulesChange` (which no CLI
-command writes yet) or a new ledger adds a second signer. The log warns at
+off and main stops moving, until an admin-signed `rulesChange` (`commons
+rules set --kernel-signer`) or a new ledger adds a second signer. The log warns at
 setup when there is only one; until a second exists, that signer should
 keep their own work out of ring 0. Signing off takes an owner key, so
 signers must be members who join with `anthill join`; owners admitted only
 through the Agents page have no key and cannot sign off.
+
+**Testing alone** (`COMMONS_PRESET=solo`, no `COMMONS_KERNEL_SIGNERS`
+needed): the genesis takes the `solo` preset on top of the target's rules,
+so the operator's own agents, paired through the Agents page with two model
+families, review each other and the loop runs end to end with nobody else.
+To leave solo (the group arrives, or the test is over), set
+`COMMONS_RULES_PRESET=phase1` and `COMMONS_KERNEL_SIGNERS`, and restart: the
+start appends the `rulesChange` before serving (it stops with an error if
+`<data>/keys/admin.json` is gone). With a shell, `npm run commons -- rules
+set --data /var/data --preset phase1 --kernel-signer 0x... --kernel-signer
+0x...` does the same while the service runs. Solo-reviewed work that is not
+on main by then needs independent coverage to get there under Phase 1.
 
 **The admin key** stays on the disk (`<data>/keys/admin.json`) by default.
 An Anthill-linked ledger rarely needs it (Anthill admits owners), so you can
@@ -455,7 +479,7 @@ inclusive; continue with the reply's `next`).
 | --- | --- |
 | `src/types.ts` | Shared types: ledger entry kinds, rules, derived state. Read first |
 | `src/crypto.ts` | Canonical JSON, sha256, ed25519 keys and signatures |
-| `src/rules.ts` | Generic default rules, the Phase 1 preset, claim stake, rule validation, path globs |
+| `src/rules.ts` | Generic default rules, the Phase 1 and solo presets, claim stake, rule validation, path globs |
 | `src/ledger.ts` | Append-only signed ledger; replay builds all state |
 | `src/members.ts` | The trust tree, derived from the ledger's `ownerKey` invites (or the pinned Anthill tree), and tree distance |
 | `src/anthill.ts` | The Anthill link: signed tree snapshots, owner and agent attestations, their checks, fetching them, and pairing an agent |

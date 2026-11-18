@@ -70,7 +70,7 @@ test("host settings: defaults, what is missing, and the target URL's strict chec
   assert.match(bad.problems.join("\n"), /ANTHILL_URL.*http\(s\)/);
   assert.match(bad.problems.join("\n"), /"alice" is not an Anthill user id/);
   assert.match(bad.problems.join("\n"), /names 0xa1.* twice/);
-  assert.match(bad.problems.join("\n"), /COMMONS_PRESET.*phase1 or none/);
+  assert.match(bad.problems.join("\n"), /COMMONS_PRESET.*phase1, solo or none/);
   assert.match(bad.problems.join("\n"), /ANTHILL_COMMUNITY/);
 });
 
@@ -360,4 +360,91 @@ test("host: without its settings it says which are missing; --hold-on-failure an
   stop();
   assert.equal(await done, 2);
   assert.ok(!fs.existsSync(path.join(data, "commons-ledger.jsonl")));
+});
+
+// --- solo --------------------------------------------------------------------
+
+test("host settings: preset solo needs no kernel signer, and says what it is", () => {
+  const solo = readHostSettings({ anthillUrl: "https://a.example", targetRepo: "https://github.com/o/r", preset: "solo" });
+  assert.deepEqual(solo.missing, []);
+  assert.equal(solo.settings?.preset, "solo");
+  assert.deepEqual(solo.settings?.kernelSigners, []);
+  assert.match(solo.warnings.join("\n"), /COMMONS_PRESET \(--preset\) solo: solo test: your own agents review each other.*COMMONS_RULES_PRESET \(--rules-preset\) phase1/);
+  assert.doesNotMatch(solo.warnings.join("\n"), /only one kernel signer/);
+  const one = readHostSettings({ anthillUrl: "https://a.example", targetRepo: "https://github.com/o/r", preset: "solo", kernelSigners: [SIGNER] });
+  assert.deepEqual(one.settings?.kernelSigners, [SIGNER]);
+  assert.doesNotMatch(one.warnings.join("\n"), /only one kernel signer/, "solo needs no sign-off, so one signer cannot freeze main");
+  // Phase 1 still needs one.
+  assert.deepEqual(readHostSettings({ anthillUrl: "https://a.example", targetRepo: "https://github.com/o/r" }).missing, ["COMMONS_KERNEL_SIGNERS (--kernel-signer)"]);
+});
+
+test("host: preset solo sets up with no kernel signer; COMMONS_RULES_PRESET phase1 leaves solo on the next start, once", { timeout: 90_000 }, async () => {
+  const dir = tmp();
+  const anthill = await fakeAnthill();
+  try {
+    const target = bareTarget(dir);
+    const data = path.join(dir, "data");
+    const ledgerFile = path.join(data, "commons-ledger.jsonl");
+    const start = async (env: NodeJS.ProcessEnv) => {
+      const port = await freePort();
+      let stopNow = () => {};
+      const until = new Promise<void>((r) => (stopNow = r));
+      let err = "";
+      const done = main(["host", "--data", data, "--port", String(port), "--anthill-url", anthill.url, "--target-repo", target, "--test-allow-file-target", "--setup-retry-seconds", "1"], {
+        cwd: data,
+        until,
+        env,
+        stdout: () => {},
+        stderr: (t) => (err += t),
+      });
+      const head = JSON.parse((await until200(port, "/api/head", () => err)).text) as Record<string, unknown>;
+      stopNow();
+      assert.equal(await done, 0, err);
+      return { head, err };
+    };
+    const lines = () => fs.readFileSync(ledgerFile, "utf8").trim().split("\n").map((l) => JSON.parse(l) as { body: { kind: string; rules?: Rules } });
+
+    const first = await start({ COMMONS_PRESET: "solo" });
+    assert.equal(first.head.mode, "solo");
+    assert.equal(first.head.notice, "solo test: your own agents review each other");
+    assert.match(first.err, /kernel signers: none; preset solo \(solo test/);
+    const genesis = lines()[0]?.body.rules as Rules;
+    assert.equal(genesis.mode, "solo");
+    assert.deepEqual(genesis.kernelSigners, []);
+    assert.equal(genesis.promotion.kernelSignoffs, 0);
+
+    // COMMONS_PRESET is setup-only: changing it says how to switch, and changes nothing.
+    const noted = await start({ COMMONS_PRESET: "phase1" });
+    assert.match(noted.err, /COMMONS_PRESET \(--preset\) is read at setup only; this ledger's rules are solo\. To switch them set COMMONS_RULES_PRESET/);
+    assert.equal(noted.head.mode, "solo");
+    assert.ok(!lines().some((l) => l.body.kind === "rulesChange"));
+
+    const switched = await start({ COMMONS_RULES_PRESET: "phase1", COMMONS_KERNEL_SIGNERS: `${SIGNER},${SIGNER2}` });
+    assert.equal(switched.head.mode, undefined);
+    assert.match(switched.err, /rulesChange .* rules v1 -> v2 \(solo -> independent review\)/);
+    const changes = lines().filter((l) => l.body.kind === "rulesChange");
+    assert.equal(changes.length, 1);
+    assert.equal(changes[0]?.body.rules?.mode, undefined);
+    assert.deepEqual(changes[0]?.body.rules?.kernelSigners, [SIGNER, SIGNER2]);
+    assert.equal(changes[0]?.body.rules?.promotion.kernelSignoffs, 1);
+
+    const again = await start({ COMMONS_RULES_PRESET: "phase1", COMMONS_KERNEL_SIGNERS: `${SIGNER},${SIGNER2}` });
+    assert.match(again.err, /rules unchanged/);
+    assert.equal(lines().filter((l) => l.body.kind === "rulesChange").length, 1);
+
+    // Without the admin key on the disk the switch cannot be signed: it stops instead of serving as solo.
+    const keyFile = path.join(data, "keys", "admin.json");
+    fs.renameSync(keyFile, `${keyFile}.away`);
+    let err = "";
+    const code = await main(["host", "--data", data, "--port", String(await freePort()), "--anthill-url", anthill.url], {
+      cwd: data,
+      env: { COMMONS_RULES_PRESET: "solo" },
+      stdout: () => {},
+      stderr: (t) => (err += t),
+    });
+    assert.equal(code, 2);
+    assert.match(err, /cannot switch the rules to solo/);
+  } finally {
+    await anthill.close();
+  }
 });

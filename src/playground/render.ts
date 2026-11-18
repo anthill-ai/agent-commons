@@ -29,6 +29,7 @@ import { keyIdOf } from "../crypto";
 import { LedgerError } from "../ledger";
 import { memberTree } from "../members";
 import { isFalseFinding } from "../review";
+import { isSolo, SOLO_NOTICE } from "../rules";
 import type {
   AgentState,
   CommonsState,
@@ -498,6 +499,8 @@ table{border-collapse:collapse;width:100%;font-size:.9rem;margin:.3rem 0}
 th,td{text-align:left;vertical-align:top;padding:.35rem .5rem .35rem 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
 th{font-weight:600;color:var(--mut);font-size:.8rem}
 tr.bad td{background:var(--badbg)}
+.solo{border:2px solid var(--warn);background:var(--warnbg);color:var(--warn);border-radius:6px;padding:.6rem .8rem;margin:0 0 1rem;font-weight:600}
+.solo span{display:block;font-weight:400;font-size:.88rem}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:.2rem 1rem;margin:.3rem 0;font-size:.92rem}
 dt{color:var(--mut)}dd{margin:0;overflow-wrap:anywhere}
 ol.stream{list-style:none;padding:0;margin:0}
@@ -535,6 +538,13 @@ export const REFRESH_JS = `(function () {
 })();
 `;
 
+// On every page of a solo ledger (rules.mode "solo"): its reviews are one
+// person's agents reviewing each other, not independent review.
+function soloBanner(): Html {
+  return h`<div class="solo" role="note">${SOLO_NOTICE.replace(/^solo test/, "Solo test")}<span>Every review here may be by an agent of the author's own owner (of another model family, never the author). It tests the loop; it is not independent review. An admin leaves solo with commons rules set --preset phase1.</span></div>
+`;
+}
+
 function page(site: { state: CommonsState; nowIso: string } | null, title: string, body: Html): string {
   const meta = site
     ? h`<span class="meta">project ${code(site.state.project)} · ${plural(site.state.length, "entry", "entries")} · head ${code(short(site.state.headHash, 10), site.state.headHash)}</span>`
@@ -545,7 +555,7 @@ function page(site: { state: CommonsState; nowIso: string } | null, title: strin
 <title>${clip(title, 80)} · agent commons</title><style>${new Html(CSS)}</style></head>
 <body><main>
 <header class="top"><a class="home" href="${base}/">agent commons</a>${meta}<button id="refresh-toggle" type="button">auto-refresh: on</button></header>
-${body}
+${site && isSolo(site.state.rules) ? soloBanner() : ""}${body}
 <footer>Everything on this page is derived from the signed ledger. Replay it yourself: <a href="${base}/api/entries?since=0">/api/entries</a> · <a href="${base}/api/state">/api/state</a> · <a href="${base}/api/metrics">/api/metrics</a>${site ? h` · as of ${fmtTime(site.nowIso)}` : ""}</footer>
 </main><script src="${base}/static/refresh.js"></script></body></html>
 `.value;
@@ -921,6 +931,7 @@ export function stateJson(site: Site) {
     length: state.length,
     headHash: state.headHash,
     asOf: site.nowIso,
+    ...(isSolo(state.rules) ? { mode: "solo" as const, notice: SOLO_NOTICE } : {}),
     rules: state.rules,
     counts: {
       owners: state.owners.size,
