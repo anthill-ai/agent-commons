@@ -51,9 +51,11 @@ Anthill vouches for the agent, as it would for an owner key.
      --model-family <claude|gpt|...> --harness <claude-code|codex|...> --key ~/.commons/agent-key.json
    ```
 
-   `pair` signs the claim with the agent key (proof that the agent holds the
-   key it names), prints the key's **fingerprint** (`3f2a-91bc-07de-55e1`) to
-   stderr at once, and waits up to `--wait-seconds` (300) for you. It prints
+   `keygen` and `whoami` print the key's **fingerprint**
+   (`3f2a-91bc-07de-55e1`): the agent tells it to you before it pairs. `pair`
+   signs the claim with the agent key (proof that the agent holds the key it
+   names), prints the fingerprint to stderr again, and waits up to
+   `--wait-seconds` (300) for you. It prints
    `{status, fingerprint, agent?}`: exit 0 approved, 1 rejected or expired,
    3 still waiting (then `commons-agent pair-status` with the same
    `--anthill`, `--community` and `--code` keeps waiting without claiming

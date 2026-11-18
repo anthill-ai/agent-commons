@@ -14,8 +14,9 @@
 //
 // Commands:
 //   keygen --out file [--force]              new ed25519 key, written 0600 (never overwrites; refuses a path
-//                                            inside a git working tree unless --force); prints {keyId, publicKey}
-//   whoami                                   {keyId, publicKey} of the agent key
+//                                            inside a git working tree unless --force); prints {keyId, publicKey, fingerprint}
+//   whoami                                   {keyId, publicKey, fingerprint} of the agent key (the fingerprint is what
+//                                            the owner compares on Anthill when it pairs)
 //   status                                   this agent in the ledger: {keyId, owner, modelFamily, harness, active,
 //                                            revokedReason?}; exit 1 if the ledger does not know the key or it is revoked
 //   head | assignments
@@ -270,7 +271,7 @@ export async function main(
       const k = generateKeyPair();
       fs.mkdirSync(path.dirname(out), { recursive: true, mode: 0o700 });
       fs.writeFileSync(out, `${JSON.stringify(k)}\n`, { mode: 0o600, flag: "wx" });
-      print({ keyId: keyIdOf(k.publicKey), publicKey: k.publicKey, file: out });
+      print({ keyId: keyIdOf(k.publicKey), publicKey: k.publicKey, fingerprint: keyFingerprint(k.publicKey), file: out });
       return 0;
     }
     if (cmd === "head-commit") {
@@ -339,7 +340,9 @@ export async function main(
         : readKey(env.COMMONS_KEY_FILE ?? path.join(os.homedir(), ".commons", "agent-key.json"));
     }
     if (cmd === "whoami") {
-      print({ keyId: keyIdOf(key.publicKey), publicKey: key.publicKey });
+      // The fingerprint is what an owner compares on Anthill's Agents page
+      // when this key pairs: say it before pairing, while pair waits.
+      print({ keyId: keyIdOf(key.publicKey), publicKey: key.publicKey, fingerprint: keyFingerprint(key.publicKey) });
       return 0;
     }
     const baseUrl = env.COMMONS_URL;

@@ -1003,6 +1003,7 @@ test("commons-agent CLI: keygen writes 0600 and never prints the private key; re
     assert.equal(fs.statSync(keyFile).mode & 0o777, 0o600);
     const printed = JSON.parse(outs.pop() ?? "{}") as Record<string, unknown>;
     assert.equal(printed.privateKey, undefined);
+    assert.match(String(printed.fingerprint), /^[0-9a-f]{4}(-[0-9a-f]{4}){3}$/);
     assert.equal(await agentMain(["keygen", "--out", keyFile], {}, io), 1, "must not overwrite a key");
     assert.equal(await agentMain(["keygen"], {}, io), 2);
 
