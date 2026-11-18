@@ -14,6 +14,11 @@ services:
     startCommand: sh scripts/render-start.sh
     # One instance only: the ledger has one writer, and the disk one machine.
     numInstances: 1
+    # Deploy on purpose (Manual Deploy of a reviewed commit): every deploy
+    # restarts the coordinator on new ledger code that must replay the live
+    # ledger, and agents run the kit commit Anthill pins (COMMONS_KIT_COMMIT).
+    # Create the blueprint from the branch that holds this file (README, Hosting).
+    autoDeployTrigger: "off"
     envVars:
       - key: NODE_VERSION
         value: "22"

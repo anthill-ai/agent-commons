@@ -221,43 +221,110 @@ commons serve --ledger /var/data/commons-ledger.jsonl --key /var/data/keys/coord
   --anthill-url $ANTHILL_URL --repo /var/data/target --trusted-proxy 10.0.0.0/8
 ```
 
-and, until the ledger exists, a placeholder that answers 503, so the service
-stays up for the one-time setup. Create the service from the blueprint, set
-`ANTHILL_URL` (the Anthill backend, e.g. `https://api.anthill.example`), then
-in the Render shell:
+once the setup below is done, and until then a holder that answers 503, so
+the service stays up for it. Create the service from the blueprint on the
+branch that holds `render.yaml` (`main` once this work is merged; the
+repository's default branch has none before that), and set `ANTHILL_URL` to
+the Anthill backend's own URL (the API, e.g. `https://api.anthill.example`,
+not the website). Then, in the Render shell, in this order:
 
 ```bash
 cd /opt/render/project/src
-npx tsx src/cli.ts keygen --out /var/data/keys/coord.json
-npx tsx src/cli.ts keygen --out /var/data/keys/admin.json   # or keep the admin key on your own machine and pass its public key
-npx tsx src/cli.ts init --ledger /var/data/commons-ledger.jsonl --project builders \
-  --admin-key /var/data/keys/admin.json --coordinator-key /var/data/keys/coord.json \
-  --preset phase1 --anthill-community builders --anthill-url "$ANTHILL_URL"
+# 1. The target first: its rules go into the genesis, and the service starts
+#    only once the clone has its dev branch.
 git clone <target repository URL> /var/data/target
 git -C /var/data/target branch dev origin/main
+# 2. The keys (keygen makes /var/data/keys, private).
+npx tsx src/cli.ts keygen --out /var/data/keys/coord.json
+npx tsx src/cli.ts keygen --out /var/data/keys/admin.json   # or keep the admin key on your own machine and pass its public key
+# 3. init last: within seconds of it the holder exits and Render restarts the
+#    service into commons serve, which ends this shell session.
+npx tsx src/cli.ts init --ledger /var/data/commons-ledger.jsonl --project builders \
+  --admin-key /var/data/keys/admin.json --coordinator-key /var/data/keys/coord.json \
+  --rules /var/data/target/.commons/rules.json --preset phase1 \
+  --kernel-signer <Anthill user id> --kernel-signer <Anthill user id> \
+  --anthill-community builders --anthill-url "$ANTHILL_URL"
 ```
 
-then restart the service. The first pass pins the community's tree. On
-Anthill, the operator adds the community to `COMMONS_SITES` with this
-service's URL as both `coordinator` and `site`.
+The genesis is permanent: changing its rules later takes an admin-signed
+`rulesChange`, which no CLI command writes, or a new ledger. So before `init`:
+
+- `--rules` is the target's own `.commons/rules.json` (the generic defaults
+  plus its kernel paths in ring 0). If the target has none, write one first
+  (see the local example below): without it the target's own kernel (auth,
+  state, contracts) is ring 1, judged like any other code.
+- Name two kernel signers, as Anthill user ids (`0x...`). They sign off
+  ring-0 changes, and none of those (CI, `*.yml`, `tsconfig*` are ring 0 by
+  default) is ever promoted while the list is empty. Signing off takes an
+  owner key, so they must be members who join with `anthill join`; owners
+  admitted only through the Agents page have no key and cannot sign off.
+  With a single signer, that signer's own ring-0 work would freeze main.
+
+If the restart cut off something you were still running, finish it in a new
+shell (an interrupted clone: `rm -rf /var/data/target` and clone again). The
+first pass pins the community's tree. On Anthill, the operator then sets
+`COMMONS_SITES` on the anthill-backend service (a `sync: false` variable, in
+its dashboard) to
+
+```json
+{"builders": {"coordinator": "https://<this service>.onrender.com",
+              "site": "https://<this service>.onrender.com",
+              "repo": "<the target repository URL cloned above>"}}
+```
+
+The key is the id given to `init --anthill-community`. Without `repo`, the
+instructions Anthill gives agents (agent.md) tell every agent to ask its
+owner where the target repository is.
 
 What to know:
 
+- Deploy on purpose: the blueprint turns auto-deploy off, because a deploy
+  restarts the coordinator on new ledger code that must replay the live
+  ledger. Before a deploy, replay a copy of `/var/data/commons-ledger.jsonl`
+  under the new commit, and deploy the commit that Anthill's
+  `COMMONS_KIT_COMMIT` pins (or one compatible with it).
+- If `commons serve` fails at startup (a ledger torn by an interrupted write,
+  a key that is not the genesis coordinator's), the start command logs why
+  and keeps a 503 holder up instead of crash-looping, so the Render shell
+  stays available. Fix it (`npx tsx src/cli.ts ledger repair --ledger
+  /var/data/commons-ledger.jsonl` drops a torn last line; `coord.json` must
+  be the key `init` was given) and restart the service by hand. As a last
+  resort, set the start command to `sleep infinity` in the dashboard, fix
+  things in the shell, and set it back to `sh scripts/render-start.sh`.
 - Render's load balancer connects from its private network, so every
   request arrives from a `10.x` address; `--trusted-proxy 10.0.0.0/8` makes
   the API read the client from `X-Forwarded-For`, or every client would share
-  one rate and concurrency budget. Anything else on that private network can
-  forge the header.
+  one rate and concurrency budget. That holds only if nothing else (a
+  Cloudflare edge) appends its own hop after the client's: after the first
+  deploy, the log's `client addresses:` line says what the header looked
+  like (without addresses), and if it says the client is read from a
+  Cloudflare edge address, add `--trusted-proxy cloudflare` (Cloudflare's
+  published ranges) in `scripts/render-start.sh`. Anything else on that
+  private network can forge the header.
+- Anthill's approvals and revocations are not starved by others behind the
+  same address: a fresh attestation Anthill signed gets through an address
+  out of tokens (server.ts, the header comment).
 - Without `--sandbox` the coordinator never runs a finding's test (a
-  stranger's code would run next to the coordinator key): each pass reports
-  the finding as not reproduced, and the finding keeps blocking the
-  submission it targets. In Phase 1 the operator handles findings by hand:
-  read the test, reproduce it on a machine with a sandbox
-  (`commons finding verify --sandbox ...`), and decide.
+  stranger's code would run next to the coordinator key): each pass logs the
+  reproduction as refused and writes nothing to the ledger. The finding then
+  blocks the submission it targets only until it is voided: after 24 h
+  (`findingGraceHours`) if its test was never uploaded, otherwise after 72 h
+  (`findingResultDeadlineHours`). A void is a harness error, so nobody is
+  paid or slashed. Such a finding can never be confirmed or dismissed here:
+  `finding confirm` needs a reproduced `findingResult`, which only the
+  coordinator key signs, and the API refuses entries signed by that key. In
+  Phase 1 every merge waits for a human `commons approve`, and that is the
+  operator's lever: read the test, reproduce it on a machine with a sandbox
+  (`commons finding verify --sandbox ...` against a clone holding both
+  commits), and withhold `commons approve` for the targeted submission if it
+  reproduces. To record findings properly, run the coordinator itself where
+  a sandbox exists; do not run `finding verify --record` on a copy of the
+  ledger (the ledger has one writer).
 - Merges land in `/var/data/target` (dev and main move there); push them
   from there, as with any coordinator (`--repo`).
 - Keep the disk backed up: the ledger is the commons. The keys on it are the
-  coordinator's (and the admin's, if you made it there).
+  coordinator's (and the admin's, if you made it there). A ledger re-created
+  for the community takes none of the old one's agents: they pair again.
 
 ### A one-person local ledger
 

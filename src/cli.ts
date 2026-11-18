@@ -1621,7 +1621,10 @@ const keyExposures = (ctx: Ctx): Exposure[] =>
 
 // The coordinator's reproducer: only under a --sandbox that passed the probe
 // (run once, before the first reproduction). Without one every reproduction
-// fails loudly; it is an operator problem, so it never voids a finding.
+// fails loudly and records nothing; it is an operator problem, so the failure
+// itself never voids a finding. The finding still blocks only until its
+// result deadline (findingResultDeadlineHours, 72 h), when the coordinator
+// voids it as a harness error, as for any finding without a result.
 function sandboxedReproducer(ctx: Ctx, repo: string | null, dir: string): ExecuteDeps["reproduce"] {
   if (repo === null) return () => Promise.resolve(null);
   const sandbox = sandboxArg(ctx);
