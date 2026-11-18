@@ -50,6 +50,14 @@
 //   which a caller retrying after a lost answer treats as done.
 //   GET /api/agents?owner=<id> lists an owner's agents, revoked ones too
 //   (?agent=<keyId>: that one agent).
+//   Anthill makes all its calls from one address, which others (its own
+//   website's visitors through it, a host's shared egress) can drain. So the
+//   two agent routes hold their own in-flight slots per address, and when the
+//   address has no token left, a fresh Anthill-signed attestation that has
+//   not landed yet still passes, charged to Anthill's own budget
+//   (anthillRatePerMinute): only Anthill holds one before it lands, and once
+//   it has landed (it is then public) a repeat is charged to the address
+//   again.
 // - GET /api/tasks (open=1: claimable ones) and GET /api/tasks/:id describe
 //   tasks from replay, GET /api/entries?since= serves the signed entries
 //   themselves (since inclusive; continue with `next`), so an agent can find
@@ -63,6 +71,16 @@ import * as http from "node:http";
 import * as path from "node:path";
 import { canonical, isValidPublicKey, keyIdOf, sha256hex, verify } from "./crypto";
 import { parsePatch } from "./github";
+import {
+  ANTHILL_AGENT_MAX_AGE_MS,
+  ANTHILL_AGENT_SKEW_MS,
+  agentAttestationProblems,
+  agentRevokeProblems,
+  type AnthillAgentAttestation,
+  type AnthillAgentRevokeAttestation,
+  verifyAgent,
+  verifyAgentRevoke,
+} from "./anthill";
 import { entryMessage, Ledger, LedgerError, type LedgerState, reviewCommitsClosedBy, type Signer, submissionDead } from "./ledger";
 import { commitDeadlineMs } from "./plants";
 import type { CommonsState, EntryBody, EntryKind, KeyId, LedgerEntry, OwnerId, Ring, Rules } from "./types";
@@ -178,6 +196,7 @@ export type ServerLimits = {
   ratePerMinute: number; // token bucket per owner (or admin key), burst = one minute's worth
   dailyBytesPerOwner: number; // ledger bytes an owner may add per day (bucket, refilled continuously)
   ipRatePerMinute: number; // every request, per remote address, before anything is read
+  anthillRatePerMinute: number; // fresh Anthill-signed agent writes past an exhausted address (one budget)
   maxConcurrent: number; // requests in flight; beyond it 503
   maxConcurrentPerIp: number; // requests in flight from one address; beyond it 503
   maxLockQueue: number; // agent posts waiting for the store lock; beyond it 503
@@ -204,6 +223,7 @@ export const DEFAULT_LIMITS: ServerLimits = {
   ratePerMinute: 60,
   dailyBytesPerOwner: 2 * 1024 * 1024,
   ipRatePerMinute: 600,
+  anthillRatePerMinute: 120,
   maxConcurrent: 64,
   maxConcurrentPerIp: 8,
   maxLockQueue: 128,
@@ -338,15 +358,19 @@ export function createCoordinatorServer(opts: CoordinatorServerOptions): Coordin
   const ownerRate = bucket(limits.ratePerMinute, 60_000);
   const ownerBytes = bucket(limits.dailyBytesPerOwner, 24 * 3_600_000);
   const ipRate = bucket(limits.ipRatePerMinute, 60_000);
+  const anthillRate = bucket(limits.anthillRatePerMinute, 60_000);
 
-  const ctx: Ctx = { opts, limits, policy, store, ownerRate, ownerBytes };
+  const ctx: Ctx = { opts, limits, policy, store, ownerRate, ownerBytes, anthillRate };
   const trusted = proxyMatcher(opts.trustedProxies ?? []);
   let inFlight = 0;
   const perIp = new Map<string, number>();
   const server = http.createServer((req, res) => {
     const ip = clientAddress(req, trusted);
+    // Anthill's relays (header comment): their own slots per address.
+    const anthillWrite = req.method === "POST" && /^\/api\/anthill\/agent(?:-revoke)?(?:\?|$)/.test(req.url ?? "");
+    const slot = anthillWrite ? `${ip} anthill-agent` : ip;
     inFlight++;
-    perIp.set(ip, (perIp.get(ip) ?? 0) + 1);
+    perIp.set(slot, (perIp.get(slot) ?? 0) + 1);
     let counted = true;
     // The slot ends with the response: a reader that stalls (never reads a
     // large page, say) loses its socket, so it cannot hold slots for ever.
@@ -356,9 +380,9 @@ export function createCoordinatorServer(opts: CoordinatorServerOptions): Coordin
       clearTimeout(deadline);
       if (counted) {
         inFlight--;
-        const n = (perIp.get(ip) ?? 1) - 1;
-        if (n <= 0) perIp.delete(ip);
-        else perIp.set(ip, n);
+        const n = (perIp.get(slot) ?? 1) - 1;
+        if (n <= 0) perIp.delete(slot);
+        else perIp.set(slot, n);
       }
       counted = false;
     };
@@ -368,12 +392,14 @@ export function createCoordinatorServer(opts: CoordinatorServerOptions): Coordin
       req.resume();
       send(res, status, { error: code, message }, { Connection: "close", "Retry-After": "1" });
     };
-    if ((perIp.get(ip) ?? 0) > limits.maxConcurrentPerIp) return refuse(503, "busy", "too many requests in flight from this address");
+    if ((perIp.get(slot) ?? 0) > limits.maxConcurrentPerIp) return refuse(503, "busy", "too many requests in flight from this address");
     if (inFlight > limits.maxConcurrent) return refuse(503, "busy", "too many requests in flight");
-    if (!ipRate.take(ip)) {
+    const charged = ipRate.take(ip);
+    // An agent write is judged once its body is read (postAnthillAgent).
+    if (!charged && !anthillWrite) {
       return refuse(429, "ip-rate-limited", `more than ${limits.ipRatePerMinute} requests a minute from this address`);
     }
-    handle(ctx, req, res).catch((e: unknown) => {
+    handle(ctx, req, res, charged).catch((e: unknown) => {
       console.error("coordinator server:", e);
       if (!res.headersSent) send(res, 500, { error: "internal", message: "internal error" });
       else res.destroy();
@@ -462,6 +488,7 @@ type Ctx = {
   store: LedgerStore;
   ownerRate: { has(key: string, cost: number): boolean; take(key: string, cost?: number): boolean };
   ownerBytes: { has(key: string, cost: number): boolean; take(key: string, cost?: number): boolean };
+  anthillRate: { has(key: string, cost: number): boolean; take(key: string, cost?: number): boolean };
 };
 
 class HttpError extends Error {
@@ -484,7 +511,9 @@ function fail(message: string): never {
 // test uploaded and every submission its patch.
 export const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
-async function handle(ctx: Ctx, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+// `charged`: whether the request spent its address's token (only an agent
+// write gets here without one).
+async function handle(ctx: Ctx, req: http.IncomingMessage, res: http.ServerResponse, charged = true): Promise<void> {
   const url = new URL(req.url ?? "/", "http://localhost");
   const method = req.method ?? "GET";
   const p = url.pathname;
@@ -492,8 +521,8 @@ async function handle(ctx: Ctx, req: http.IncomingMessage, res: http.ServerRespo
     if (method === "GET" && p === "/api/head") return send(res, 200, ctx.store.head());
     if (method === "POST" && p === "/api/entries") return send(res, 201, await postEntry(ctx, req));
     if (method === "POST" && p === "/api/anthill/owner") return send(res, 201, await postAnthillOwner(ctx, req));
-    if (method === "POST" && p === "/api/anthill/agent") return send(res, 201, await postAnthillAgent(ctx, req, "anthillAgent"));
-    if (method === "POST" && p === "/api/anthill/agent-revoke") return send(res, 201, await postAnthillAgent(ctx, req, "anthillAgentRevoked"));
+    if (method === "POST" && p === "/api/anthill/agent") return send(res, 201, await postAnthillAgent(ctx, req, "anthillAgent", charged));
+    if (method === "POST" && p === "/api/anthill/agent-revoke") return send(res, 201, await postAnthillAgent(ctx, req, "anthillAgentRevoked", charged));
     if (method === "GET" && p === "/api/agents") return send(res, 200, ownerAgents(ctx, url));
     if (method === "GET" && p === "/api/assignments") return send(res, 200, assignments(ctx, url));
     if (method === "GET" && p === "/api/tasks") return send(res, 200, tasks(ctx, url));
@@ -773,8 +802,12 @@ async function postAnthillAgent(
   ctx: Ctx,
   req: http.IncomingMessage,
   kind: "anthillAgent" | "anthillAgentRevoked",
+  charged = true,
 ): Promise<{ seq: number; hash: string; agent: KeyId; owner: OwnerId }> {
   const parsed = await readAttestation(ctx, req);
+  if (!charged && !(freshFromAnthill(ctx, kind, parsed) && ctx.anthillRate.take("anthill"))) {
+    throw new HttpError(429, "ip-rate-limited", `more than ${ctx.limits.ipRatePerMinute} requests a minute from this address`);
+  }
   const a = parsed.attestation as { agentKey?: unknown; user?: unknown } | null;
   const agentKey = isObject(a) && typeof a.agentKey === "string" ? a.agentKey : null;
   const user = isObject(a) && typeof a.user === "string" ? a.user : null;
@@ -797,6 +830,27 @@ async function postAnthillAgent(
     return { kind, attestation: parsed.attestation, signature: parsed.signature } as EntryBody;
   });
   return { seq: stored.seq, hash: stored.hash, agent, owner: user };
+}
+
+// Whether this is what only Anthill can hold: an attestation under the linked
+// key, signed within the ledger's window of the server's clock, that has not
+// landed (no agent with the key yet; for a revoke, the agent still active).
+// The ledger still checks everything; this only decides whose budget it spends.
+function freshFromAnthill(ctx: Ctx, kind: "anthillAgent" | "anthillAgentRevoked", parsed: { attestation: unknown; signature: string }): boolean {
+  const linked = ctx.store.state().anthill;
+  if (linked === undefined) return false;
+  const now = Date.parse(ctx.opts.clock());
+  const fresh = (at: string) => Date.parse(at) <= now + ANTHILL_AGENT_SKEW_MS && now - Date.parse(at) <= ANTHILL_AGENT_MAX_AGE_MS;
+  if (kind === "anthillAgent") {
+    if (agentAttestationProblems(parsed.attestation).length > 0) return false;
+    const a = parsed.attestation as AnthillAgentAttestation;
+    if (!isValidPublicKey(a.agentKey) || ctx.store.state().publicKeys.has(keyIdOf(a.agentKey))) return false;
+    return fresh(a.at) && verifyAgent(linked.link, a, parsed.signature);
+  }
+  if (agentRevokeProblems(parsed.attestation).length > 0) return false;
+  const a = parsed.attestation as AnthillAgentRevokeAttestation;
+  if (!isValidPublicKey(a.agentKey) || ctx.store.state().agents.get(keyIdOf(a.agentKey))?.active !== true) return false;
+  return fresh(a.at) && verifyAgentRevoke(linked.link, a, parsed.signature);
 }
 
 // GET /api/agents?owner=<id>: an owner's agents, oldest first, revoked ones

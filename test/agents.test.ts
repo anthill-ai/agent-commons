@@ -19,7 +19,7 @@ import { main as cliMain } from "../src/cli";
 import { generateKeyPair, keyIdOf, sign, verify } from "../src/crypto";
 import { Ledger, type Signer } from "../src/ledger";
 import { defaultRules } from "../src/rules";
-import { createCoordinatorServer, proxyMatcher, type CoordinatorServer } from "../src/server";
+import { createCoordinatorServer, proxyMatcher, type CoordinatorServer, type ServerLimits } from "../src/server";
 
 // Agents vouched for by Anthill, end to end on the commons side: the
 // coordinator's relay routes and GET /api/agents, `commons serve --one-port`,
@@ -32,7 +32,7 @@ const nowIso = () => new Date().toISOString();
 
 type Coordinator = { url: string; server: CoordinatorServer; anthill: Signer; ledgerPath: string; close: () => Promise<void> };
 
-async function coordinator(linked = true): Promise<Coordinator> {
+async function coordinator(linked = true, limits: Partial<ServerLimits> = {}): Promise<Coordinator> {
   const dir = tmp("coord");
   const ledgerPath = path.join(dir, "ledger.jsonl");
   const anthill = generateKeyPair();
@@ -55,6 +55,7 @@ async function coordinator(linked = true): Promise<Coordinator> {
     clock: nowIso,
     patchesDir: path.join(dir, "patches"),
     policy: { submitCredits: () => 1, prSlots: () => 1, claimStake: () => 1 },
+    limits,
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   return {
@@ -117,6 +118,48 @@ test("POST /api/anthill/agent relays Anthill's attestation; a repeat is 409 alre
     assert.equal((await postJson(`${c.url}/api/anthill/agent`, "not json")).status, 400);
     assert.equal((await postJson(`${c.url}/api/anthill/agent`, { ...signed, extra: 1 })).body.error, "malformed");
     assert.equal((await postJson(`${c.url}/api/anthill/agent`, signedAgent(c.anthill, A, "nope"))).body.error, "invalid-value");
+  } finally {
+    await c.close();
+  }
+});
+
+test("an address out of tokens still gets Anthill's fresh approvals and revocations through, and nothing else", async () => {
+  const c = await coordinator(true, { ipRatePerMinute: 2, anthillRatePerMinute: 3 });
+  try {
+    // Others on Anthill's address drain its bucket.
+    for (let i = 0; i < 2; i++) assert.equal((await fetch(`${c.url}/api/head`)).status, 200);
+    assert.equal((await fetch(`${c.url}/api/head`)).status, 429);
+    assert.equal((await fetch(`${c.url}/api/agents?owner=${A}`)).status, 429);
+    const agent = generateKeyPair();
+    const signed = signedAgent(c.anthill, A, agent.publicKey);
+    const approved = await postJson(`${c.url}/api/anthill/agent`, signed);
+    assert.equal(approved.status, 201, JSON.stringify(approved.body));
+    // Landed, it is public: a repeat, junk, a stale or forged one spend the address's (empty) bucket.
+    assert.equal((await postJson(`${c.url}/api/anthill/agent`, signed)).status, 429);
+    assert.equal((await postJson(`${c.url}/api/anthill/agent`, { attestation: {}, signature: "x" })).status, 429);
+    const old = signedAgent(c.anthill, B, generateKeyPair().publicKey, { at: new Date(Date.now() - 11 * 60_000).toISOString() });
+    assert.equal((await postJson(`${c.url}/api/anthill/agent`, old)).status, 429);
+    const forged = signedAgent(generateKeyPair(), B, generateKeyPair().publicKey);
+    assert.equal((await postJson(`${c.url}/api/anthill/agent`, forged)).status, 429);
+    const revoked = await postJson(`${c.url}/api/anthill/agent-revoke`, signedRevoke(c.anthill, A, agent.publicKey));
+    assert.equal(revoked.status, 201, JSON.stringify(revoked.body));
+    assert.equal((await postJson(`${c.url}/api/anthill/agent-revoke`, signedRevoke(c.anthill, A, agent.publicKey))).status, 429);
+    // Anthill's own budget is bounded too.
+    assert.equal((await postJson(`${c.url}/api/anthill/agent`, signedAgent(c.anthill, B, generateKeyPair().publicKey))).status, 201);
+    assert.equal((await postJson(`${c.url}/api/anthill/agent`, signedAgent(c.anthill, B, generateKeyPair().publicKey))).status, 429);
+    assert.equal(Ledger.open(c.ledgerPath).entries().length, 4);
+  } finally {
+    await c.close();
+  }
+});
+
+test("an agent attestation older than the ledger's window is refused with time", async () => {
+  const c = await coordinator();
+  try {
+    const old = signedAgent(c.anthill, A, generateKeyPair().publicKey, { at: new Date(Date.now() - 11 * 60_000).toISOString() });
+    const r = await postJson(`${c.url}/api/anthill/agent`, old);
+    assert.equal(r.status, 400);
+    assert.equal(r.body.error, "time");
   } finally {
     await c.close();
   }
