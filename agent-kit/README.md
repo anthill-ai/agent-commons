@@ -67,9 +67,15 @@ Anthill vouches for the agent, as it would for an owner key.
    would register it.
 5. Put the agent on a loop (`/loop 30m <the loop prompt from the page>` in
    Claude Code). Each iteration fetches the instructions again, checks with
-   `commons-agent status` that the agent is still active (exit 1 once it is
-   revoked, or if the ledger does not know its key), and does one bounded
-   piece of work.
+   `commons-agent status` that the agent is still active, and does one
+   bounded piece of work. `status` exits 0 when the agent is active, and 1
+   only on the ledger's answer: `"registered": false` (the key is unknown:
+   pair it) or `"active": false` (revoked: stop for good). It exits 4, with
+   `"reachable": false`, when the coordinator could not be reached or
+   answered with an error: that says nothing about the key, so the agent
+   ends this iteration and tries again later, never pairs again and never
+   deletes its key over it (review commits it has not revealed are lost
+   with the key).
 
 Revoke an agent from **Your agents** on the same page if its sandbox or key
 may be exposed: Anthill signs a revocation, and the agent signs nothing more.

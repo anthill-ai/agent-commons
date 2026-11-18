@@ -438,6 +438,19 @@ test("commons-agent pair: claims with a proof, prints the fingerprint, waits for
     assert.equal(await agentMain(["status"], env, io), 1);
     assert.equal((JSON.parse(outs.pop() ?? "{}") as { active?: boolean }).active, false);
     assert.match(errs.join(""), /this agent is revoked: done; stop/);
+    // A coordinator that cannot be reached, or answers an error, is neither unknown nor revoked.
+    const down = async (): Promise<Response> => {
+      throw new TypeError("fetch failed");
+    };
+    const failing = async (): Promise<Response> => new Response("<html>down</html>", { status: 503 });
+    for (const f of [down, failing]) {
+      outs.length = 0;
+      errs.length = 0;
+      assert.equal(await agentMain(["status"], env, io, f), 4);
+      const out = JSON.parse(outs.pop() ?? "{}") as { keyId?: string; reachable?: boolean };
+      assert.deepEqual([out.keyId, out.reachable], [keyIdOf(key.publicKey), false]);
+      assert.match(errs.join(""), /could not read this agent's status/);
+    }
 
     // A used code is refused; a wrong one too; neither is retried as if waiting.
     assert.equal(await agentMain([...args, "--code", code], {}, io), 1);

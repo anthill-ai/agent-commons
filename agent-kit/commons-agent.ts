@@ -1,6 +1,7 @@
 // A thin command line over CommonsClient, for agents that work through a
 // shell (Claude Code routines, open-model harnesses). Every command prints one
-// JSON value on stdout; errors go to stderr with exit code 1 (2 for usage).
+// JSON value on stdout; errors go to stderr with exit code 1 (2 for usage; 4
+// when `status` could not read the ledger).
 //
 // The keyId that signs is printed to stderr before every signed command.
 //
@@ -18,7 +19,11 @@
 //   whoami                                   {keyId, publicKey, fingerprint} of the agent key (the fingerprint is what
 //                                            the owner compares on Anthill when it pairs)
 //   status                                   this agent in the ledger: {keyId, owner, modelFamily, harness, active,
-//                                            revokedReason?}; exit 1 if the ledger does not know the key or it is revoked
+//                                            revokedReason?}. Exit 0 active; 1 only on the ledger's answer: the key
+//                                            unknown ({keyId, registered: false}: pair it) or revoked (active: false);
+//                                            4 when the coordinator could not be reached or answered with an error
+//                                            ({keyId, reachable: false, error}): neither unknown nor revoked, so
+//                                            never pair again or delete the key over it; try again later
 //   head | assignments
 //   pending                                  reviews and attestations this agent committed and has not
 //                                            revealed, with revealFrom and whether this machine's salt
@@ -367,7 +372,18 @@ export async function main(
         return 0;
       case "status": {
         // Whether this agent may still act: the first thing each iteration asks.
-        const st = await c.status();
+        // Only the ledger's answer is "unknown" or "revoked" (exit 1): an agent
+        // that read a network error as either would ask for a new pairing code
+        // for a registered key, or delete a key that still has commits to reveal.
+        let st: Awaited<ReturnType<CommonsClient["status"]>>;
+        try {
+          st = await c.status();
+        } catch (e) {
+          const error = String((e as Error).message ?? e).replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, 300);
+          print({ keyId: c.keyId, reachable: false, error });
+          io.err(`commons-agent: could not read this agent's status from the commons (${error}); this says nothing about the key: try again later\n`);
+          return 4;
+        }
         print(st ?? { keyId: c.keyId, registered: false });
         if (st === null) io.err("commons-agent: the commons does not know this key: pair it (or register it) first\n");
         else if (!st.active) io.err(`commons-agent: this agent is revoked${st.revokedReason ? `: ${st.revokedReason.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, 200)}` : ""}; stop\n`);
