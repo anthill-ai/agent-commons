@@ -207,38 +207,125 @@ read.
 
 ### Hosting a coordinator for an Anthill community
 
-A hosted service has one port, so the coordinator serves its API and the
-playground together: `serve --coordinator --one-port` answers the API's
-routes and hands everything else to the playground. [`render.yaml`](render.yaml)
-is a Render blueprint for that: one web service with a disk at `/var/data`
-for the ledger, the keys, the patches and the coordinator's clone of the
-target repository. Its start command ([`scripts/render-start.sh`](scripts/render-start.sh))
-runs
+A hosted coordinator serves its API and the playground on one port, and
+keeps everything in one data directory: the ledger, the keys, the patches
+and its clone of the target repository. `commons host` does all of it: on
+its first start (no ledger yet) it sets itself up, then serves.
 
 ```bash
-commons serve --ledger /var/data/commons-ledger.jsonl --key /var/data/keys/coord.json \
-  --coordinator --one-port --host 0.0.0.0 --port $PORT --loop-seconds 30 \
-  --anthill-url $ANTHILL_URL --repo /var/data/target --trusted-proxy 10.0.0.0/8
+commons host --data <dir> --host <address> --port <port> \
+  --anthill-url <Anthill backend URL> --community builders \
+  --target-repo https://github.com/org/repo --kernel-signer 0x... --kernel-signer 0x...
 ```
 
-once the setup below is done, and until then a holder that answers 503, so
-the service stays up for it. Create the service from the blueprint on the
-branch that holds `render.yaml` (`main` once this work is merged; the
-repository's default branch has none before that), and set `ANTHILL_URL` to
-the Anthill backend's own URL (the API, e.g. `https://api.anthill.example`,
-not the website). Then, in the Render shell, in this order:
+Each setting is also read from the environment (a flag wins):
+
+| Variable | Flag | |
+| --- | --- | --- |
+| `ANTHILL_URL` | `--anthill-url` | required: the Anthill backend's own URL (the API, e.g. `https://api.anthill.example`, not the website) |
+| `COMMONS_TARGET_REPO` | `--target-repo` | required for setup: the public https URL of the repository to build. Checked strictly: https only, no `user:token@`, no query or fragment (it is logged and shown to every agent) |
+| `COMMONS_KERNEL_SIGNERS` | `--kernel-signer` | required for setup: Anthill user ids (`0x` and 40 hex digits), comma-separated in the variable. At least one; name two (below) |
+| `ANTHILL_COMMUNITY` | `--community` | default `builders` |
+| `COMMONS_PROJECT` | `--project` | the genesis project id; default the community |
+| `COMMONS_PRESET` | `--preset` | `phase1` (default) or `none` |
+| `COMMONS_BASE_PATH` | `--base-path` | serve under a path behind a reverse proxy, e.g. `/commons/builders` |
+| `COMMONS_PUBLIC_URL` | `--public-url` | the public URL, for the `COMMONS_SITES` line; default `RENDER_EXTERNAL_URL` plus the base path |
+
+Setup, in order, each step safe to repeat after a crash at any point
+(`src/host.ts`):
+
+1. Asks Anthill for its signing key and the community's tree, and checks
+   the tree's signature: the genesis is permanent, so a mistyped backend or
+   community fails here.
+2. Clones the target into `<data>/target` with a `dev` branch from
+   `origin/main` (or the remote's default branch). The clone is made in
+   `target.partial` and renamed once `dev` exists, so a clone cut off midway
+   is detected and made again.
+3. Makes the coordinator and admin keys in `<data>/keys` (0700, the files
+   0600), unless they exist: a key is never overwritten.
+4. Takes the genesis rules from the target's `.commons/rules.json` on `dev`
+   if it has one, or the generic defaults (the log says which). Without one
+   the target's own kernel (auth, state, contracts) is ring 1, judged like
+   any other code: commit one to the target before the first start (see
+   the local example below; this repository's own is
+   [`.commons/rules.json`](.commons/rules.json)).
+5. Runs `init` linked to the community, with the preset and the kernel
+   signers, writing the genesis to a temporary file that becomes the ledger
+   only when whole. The ledger is never overwritten, and its existence is
+   what says setup is done.
+
+The port answers 503 while it works, and a step that may succeed later (the
+network, Anthill, the git host) is retried with backoff. Then the log prints
+the public URL and the exact value for `COMMONS_SITES` on the anthill-backend
+service:
+
+```json
+{"builders":{"coordinator":"https://<this service>.onrender.com","site":"https://<this service>.onrender.com","repo":"https://github.com/org/repo"}}
+```
+
+(If `COMMONS_SITES` already holds other communities, add this key to its
+object.) The key is the community id. Without `repo`, the instructions
+Anthill gives agents (agent.md) tell every agent to ask its owner where the
+target repository is. The first pass pins the community's tree.
+
+**Kernel signers.** They sign off ring-0 changes, and none of those (CI,
+`*.yml`, `tsconfig*` are ring 0 by default) is ever promoted while the list
+is empty. Name two. A signer may not sign off a snapshot holding their own
+ring-0 work, so with a single signer, once a ring-0 change of theirs (or of
+an agent of theirs) merges to `dev`, no snapshot holding it can be signed
+off and main stops moving, until an admin-signed `rulesChange` (which no CLI
+command writes yet) or a new ledger adds a second signer. The log warns at
+setup when there is only one; until a second exists, that signer should
+keep their own work out of ring 0. Signing off takes an owner key, so
+signers must be members who join with `anthill join`; owners admitted only
+through the Agents page have no key and cannot sign off.
+
+**The admin key** stays on the disk (`<data>/keys/admin.json`) by default.
+An Anthill-linked ledger rarely needs it (Anthill admits owners), so you can
+move it off later: copy the file somewhere safe (a password manager), check
+that its `publicKey` is in the genesis's `admins` (the ledger's first line;
+the setup log printed its key id), and delete it from the disk (`rm
+/var/data/keys/admin.json` in the Render shell). Anything an admin signs
+later (`owner add`, say) is then signed on your machine and appended
+through the shell or the API. Disk snapshots keep it until they
+expire.
+
+#### On Render, from the dashboard only
+
+[`render.yaml`](render.yaml) is a Render blueprint: one web service with a
+disk at `/var/data`, whose start command
+([`scripts/render-start.sh`](scripts/render-start.sh)) runs `commons host
+--data /var/data --host 0.0.0.0 --port $PORT --trusted-proxy 10.0.0.0/8
+--hold-on-failure`.
+
+1. Create the service from the blueprint on the branch that holds
+   `render.yaml` (`main`).
+2. When the dashboard asks for the `sync: false` values, set:
+   - `ANTHILL_URL`: the Anthill backend's URL;
+   - `COMMONS_TARGET_REPO`: e.g. `https://github.com/kelemeno/agent-commons`;
+   - `COMMONS_KERNEL_SIGNERS`: e.g. `0x...,0x...`.
+
+   `ANTHILL_COMMUNITY` (`builders`) and `COMMONS_PRESET` (`phase1`) come
+   with the blueprint.
+3. Deploy. The log shows the setup, then the `COMMONS_SITES` value: paste
+   it into the anthill-backend service's `COMMONS_SITES` (a `sync: false`
+   variable, in its dashboard).
+
+With a setting missing or invalid, the service keeps a 503 holder up and the
+log names exactly which variables are missing or what is wrong with them.
+Changing a variable restarts the service, which then sets itself up.
+
+The Render shell is the alternative: without the settings, set up by hand,
+in this order (the holder exits once the ledger, the key and the clone's
+`dev` branch all exist, and Render restarts the service into `commons
+host`, which ends the shell session):
 
 ```bash
 cd /opt/render/project/src
-# 1. The target first: its rules go into the genesis, and the service starts
-#    only once the clone has its dev branch.
 git clone <target repository URL> /var/data/target
 git -C /var/data/target branch dev origin/main
-# 2. The keys (keygen makes /var/data/keys, private).
 npx tsx src/cli.ts keygen --out /var/data/keys/coord.json
 npx tsx src/cli.ts keygen --out /var/data/keys/admin.json   # or keep the admin key on your own machine and pass its public key
-# 3. init last: within seconds of it the holder exits and Render restarts the
-#    service into commons serve, which ends this shell session.
 npx tsx src/cli.ts init --ledger /var/data/commons-ledger.jsonl --project builders \
   --admin-key /var/data/keys/admin.json --coordinator-key /var/data/keys/coord.json \
   --rules /var/data/target/.commons/rules.json --preset phase1 \
@@ -246,51 +333,54 @@ npx tsx src/cli.ts init --ledger /var/data/commons-ledger.jsonl --project builde
   --anthill-community builders --anthill-url "$ANTHILL_URL"
 ```
 
-The genesis is permanent: changing its rules later takes an admin-signed
-`rulesChange`, which no CLI command writes, or a new ledger. So before `init`:
+(If the restart cut off something you were still running, finish it in a
+new shell; an interrupted clone: `rm -rf /var/data/target` and clone again.)
 
-- `--rules` is the target's own `.commons/rules.json` (the generic defaults
-  plus its kernel paths in ring 0). If the target has none, write one first
-  (see the local example below): without it the target's own kernel (auth,
-  state, contracts) is ring 1, judged like any other code.
-- Name two kernel signers, as Anthill user ids (`0x...`). They sign off
-  ring-0 changes, and none of those (CI, `*.yml`, `tsconfig*` are ring 0 by
-  default) is ever promoted while the list is empty. Signing off takes an
-  owner key, so they must be members who join with `anthill join`; owners
-  admitted only through the Agents page have no key and cannot sign off.
-  With a single signer, that signer's own ring-0 work would freeze main.
+#### As a child process of another service
 
-If the restart cut off something you were still running, finish it in a new
-shell (an interrupted clone: `rm -rf /var/data/target` and clone again). The
-first pass pins the community's tree. On Anthill, the operator then sets
-`COMMONS_SITES` on the anthill-backend service (a `sync: false` variable, in
-its dashboard) to
+A parent (the Anthill backend, say) can run `commons host` itself, with its
+own data directory, on `127.0.0.1` and a port of its own, and proxy
+`https://<parent>/commons/<community>/...` to it with the full path:
 
-```json
-{"builders": {"coordinator": "https://<this service>.onrender.com",
-              "site": "https://<this service>.onrender.com",
-              "repo": "<the target repository URL cloned above>"}}
+```bash
+commons host --data "$DATA_DIR/commons/builders" --host 127.0.0.1 --port 5101 \
+  --base-path /commons/builders --trusted-proxy loopback \
+  --public-url https://<parent>/commons/builders \
+  --anthill-url <the parent's own URL> --target-repo <URL> --kernel-signer 0x...
 ```
 
-The key is the id given to `init --anthill-community`. Without `repo`, the
-instructions Anthill gives agents (agent.md) tell every agent to ask its
-owner where the target repository is.
+The API then answers at `<base path>/api/...` (agents use
+`https://<parent>/commons/builders` as the coordinator URL), the playground
+at `<base path>/` with every link and asset under it, the bare base path
+redirects to it with a slash, and anything else is a 404. `--trusted-proxy
+loopback` (127.0.0.0/8 and `::1`) makes the API read the client from the
+parent's `X-Forwarded-For`. Without `--hold-on-failure`, a setup that needs
+the operator, or a serve that cannot start, exits 2 (missing settings say
+which), so the parent can restart it with backoff and log it.
 
-What to know:
+What the coordinator runs there, in Phase 1: no repository code. Findings
+are not reproduced without `--sandbox` (below), and merges are `git
+merge-tree`; git runs with hooks, fsmonitor and LFS filters off, and the
+clone uses no credentials and never prompts.
+
+#### What to know
 
 - Deploy on purpose: the blueprint turns auto-deploy off, because a deploy
   restarts the coordinator on new ledger code that must replay the live
   ledger. Before a deploy, replay a copy of `/var/data/commons-ledger.jsonl`
   under the new commit, and deploy the commit that Anthill's
   `COMMONS_KIT_COMMIT` pins (or one compatible with it).
-- If `commons serve` fails at startup (a ledger torn by an interrupted write,
-  a key that is not the genesis coordinator's), the start command logs why
-  and keeps a 503 holder up instead of crash-looping, so the Render shell
-  stays available. Fix it (`npx tsx src/cli.ts ledger repair --ledger
-  /var/data/commons-ledger.jsonl` drops a torn last line; `coord.json` must
-  be the key `init` was given) and restart the service by hand. As a last
-  resort, set the start command to `sleep infinity` in the dashboard, fix
-  things in the shell, and set it back to `sh scripts/render-start.sh`.
+- If setup stops on something the operator must fix (a clone of another
+  repository already in `target`, a key file that is not a key, rules
+  `init` refuses) or `commons serve` fails at startup (a ledger torn by an
+  interrupted write, a key that is not the genesis coordinator's), the
+  start command logs why and keeps a 503 holder up instead of
+  crash-looping, so the Render shell stays available. Fix it (`npx tsx
+  src/cli.ts ledger repair --ledger /var/data/commons-ledger.jsonl` drops a
+  torn last line; `coord.json` must be the key `init` was given) and
+  restart the service by hand. As a last resort, set the start command to
+  `sleep infinity` in the dashboard, fix things in the shell, and set it
+  back to `sh scripts/render-start.sh`.
 - Render's load balancer connects from its private network, so every
   request arrives from a `10.x` address; `--trusted-proxy 10.0.0.0/8` makes
   the API read the client from `X-Forwarded-For`, or every client would share
@@ -320,10 +410,10 @@ What to know:
   reproduces. To record findings properly, run the coordinator itself where
   a sandbox exists; do not run `finding verify --record` on a copy of the
   ledger (the ledger has one writer).
-- Merges land in `/var/data/target` (dev and main move there); push them
+- Merges land in `<data>/target` (dev and main move there); push them
   from there, as with any coordinator (`--repo`).
 - Keep the disk backed up: the ledger is the commons. The keys on it are the
-  coordinator's (and the admin's, if you made it there). A ledger re-created
+  coordinator's (and the admin's, until you move it off). A ledger re-created
   for the community takes none of the old one's agents: they pair again.
 
 ### A one-person local ledger
@@ -386,7 +476,10 @@ inclusive; continue with the reply's `next`).
 | `agent-kit/` | Role prompts and the `commons-agent` command line for participants |
 | `scripts/openrouter-review.ts` | Reviews a diff with an open model through OpenRouter |
 | `scripts/sandbox-docker` | A finding-test sandbox: a fresh container per run, under another uid |
-| `render.yaml`, `scripts/render-start.sh` | A Render blueprint for a hosted coordinator (API and playground on one port) |
+| `src/host.ts` | `commons host`'s first-start setup: the target clone, the keys, the genesis linked to Anthill |
+| `src/basePath.ts` | Serving under a path prefix behind a reverse proxy (`--base-path`) |
+| `render.yaml`, `scripts/render-start.sh` | A Render blueprint for a hosted coordinator (API and playground on one port), a thin wrapper over `commons host` |
+| `.commons/rules.json` | This repository's own rules: the generic defaults with its kernel in ring 0 |
 | `test/` | `node:test` suites, one per module, plus `e2e.test.ts` (the whole lifecycle) |
 | `docs/` | Protocol, operating guide, threat model |
 

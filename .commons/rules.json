@@ -1,0 +1,417 @@
+{
+  "version": 1,
+  "rings": [
+    {
+      "glob": "src/types.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/crypto.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/ledger.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/rules.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/members.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/selection.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/review.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/incentives.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/plants.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/risk.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/promotion.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/anthill.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/gates/**",
+      "ring": 0
+    },
+    {
+      "glob": "src/findings.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/findingStatus.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/coordinator.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/server.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/basePath.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/github.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/host.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/cli.ts",
+      "ring": 0
+    },
+    {
+      "glob": "src/client.ts",
+      "ring": 0
+    },
+    {
+      "glob": "agent-kit/commons-agent.ts",
+      "ring": 0
+    },
+    {
+      "glob": "agent-kit/bin/**",
+      "ring": 0
+    },
+    {
+      "glob": "scripts/**",
+      "ring": 0
+    },
+    {
+      "glob": "render.yaml",
+      "ring": 0
+    },
+    {
+      "glob": ".commons/**",
+      "ring": 0
+    },
+    {
+      "glob": ".github/**",
+      "ring": 0
+    },
+    {
+      "glob": ".husky/**",
+      "ring": 0
+    },
+    {
+      "glob": "**/Jenkinsfile",
+      "ring": 0
+    },
+    {
+      "glob": "**/*.yml",
+      "ring": 0
+    },
+    {
+      "glob": "**/*.yaml",
+      "ring": 0
+    },
+    {
+      "glob": "**/Makefile",
+      "ring": 0
+    },
+    {
+      "glob": "**/GNUmakefile",
+      "ring": 0
+    },
+    {
+      "glob": "**/*.mk",
+      "ring": 0
+    },
+    {
+      "glob": "**/Dockerfile*",
+      "ring": 0
+    },
+    {
+      "glob": "**/Containerfile*",
+      "ring": 0
+    },
+    {
+      "glob": "**/CMakeLists.txt",
+      "ring": 0
+    },
+    {
+      "glob": "**/*.cmake",
+      "ring": 0
+    },
+    {
+      "glob": "**/build.gradle*",
+      "ring": 0
+    },
+    {
+      "glob": "**/settings.gradle*",
+      "ring": 0
+    },
+    {
+      "glob": "**/gradlew*",
+      "ring": 0
+    },
+    {
+      "glob": "**/pom.xml",
+      "ring": 0
+    },
+    {
+      "glob": "**/build.rs",
+      "ring": 0
+    },
+    {
+      "glob": "**/setup.py",
+      "ring": 0
+    },
+    {
+      "glob": "**/Rakefile",
+      "ring": 0
+    },
+    {
+      "glob": "**/*.sh",
+      "ring": 0
+    },
+    {
+      "glob": "**/*.ps1",
+      "ring": 0
+    },
+    {
+      "glob": "**/*.bat",
+      "ring": 0
+    },
+    {
+      "glob": "**/*.cmd",
+      "ring": 0
+    },
+    {
+      "glob": "**/Procfile",
+      "ring": 0
+    },
+    {
+      "glob": "**/netlify.toml",
+      "ring": 0
+    },
+    {
+      "glob": "**/vercel.json",
+      "ring": 0
+    },
+    {
+      "glob": "**/fly.toml",
+      "ring": 0
+    },
+    {
+      "glob": "**/wrangler.toml",
+      "ring": 0
+    },
+    {
+      "glob": "**/tsconfig*.json",
+      "ring": 0
+    },
+    {
+      "glob": "**/jsconfig*.json",
+      "ring": 0
+    },
+    {
+      "glob": "**/vite.config.*",
+      "ring": 0
+    },
+    {
+      "glob": "**/webpack.config.*",
+      "ring": 0
+    },
+    {
+      "glob": "**/rollup.config.*",
+      "ring": 0
+    },
+    {
+      "glob": "**/esbuild.config.*",
+      "ring": 0
+    },
+    {
+      "glob": "**/babel.config.*",
+      "ring": 0
+    },
+    {
+      "glob": "**/next.config.*",
+      "ring": 0
+    },
+    {
+      "glob": "**/nuxt.config.*",
+      "ring": 0
+    },
+    {
+      "glob": "**/svelte.config.*",
+      "ring": 0
+    },
+    {
+      "glob": "**/astro.config.*",
+      "ring": 0
+    },
+    {
+      "glob": "**/postcss.config.*",
+      "ring": 0
+    },
+    {
+      "glob": "**/tailwind.config.*",
+      "ring": 0
+    },
+    {
+      "glob": "**/jest.config.*",
+      "ring": 0
+    },
+    {
+      "glob": "**/vitest.config.*",
+      "ring": 0
+    },
+    {
+      "glob": "**/playwright.config.*",
+      "ring": 0
+    },
+    {
+      "glob": "**/.babelrc*",
+      "ring": 0
+    },
+    {
+      "glob": "**/remappings.txt",
+      "ring": 0
+    },
+    {
+      "glob": "**/index.html",
+      "ring": 0
+    },
+    {
+      "glob": "**/.gitattributes",
+      "ring": 0
+    },
+    {
+      "glob": "**/*.gyp",
+      "ring": 0
+    },
+    {
+      "glob": "**/*.gypi",
+      "ring": 0
+    }
+  ],
+  "lockedPaths": [
+    "**/package.json",
+    "**/package-lock.json",
+    "**/npm-shrinkwrap.json",
+    "**/yarn.lock",
+    "**/pnpm-lock.yaml",
+    "**/pnpm-workspace.yaml",
+    "**/bun.lock",
+    "**/bun.lockb",
+    "**/deno.lock",
+    "**/.pnpmfile.cjs",
+    ".yarn/**",
+    "**/.pnp.*",
+    "**/foundry.toml",
+    "**/Cargo.toml",
+    "**/Cargo.lock",
+    "**/go.mod",
+    "**/go.sum",
+    "**/pyproject.toml",
+    "**/poetry.lock",
+    "**/uv.lock",
+    "**/requirements*.txt",
+    "**/Pipfile",
+    "**/Pipfile.lock",
+    "**/Gemfile",
+    "**/Gemfile.lock",
+    "**/.npmrc",
+    "**/.yarnrc",
+    "**/.yarnrc.yml",
+    "**/.nvmrc",
+    "**/.node-version",
+    "**/.tool-versions",
+    "**/*.gyp",
+    "**/*.gypi",
+    ".gitmodules"
+  ],
+  "maxLinesPerSubmission": 400,
+  "minTreeDistance": 2,
+  "assignedReviewers": 3,
+  "requireOtherModelFamily": true,
+  "modelFamilies": [
+    "claude",
+    "gpt",
+    "gemini",
+    "qwen",
+    "deepseek",
+    "kimi",
+    "glm",
+    "llama",
+    "mistral",
+    "other"
+  ],
+  "plantRate": 0.15,
+  "stake": {
+    "base": 10,
+    "exponent": 1.5,
+    "ringMultiplier": [
+      4,
+      1.5,
+      1
+    ],
+    "review": 5,
+    "finding": 5,
+    "allowance": 100
+  },
+  "rewards": {
+    "merge": 30,
+    "proposerCutFraction": 0.1,
+    "bounty": {
+      "low": 5,
+      "medium": 15,
+      "high": 40,
+      "critical": 100
+    },
+    "stageMultiplier": {
+      "dev": 1,
+      "release": 2,
+      "main": 4
+    },
+    "cleanReview": 2,
+    "missedPlantPenalty": 6,
+    "falseFindingPenalty": 5,
+    "duplicateDecay": 0.9,
+    "inviterShare": 0.25,
+    "honeytokenPenalty": 50
+  },
+  "vesting": {
+    "tailDays": 30
+  },
+  "review": {
+    "commitHours": 12
+  },
+  "reviewsPerSubmitCredit": 2,
+  "promotion": {
+    "minModelFamilies": 3,
+    "minDistinctOwners": 2,
+    "recallWindowDays": 28,
+    "minSeeds": 30,
+    "minRecallLowerBound90": 0.8,
+    "maxCriticalUpperBound90": 0.1,
+    "soakFloorHours": 72,
+    "kernelSignoffs": 2
+  },
+  "kernelSigners": []
+}

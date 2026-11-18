@@ -70,6 +70,7 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import { BlockList, isIPv4, isIPv6 } from "node:net";
 import * as path from "node:path";
+import { answeredOutsideBase, normaliseBasePath } from "./basePath";
 import { canonical, isValidPublicKey, keyIdOf, sha256hex, verify } from "./crypto";
 import { parsePatch } from "./github";
 import {
@@ -312,11 +313,17 @@ export type CoordinatorServerOptions = {
   // Addresses of reverse proxies in front of this server, exact or as IPv4
   // CIDR ranges (10.0.0.0/8: a hosting provider's load balancers connect from
   // changing private addresses), or "cloudflare" for Cloudflare's published
-  // ranges (an edge that appends its own hop). A request from one of them is
+  // ranges (an edge that appends its own hop), or "loopback" (127.0.0.0/8 and
+  // ::1: a parent process proxying on the same machine). A request from one of them is
   // attributed to the last X-Forwarded-For hop that is not a trusted proxy;
   // from anyone else the header is ignored. The first proxied request logs
   // the header's shape once ("client addresses:"), without addresses.
   trustedProxies?: readonly string[];
+  // The path this server is mounted under behind a reverse proxy that
+  // forwards the full path (basePath.ts: "" or "/commons/builders"): the API
+  // answers at <basePath>/api/..., the fallback gets the paths below it, and
+  // requests outside it are 404s.
+  basePath?: string;
 };
 
 export type CoordinatorServer = http.Server & { store: LedgerStore };
@@ -368,7 +375,9 @@ export function createCoordinatorServer(opts: CoordinatorServerOptions): Coordin
   let inFlight = 0;
   const perIp = new Map<string, number>();
   let loggedShape = false;
+  const basePath = normaliseBasePath(opts.basePath ?? "");
   const server = http.createServer((req, res) => {
+    if (answeredOutsideBase(basePath, req, res)) return;
     const ip = clientAddress(req, trusted);
     if (!loggedShape && trusted(req.socket.remoteAddress ?? "")) {
       loggedShape = true;
@@ -487,9 +496,10 @@ function ipv4(ip: string): number | null {
 }
 
 // Whether an address is one of `entries`: exact addresses (an IPv4-mapped
-// IPv6 peer matches its IPv4 spelling), IPv4 CIDR ranges, or "cloudflare"
-// (its IPv4 and IPv6 ranges). A malformed range throws at startup rather than
-// trusting nothing (or everything) silently.
+// IPv6 peer matches its IPv4 spelling), IPv4 CIDR ranges, "cloudflare"
+// (its IPv4 and IPv6 ranges), or "loopback" (127.0.0.0/8 and ::1). A
+// malformed range throws at startup rather than trusting nothing (or
+// everything) silently.
 export function proxyMatcher(entries: readonly string[]): (ip: string) => boolean {
   const exact = new Set<string>();
   const ranges: { base: number; mask: number }[] = [];
@@ -497,6 +507,13 @@ export function proxyMatcher(entries: readonly string[]): (ip: string) => boolea
   for (const e of entries) {
     if (e === "cloudflare") {
       cloudflare = true;
+      continue;
+    }
+    // A proxy on the same machine (a parent process that runs this server and
+    // forwards to it on 127.0.0.1, or on ::1 when it dials "localhost").
+    if (e === "loopback") {
+      exact.add("::1");
+      ranges.push({ base: 0x7f000000, mask: 0xff000000 });
       continue;
     }
     const cidr = /^([^/]+)\/(\d{1,2})$/.exec(e);

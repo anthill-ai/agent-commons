@@ -48,7 +48,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
-import type * as http from "node:http";
+import * as http from "node:http";
 import * as path from "node:path";
 import { COMMONS_COMMIT_IDENTITY, CommonsClient, commitSubject, commonsCommit, commonsCommitMessage, fileSaltStore, newId, type CommitKind } from "./client";
 import {
@@ -80,6 +80,8 @@ import {
 } from "./anthill";
 import { canonical, generateKeyPair, isValidPublicKey, keyIdOf, randomSalt, sha256hex } from "./crypto";
 import { HARNESS_DIR_PREFIX, minimalEnv, reproduceFinding } from "./findings";
+import { normaliseBasePath } from "./basePath";
+import { HOST_SETTINGS, hostLayout, missingForServe, readHostSettings, settingName, SetupError, setUp } from "./host";
 import { applyUnifiedDiff, checkRepoPath, FULL_SHA, parsePatch } from "./github";
 import { DEFAULT_MAX_SKEW_MS, isCanonicalPath, isRefSafeId, Ledger, LedgerError, type LedgerState, type Signer, citedFindingProblems, verdictProblems } from "./ledger";
 import { plantCommitment, reviewWindowClosed } from "./plants";
@@ -118,9 +120,9 @@ export type MetricsApi = {
   computeMetrics(state: CommonsState, nowIso: string): { group: string; metric: string; value: unknown; bad: boolean; note: string }[];
 };
 export type PlaygroundApi = {
-  startPlayground(opts: { ledgerPath: string; port: number; host?: string }): http.Server;
+  startPlayground(opts: { ledgerPath: string; port: number; host?: string; basePath?: string }): http.Server;
   // The same site as a request handler, mounted behind the coordinator API by `serve --one-port`.
-  createPlaygroundHandler(opts: { ledgerPath: string }): http.RequestListener;
+  createPlaygroundHandler(opts: { ledgerPath: string; basePath?: string }): http.RequestListener;
 };
 
 export type ModuleName =
@@ -160,6 +162,8 @@ export type Io = {
   fetch?: typeof globalThis.fetch;
   // Resolves when a long-running command (serve) should stop; default: never.
   until?: Promise<void>;
+  // The environment `host` reads its settings from; default process.env.
+  env?: NodeJS.ProcessEnv;
 };
 
 // exitCode 1 = refused or failed check, 2 = usage or harness error.
@@ -2740,12 +2744,25 @@ const COMMANDS: Record<string, Command> = {
       "api-port": { type: "string", help: "coordinator API port (default port + 1)" },
       "one-port": { type: "boolean", help: "with --coordinator: serve the API and the playground together on --port (a hosted service has one port)" },
       "loop-seconds": { type: "string", help: "with --coordinator: run a coordinator pass this often (default: never)" },
-      "trusted-proxy": { type: "list", help: "address (or IPv4 range, 10.0.0.0/8, or cloudflare for Cloudflare's ranges) of a reverse proxy in front of the API (repeatable); only its X-Forwarded-For is believed" },
+      "trusted-proxy": {
+        type: "list",
+        help: "address (or IPv4 range, 10.0.0.0/8, cloudflare for Cloudflare's ranges, loopback for 127.0.0.0/8 and ::1) of a reverse proxy in front of the API (repeatable); only its X-Forwarded-For is believed",
+      },
+      "base-path": {
+        type: "string",
+        help: "serve under this path behind a reverse proxy that forwards the full path, e.g. /commons/builders: the API at <path>/api/..., the playground and its links at <path>/",
+      },
     },
     async (ctx) => {
       const f = ctx.flags;
       const port = int(f, "port", { min: 0, dflt: 8080 }) as number;
       const host = str(f, "host") ?? "127.0.0.1";
+      let basePath = "";
+      try {
+        basePath = normaliseBasePath(str(f, "base-path") ?? "");
+      } catch (e) {
+        usage(`--base-path: ${(e as Error).message}`);
+      }
       const ledger = ledgerPath(ctx);
       const onePort = bool(f, "one-port");
       if (onePort && !bool(f, "coordinator")) usage("--one-port needs --coordinator: without it the playground already has the port to itself");
@@ -2759,9 +2776,9 @@ const COMMANDS: Record<string, Command> = {
       const servers: http.Server[] = [];
       const playground = ctx.io.load("playground") as PlaygroundApi;
       if (!onePort) {
-        const pg = playground.startPlayground({ ledgerPath: ledger, port, host });
+        const pg = playground.startPlayground({ ledgerPath: ledger, port, host, basePath });
         servers.push(pg);
-        pg.on("listening", () => ctx.out(`playground on http://${host}:${addrPort(pg)}`));
+        pg.on("listening", () => ctx.out(`playground on http://${host}:${addrPort(pg)}${basePath}`));
       }
       let timer: NodeJS.Timeout | undefined;
       if (bool(f, "coordinator")) {
@@ -2774,15 +2791,20 @@ const COMMANDS: Record<string, Command> = {
           patchesDir: patchesDir(ctx),
           policy: ctx.io.load("incentives") as SubmitPolicy,
           trustedProxies: list(f, "trusted-proxy"),
+          basePath,
           // One port: whatever the API does not answer is the playground's.
           // /api/entries is the API's (the same contract); the site's other
           // pages and /api/state, /api/metrics pass through, under the API's
           // per-address limits.
-          ...(onePort ? { fallback: playground.createPlaygroundHandler({ ledgerPath: ledger }) } : {}),
+          ...(onePort ? { fallback: playground.createPlaygroundHandler({ ledgerPath: ledger, basePath }) } : {}),
         });
         const apiPort = onePort ? port : (int(f, "api-port", { min: 0 }) ?? (port === 0 ? 0 : port + 1));
         api.listen(apiPort, host, () =>
-          ctx.out(onePort ? `coordinator API and playground on http://${host}:${addrPort(api)}` : `coordinator API on http://${host}:${addrPort(api)}`),
+          ctx.out(
+            onePort
+              ? `coordinator API and playground on http://${host}:${addrPort(api)}${basePath}`
+              : `coordinator API on http://${host}:${addrPort(api)}${basePath}`,
+          ),
         );
         servers.push(api);
         const every = int(f, "loop-seconds", { min: 1 });
@@ -2801,6 +2823,173 @@ const COMMANDS: Record<string, Command> = {
       if (timer) clearInterval(timer);
       await Promise.all(servers.map((s) => new Promise<void>((r) => s.close(() => r()))));
       return 0;
+    },
+  ),
+
+  host: command(
+    "a coordinator linked to an Anthill community in one data directory: on the first start it sets itself up (clone, keys, init), then serves the API and the playground on one port",
+    {
+      data: { type: "string", help: "the data directory: ledger, keys/, target/ (the coordinator's clone), patches/", required: true },
+      host: { type: "string", help: "listen address (default 127.0.0.1)" },
+      port: { type: "string", help: "the one port (default 8080)" },
+      "anthill-url": { type: "string", help: "the Anthill backend URL (env ANTHILL_URL)" },
+      community: { type: "string", help: "the Anthill community (env ANTHILL_COMMUNITY; default builders)" },
+      project: { type: "string", help: "setup: the project id in the genesis (env COMMONS_PROJECT; default the community)" },
+      "target-repo": { type: "string", help: "setup: public https URL of the repository to build, no credentials (env COMMONS_TARGET_REPO)" },
+      "kernel-signer": { type: "list", help: "setup: Anthill user id (0x + 40 hex) who signs off kernel changes; name two (env COMMONS_KERNEL_SIGNERS, comma-separated)" },
+      preset: { type: "string", help: "setup: phase1 or none (env COMMONS_PRESET; default phase1)" },
+      "base-path": { type: "string", help: "serve under this path behind a reverse proxy, e.g. /commons/builders (env COMMONS_BASE_PATH)" },
+      "public-url": { type: "string", help: "the coordinator's public URL, for the COMMONS_SITES line setup prints (env COMMONS_PUBLIC_URL; default RENDER_EXTERNAL_URL + base path)" },
+      "trusted-proxy": { type: "list", help: "as serve --trusted-proxy (loopback for a parent process proxying on this machine)" },
+      "loop-seconds": { type: "string", help: "a coordinator pass this often (default 30)" },
+      "setup-retry-seconds": { type: "string", help: "first wait before retrying a setup step that may succeed later (network, Anthill, git host); doubles up to 600 (default 60)" },
+      "hold-on-failure": { type: "boolean", help: "if setup or serve cannot start, keep answering 503 on the port instead of exiting (a service with no other way in than its shell)" },
+      check: { type: "boolean", help: "only check: exit 0 if it can start (ledger there, or setup settings complete), 1 if setup settings are missing, 2 if one is invalid" },
+      "test-allow-file-target": { type: "boolean", help: "tests only: accept a file: URL as the target (env COMMONS_TEST_ALLOW_FILE_TARGET=1)" },
+    },
+    async (ctx) => {
+      const f = ctx.flags;
+      const env = ctx.io.env ?? process.env;
+      const say = (line: string) => ctx.io.stderr(`commons host: ${printable(line, true)}\n`);
+      const layout = hostLayout(resolvePath(ctx, req(f, "data")));
+      const port = int(f, "port", { min: 0, dflt: 8080 }) as number;
+      const host = str(f, "host") ?? "127.0.0.1";
+      const pick = (k: keyof typeof HOST_SETTINGS): string | undefined => str(f, HOST_SETTINGS[k].flag) ?? env[HOST_SETTINGS[k].env];
+      let basePath = "";
+      try {
+        basePath = normaliseBasePath(str(f, "base-path") ?? env.COMMONS_BASE_PATH ?? "");
+      } catch (e) {
+        usage(`--base-path: ${(e as Error).message}`);
+      }
+      const signerFlags = list(f, "kernel-signer");
+      const envSigners = env[HOST_SETTINGS.kernelSigners.env];
+      const read = readHostSettings(
+        {
+          anthillUrl: pick("anthillUrl"),
+          community: pick("community"),
+          project: pick("project"),
+          targetRepo: pick("targetRepo"),
+          kernelSigners: signerFlags.length > 0 ? signerFlags : envSigners === undefined ? [] : [envSigners],
+          preset: pick("preset"),
+        },
+        { allowFileTarget: bool(f, "test-allow-file-target") || env.COMMONS_TEST_ALLOW_FILE_TARGET === "1" },
+      );
+      const fresh = !fs.existsSync(layout.ledger);
+      const until = ctx.io.until ?? new Promise<void>(() => {});
+      let stopped = false;
+      void until.then(() => (stopped = true));
+
+      // A 503 on the port while setting up, or (with --hold-on-failure) after a failure.
+      let holder: http.Server | null = null;
+      let holderText = "";
+      const hold = async (text: string) => {
+        holderText = text;
+        if (holder !== null) return;
+        const h = http.createServer((q, r) => {
+          q.resume();
+          r.writeHead(503, { "Content-Type": "text/plain; charset=utf-8", "Retry-After": "60" });
+          r.end(`${holderText}\n`);
+        });
+        holder = h;
+        await new Promise<void>((resolve, reject) => {
+          h.once("error", reject);
+          h.listen(port, host, () => resolve());
+        });
+      };
+      const release = async () => {
+        const h = holder;
+        holder = null;
+        if (h !== null) await new Promise<void>((r) => h.close(() => r()));
+      };
+      // Fails: exits 2, or holds the port until stopped.
+      const fail = async (text: string): Promise<number> => {
+        if (bool(f, "hold-on-failure")) {
+          await hold(text);
+          await until;
+        }
+        await release();
+        return 2;
+      };
+
+      if (bool(f, "check")) {
+        if (!fresh) return 0;
+        if (read.missing.length > 0) say(`no ledger yet, and setup needs ${read.missing.join(", ")}`);
+        for (const p of read.problems) say(p);
+        return read.problems.length > 0 ? 2 : read.missing.length > 0 ? 1 : 0;
+      }
+
+      if (fresh) {
+        if (read.settings === undefined) {
+          if (read.missing.length > 0) say(`cannot set up: no ledger yet, and setup needs ${read.missing.join(", ")}`);
+          for (const p of read.problems) say(`cannot set up: ${p}`);
+          return fail("This commons is not set up yet.");
+        }
+        for (const w of read.warnings) say(`warning: ${w}`);
+        await hold("This commons is setting itself up; try again in a few minutes.");
+        const publicUrl = (str(f, "public-url") ?? env.COMMONS_PUBLIC_URL ?? (env.RENDER_EXTERNAL_URL ? `${env.RENDER_EXTERNAL_URL.replace(/\/+$/, "")}${basePath}` : undefined))?.replace(
+          /\/+$/,
+          "",
+        );
+        let wait = int(f, "setup-retry-seconds", { min: 1, dflt: 60 }) as number;
+        for (;;) {
+          try {
+            await setUp(layout, read.settings, {
+              log: say,
+              init: (argv) => main(argv, { ...ctx.io, stdout: (t) => ctx.io.stderr(t) }),
+              ...(ctx.io.fetch ? { fetch: ctx.io.fetch } : {}),
+              ...(publicUrl ? { publicUrl } : {}),
+            });
+            break;
+          } catch (e) {
+            const retry = e instanceof SetupError ? e.retry : false;
+            say(`setup failed: ${(e as Error).message}`);
+            if (!retry) {
+              say("setup stopped: fix the above and restart");
+              return fail("This commons could not set itself up; the operator has the details in the logs.");
+            }
+            say(`retrying in ${wait}s`);
+            await Promise.race([until, new Promise((r) => setTimeout(r, wait * 1000).unref())]);
+            if (stopped) {
+              await release();
+              return 0;
+            }
+            wait = Math.min(wait * 2, 600);
+          }
+        }
+        await release();
+      } else {
+        const missing = missingForServe(layout);
+        if (missing.length > 0) {
+          say(`the ledger exists, but ${missing.join(" and ")} is missing; setup never runs over a ledger`);
+          return fail("This commons cannot start; the operator has the details in the logs.");
+        }
+      }
+
+      const anthillUrl = pick("anthillUrl")?.trim();
+      if (anthillUrl === undefined || anthillUrl === "") {
+        say(`cannot serve: ${settingName("anthillUrl")} is not set`);
+        return fail("This commons cannot start; the operator has the details in the logs.");
+      }
+      const serveArgv = [
+        "serve",
+        "--ledger", layout.ledger,
+        "--key", layout.coordKey,
+        "--coordinator", "--one-port",
+        "--host", host,
+        "--port", String(port),
+        "--loop-seconds", str(f, "loop-seconds") ?? "30",
+        "--anthill-url", anthillUrl,
+        "--repo", layout.target,
+        "--patches", layout.patches,
+        ...(basePath === "" ? [] : ["--base-path", basePath]),
+        ...list(f, "trusted-proxy").flatMap((p) => ["--trusted-proxy", p]),
+      ];
+      const code = await main(serveArgv, ctx.io);
+      if (code === 0 || stopped) return code;
+      say(`serve failed at startup (exit ${code}; its error is above)${bool(f, "hold-on-failure") ? ". The port answers 503 until this is fixed and the process restarted:" : ":"}`);
+      say(`  a torn ledger (an interrupted write): npx tsx src/cli.ts ledger repair --ledger ${layout.ledger}`);
+      say(`  a key mismatch: ${layout.coordKey} must be the coordinator key init was given`);
+      return fail("This commons cannot start; the operator has the details in the service logs.");
     },
   ),
 

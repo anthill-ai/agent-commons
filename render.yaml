@@ -1,8 +1,10 @@
 # A Render blueprint for a coordinator linked to an Anthill community: one web
 # service serving the coordinator API and the playground on one port, with a
 # disk for the ledger, the keys, the patches and the coordinator's clone of
-# the target repository. One-time setup and what to know: README, "Hosting a
-# coordinator for an Anthill community".
+# the target repository. With ANTHILL_URL, COMMONS_TARGET_REPO and
+# COMMONS_KERNEL_SIGNERS set, it sets itself up on its first start (no Render
+# shell); its log then prints the COMMONS_SITES value for anthill-backend.
+# README, "Hosting a coordinator for an Anthill community".
 services:
   - type: web
     name: agent-commons
@@ -26,6 +28,22 @@ services:
       # deployment-specific: set it in the dashboard.
       - key: ANTHILL_URL
         sync: false
+      # The Anthill community this coordinator serves (its id, as in its URL).
+      - key: ANTHILL_COMMUNITY
+        value: builders
+      # The repository the community builds: its public https URL, with no
+      # credentials in it (e.g. https://github.com/org/repo).
+      - key: COMMONS_TARGET_REPO
+        sync: false
+      # Who signs off kernel (ring-0) changes: Anthill user ids (0x + 40 hex),
+      # comma-separated. Name two: with one, that signer's own ring-0 work
+      # freezes main (README, Hosting).
+      - key: COMMONS_KERNEL_SIGNERS
+        sync: false
+      # phase1 (3-10 trusted people) or none. COMMONS_PROJECT (the genesis
+      # project id) defaults to the community.
+      - key: COMMONS_PRESET
+        value: phase1
       - key: COMMONS_DATA
         value: /var/data
     disk:

@@ -25,6 +25,7 @@ import { applyEntry, parseLines, replay, type LedgerState } from "./ledger";
 import { computeMetrics } from "./metrics";
 import { evaluatePromotion } from "./promotion";
 import { reviewerScores } from "./review";
+import { answeredOutsideBase } from "./basePath";
 import { route, type Site } from "./playground/render";
 import type { LedgerEntry } from "./types";
 
@@ -33,6 +34,11 @@ export type PlaygroundHandlerOptions = {
   // Fixed clock for tests and reproducible renders; otherwise the wall clock,
   // floored to the minute.
   nowIso?: string;
+  // The path the site is mounted under behind a reverse proxy (basePath.ts's
+  // spelling: "" or "/commons/builders"). Every link starts with it; the
+  // handler itself sees paths below it, so whoever mounts it strips it
+  // (startPlayground does, as does the coordinator server for its fallback).
+  basePath?: string;
 };
 
 export type PlaygroundOptions = PlaygroundHandlerOptions & { port: number; host?: string };
@@ -162,7 +168,7 @@ export function createPlaygroundHandler(opts: PlaygroundHandlerOptions): http.Re
   return (req, res) => {
     let r;
     try {
-      r = route(load, req.method ?? "GET", req.url ?? "/", log);
+      r = route(load, req.method ?? "GET", req.url ?? "/", log, opts.basePath ?? "");
     } catch (e) {
       // Never echo internals of an unexpected failure to the public page.
       log(e);
@@ -176,7 +182,10 @@ export function createPlaygroundHandler(opts: PlaygroundHandlerOptions): http.Re
 }
 
 export function startPlayground(opts: PlaygroundOptions): http.Server {
-  const server = http.createServer(createPlaygroundHandler(opts));
+  const handler = createPlaygroundHandler(opts);
+  const server = http.createServer((req, res) => {
+    if (!answeredOutsideBase(opts.basePath ?? "", req, res)) handler(req, res);
+  });
   server.listen(opts.port, opts.host);
   return server;
 }

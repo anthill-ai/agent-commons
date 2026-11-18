@@ -138,14 +138,23 @@ export function clip(value: string, n: number): string {
 
 type ObjectKind = "submissions" | "snapshots" | "owners" | "agents";
 
+// The path the site is mounted under behind a reverse proxy ("" at the root,
+// else e.g. "/commons/builders": normaliseBasePath's spelling, so it needs no
+// escaping). Every link, asset and form the site renders starts with it; the
+// routes themselves see paths below it (the caller strips it: basePath.ts).
+// Set by route() for the one synchronous render it does, so a render never
+// sees another mount's base; a memoised body belongs to one handler, which
+// has one base.
+let base = "";
+
 // "." and ".." are dot segments that URL parsers (ours and every browser's)
 // normalise away, and a huge id would make every link to it huge, so those
 // objects are linked by query instead: by the seq of the entry that created
 // them where there is one, else by id. The ledger refuses both since it bounds
 // ids (LEDGER_LIMITS, ID_RE); this stays for states not built by replay.
 function objectHref(kind: ObjectKind, id: string, seq?: number): string {
-  if (id.length <= CLIP.id && !/^\.{1,2}$/.test(id)) return `/${kind}/${encodeURIComponent(id)}`;
-  return seq === undefined ? `/${kind}?id=${encodeURIComponent(id)}` : `/${kind}?seq=${seq}`;
+  if (id.length <= CLIP.id && !/^\.{1,2}$/.test(id)) return `${base}/${kind}/${encodeURIComponent(id)}`;
+  return seq === undefined ? `${base}/${kind}?id=${encodeURIComponent(id)}` : `${base}/${kind}?seq=${seq}`;
 }
 const submissionHref = (state: CommonsState, id: string) =>
   objectHref("submissions", id, state.submissions.get(id)?.submittedSeq);
@@ -535,10 +544,10 @@ function page(site: { state: CommonsState; nowIso: string } | null, title: strin
 <meta name="referrer" content="no-referrer">
 <title>${clip(title, 80)} · agent commons</title><style>${new Html(CSS)}</style></head>
 <body><main>
-<header class="top"><a class="home" href="/">agent commons</a>${meta}<button id="refresh-toggle" type="button">auto-refresh: on</button></header>
+<header class="top"><a class="home" href="${base}/">agent commons</a>${meta}<button id="refresh-toggle" type="button">auto-refresh: on</button></header>
 ${body}
-<footer>Everything on this page is derived from the signed ledger. Replay it yourself: <a href="/api/entries?since=0">/api/entries</a> · <a href="/api/state">/api/state</a> · <a href="/api/metrics">/api/metrics</a>${site ? h` · as of ${fmtTime(site.nowIso)}` : ""}</footer>
-</main><script src="/static/refresh.js"></script></body></html>
+<footer>Everything on this page is derived from the signed ledger. Replay it yourself: <a href="${base}/api/entries?since=0">/api/entries</a> · <a href="${base}/api/state">/api/state</a> · <a href="${base}/api/metrics">/api/metrics</a>${site ? h` · as of ${fmtTime(site.nowIso)}` : ""}</footer>
+</main><script src="${base}/static/refresh.js"></script></body></html>
 `.value;
 }
 
@@ -1011,7 +1020,7 @@ function jsonReply(status: number, value: unknown): Reply {
 
 function htmlError(site: { state: CommonsState; nowIso: string } | null, status: number, message: string): Reply {
   const title = status === 404 ? "not found" : status === 400 ? "bad request" : "error";
-  return reply(status, HTML, page(site, title, h`<h1>${title}</h1><p>${message}</p><p><a href="/">back to the overview</a></p>`));
+  return reply(status, HTML, page(site, title, h`<h1>${title}</h1><p>${message}</p><p><a href="${base}/">back to the overview</a></p>`));
 }
 
 // Only a LedgerError's code is public: its message can name the ledger's path.
@@ -1042,7 +1051,16 @@ function requestedId(site: Site, kind: string, segs: string[], params: URLSearch
 
 // The whole site. `load` is called only for routes that need the ledger, so
 // the refresh script is served even while the ledger cannot be read.
-export function route(load: () => Site, method: string, rawUrl: string, log: (e: unknown) => void = defaultLog): Reply {
+export function route(load: () => Site, method: string, rawUrl: string, log: (e: unknown) => void = defaultLog, basePath = ""): Reply {
+  base = basePath;
+  try {
+    return routeBelowBase(load, method, rawUrl, log);
+  } finally {
+    base = "";
+  }
+}
+
+function routeBelowBase(load: () => Site, method: string, rawUrl: string, log: (e: unknown) => void): Reply {
   if (method !== "GET" && method !== "HEAD") {
     return reply(405, "text/plain; charset=utf-8", "method not allowed\n", { Allow: "GET, HEAD" });
   }
