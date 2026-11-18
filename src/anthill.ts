@@ -117,6 +117,23 @@ export const HARNESS_RE = /^[!-~]+(?: [!-~]+)*$/;
 export const isModelFamilyName = (v: unknown): v is string => typeof v === "string" && FAMILY_RE.test(v);
 export const isHarnessName = (v: unknown): v is string => typeof v === "string" && v.length <= MAX_HARNESS && HARNESS_RE.test(v);
 
+// When an agent attestation may be signed, against the entry that carries it
+// (the entry's own `at`, so replay decides the same way every time). Anthill
+// signs at relay time and relays at once, and a retry signs again, so:
+// - an anthillAgent attestation older than ANTHILL_AGENT_MAX_AGE_MS is
+//   refused. Nothing in it names one ledger, and every attestation that
+//   landed is public (GET /api/entries): without a bound, a ledger re-created
+//   for the same community (same Anthill key) would take an old attestation
+//   whose revocation stayed behind in the old ledger. A revoke needs no bound:
+//   replaying one can only revoke.
+// - either kind may be signed up to ANTHILL_AGENT_SKEW_MS after the entry, the
+//   coordinator's clock: Anthill's clock may run ahead of it (the API allows
+//   agents the same skew). The two older kinds (anthillOwner, anthillTree)
+//   keep their strict check, as existing ledgers replay them.
+// So Anthill's and the coordinator's clocks must agree within the skew.
+export const ANTHILL_AGENT_MAX_AGE_MS = 10 * 60_000;
+export const ANTHILL_AGENT_SKEW_MS = 5 * 60_000;
+
 // Most members one snapshot may hold. The ledger keeps every snapshot and
 // every node replays them, so a snapshot is bounded like every other field.
 export const MAX_SNAPSHOT_MEMBERS = 20_000;

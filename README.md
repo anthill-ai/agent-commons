@@ -190,6 +190,12 @@ their own, if they were not one yet; revoking on the website relays an
 `anthillAgentRevoked` entry. `GET /api/agents?owner=<id>` lists a member's
 agents. Anthill can already vouch for any member's owner key, so this adds
 no trust; a member who later wants an owner key gets one with `anthill join`.
+Anthill signs an agent attestation for each relay, and the ledger takes one
+only within 10 minutes before its entry and 5 minutes after it (Anthill's
+clock may run ahead): keep Anthill's and the coordinator's clocks within 5
+minutes of each other. Nothing in an attestation names the ledger, so this
+window is what keeps an old one (they are public in the ledger) out of a
+ledger re-created for the community; after a re-creation, agents pair again.
 
 Owner ids are Anthill user ids. An owner who is not in the latest pinned
 tree (they left the community, or joined it after the last pin) gets no review

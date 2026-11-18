@@ -24,6 +24,8 @@ import { canonical, isValidPublicKey, keyIdOf, sha256hex, sign, verify } from ".
 import { isConfirmedDefect, isReproducedOpen } from "./findingStatus";
 import { ringOf } from "./gates/rings";
 import {
+  ANTHILL_AGENT_MAX_AGE_MS,
+  ANTHILL_AGENT_SKEW_MS,
   agentAttestationProblems,
   agentRevokeProblems,
   attestationProblems,
@@ -838,14 +840,18 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       const a = body.attestation as AnthillAgentAttestation;
       if (a.community !== linked.link.community) reject("invalid-value", `attestation is for ${a.community}, not ${linked.link.community}`);
       if (!verifyAgent(linked.link, a, body.signature)) reject("signature", "Anthill's signature on the attestation does not verify");
-      if (Date.parse(a.at) > ms) reject("time", "attestation is signed after this entry");
+      // anthill.ts, ANTHILL_AGENT_MAX_AGE_MS: Anthill signs for each relay.
+      const signedAt = Date.parse(a.at);
+      if (signedAt > ms + ANTHILL_AGENT_SKEW_MS) reject("time", "attestation is signed after this entry");
+      if (ms - signedAt > ANTHILL_AGENT_MAX_AGE_MS) reject("time", "attestation is too old: Anthill signs a new one for each relay");
       // The same closed list as agentRegistered.
       if (!state.rules.modelFamilies.includes(a.modelFamily)) {
         reject("invalid-value", `model family ${JSON.stringify(a.modelFamily)} is not one of rules.modelFamilies`);
       }
       // Any key the ledger knows (agent, owner, admin, coordinator) is refused:
-      // a revoked agent's key never comes back, so a re-posted attestation
-      // cannot undo its revocation.
+      // a revoked agent's key never comes back to this ledger, so a re-posted
+      // attestation cannot undo its revocation (and the age bound above keeps
+      // an old one out of a ledger re-created for the community).
       const keyId = newKey(a.agentKey);
       state.publicKeys.set(keyId, a.agentKey);
       if (!state.owners.has(a.user)) {
@@ -869,7 +875,7 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       const a = body.attestation as AnthillAgentRevokeAttestation;
       if (a.community !== linked.link.community) reject("invalid-value", `attestation is for ${a.community}, not ${linked.link.community}`);
       if (!verifyAgentRevoke(linked.link, a, body.signature)) reject("signature", "Anthill's signature on the attestation does not verify");
-      if (Date.parse(a.at) > ms) reject("time", "attestation is signed after this entry");
+      if (Date.parse(a.at) > ms + ANTHILL_AGENT_SKEW_MS) reject("time", "attestation is signed after this entry");
       if (!isValidPublicKey(a.agentKey)) reject("invalid-key", "agentKey is not a canonical ed25519 SPKI key");
       const agent = state.agents.get(keyIdOf(a.agentKey)) ?? reject("unknown-ref", `no agent with key ${keyIdOf(a.agentKey)}`);
       // Anthill vouches for who asked; the agent must be that member's.

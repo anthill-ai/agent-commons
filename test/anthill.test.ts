@@ -54,7 +54,9 @@ class World {
   entries: LedgerEntry[];
   state: LedgerState;
 
-  constructor(linked = true) {
+  // `anthill`: Anthill's key, to build a second ledger for the same community.
+  constructor(linked = true, anthill?: Signer) {
+    if (anthill !== undefined) this.anthill = anthill;
     const genesis = genesisEntry(
       {
         kind: "genesis",
@@ -444,6 +446,39 @@ test("anthillAgent: refused for another community, a bad signature, an unknown f
   assert.equal(w.state.owners.has(A), false);
   w.append({ kind: "anthillAgent", ...w.signedAgent(A, key) });
   assert.ok(w.state.owners.has(A));
+});
+
+test("anthillAgent: signed for this relay: at most 10 minutes old, and up to 5 minutes ahead of the entry", () => {
+  const w = new World();
+  // The entry is stamped at minute w.minute + 1.
+  const at = (offsetMinutes: number, ms = 0) => new Date(T0 + (w.minute + 1 + offsetMinutes) * 60_000 + ms).toISOString();
+  refused(w, { kind: "anthillAgent", ...w.signedAgent(A, generateKeyPair().publicKey, { at: at(-10, -1) }) }, "time");
+  w.append({ kind: "anthillAgent", ...w.signedAgent(A, generateKeyPair().publicKey, { at: at(-10) }) });
+  // Anthill's clock ahead of the coordinator's.
+  w.append({ kind: "anthillAgent", ...w.signedAgent(A, generateKeyPair().publicKey, { at: at(0, 1) }) });
+  w.append({ kind: "anthillAgent", ...w.signedAgent(A, generateKeyPair().publicKey, { at: at(5) }) });
+  refused(w, { kind: "anthillAgent", ...w.signedAgent(A, generateKeyPair().publicKey, { at: at(5, 1) }) }, "time");
+  // A revoke has no age bound (replaying one can only revoke), but the same skew.
+  const agent = w.connect(B);
+  refused(w, { kind: "anthillAgentRevoked", ...w.signedRevoke(B, agent.publicKey, { at: at(5, 1) }) }, "time");
+  w.append({ kind: "anthillAgentRevoked", ...w.signedRevoke(B, agent.publicKey, { at: at(-60 * 24) }) });
+  assert.equal(w.state.agents.get(keyIdOf(agent.publicKey))?.active, false);
+});
+
+test("a ledger re-created for the community does not take an agent the old one revoked", () => {
+  const old = new World();
+  const agent = old.connect(A);
+  const registered = old.entries.at(-1) as LedgerEntry;
+  old.append({ kind: "anthillAgentRevoked", ...old.signedRevoke(A, agent.publicKey, { reason: "leaked" }) });
+  // A new genesis, the same Anthill key and community, 90 days later: the old,
+  // public attestation is re-posted without its revocation.
+  const fresh = new World(true, old.anthill);
+  fresh.minute = 90 * 24 * 60;
+  refused(fresh, registered.body, "time");
+  assert.equal(fresh.state.agents.has(keyIdOf(agent.publicKey)), false);
+  // A new approval (signed now) still registers a new key.
+  fresh.connect(A);
+  assert.equal(fresh.state.owners.has(A), true);
 });
 
 test("an unlinked ledger refuses the agent entries", () => {
