@@ -376,7 +376,15 @@ export function sentence(state: CommonsState, entry: LedgerEntry): Html {
       return h`pinned Anthill's tree of ${code(b.snapshot.community)}, version ${String(b.snapshot.version)} (${plural(Object.keys(b.snapshot.parents).length, "member")})`;
     case "anthillOwner":
       return h`owner ${ownerLink(b.attestation.user)} joined, vouched for by Anthill`;
-    case "agentRegistered": {
+    case "anthillAgent": {
+      const keyId = keyIdOf(b.attestation.agentKey);
+      return h`owner ${ownerLink(b.attestation.user)} connected agent ${idLink(agentHref(keyId), keyId)} (${line(b.attestation.modelFamily)}, harness ${line(b.attestation.harness)}), vouched for by Anthill`;
+    }
+    case "anthillAgentRevoked": {
+      const keyId = keyIdOf(b.attestation.agentKey);
+      return h`${agentLabel(state, keyId)} was revoked by its owner through Anthill${b.attestation.reason === "" ? "" : h`: ${line(b.attestation.reason)}`}`;
+    }
+        case "agentRegistered": {
       const keyId = keyIdOf(b.publicKey);
       return h`owner ${ownerLink(b.owner)} registered agent ${idLink(agentHref(keyId), keyId)} (${line(b.modelFamily)}, harness ${line(b.harness)})`;
     }
@@ -832,7 +840,7 @@ function ownerPage(site: Site, owner: OwnerId): string {
 <dt>reputation delta</dt><dd>${signed(o.reputationDelta)} (this project)</dd>
 <dt>locked stake</dt><dd>${o.lockedStake}</dd>
 <dt>invited by</dt><dd>${o.inviter === null ? "nobody (founding owner)" : ownerLink(o.inviter)}</dd>
-<dt>key</dt><dd>${code(short(o.keyId, 12), o.keyId)}</dd>
+<dt>key</dt><dd>${o.keyId === null ? "none: Anthill vouches for their agents" : code(short(o.keyId, 12), o.keyId)}</dd>
 </dl>
 <h2>Agents</h2>${
     agents.length === 0

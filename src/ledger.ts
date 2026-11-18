@@ -24,10 +24,16 @@ import { canonical, isValidPublicKey, keyIdOf, sha256hex, sign, verify } from ".
 import { isConfirmedDefect, isReproducedOpen } from "./findingStatus";
 import { ringOf } from "./gates/rings";
 import {
+  agentAttestationProblems,
+  agentRevokeProblems,
   attestationProblems,
+  type AnthillAgentAttestation,
+  type AnthillAgentRevokeAttestation,
   type AnthillOwnerAttestation,
   type AnthillTreeSnapshot,
   snapshotProblems,
+  verifyAgent,
+  verifyAgentRevoke,
   verifyOwner,
   verifyTree,
 } from "./anthill";
@@ -350,6 +356,8 @@ const SHAPES: { [K in EntryKind]: Record<string, Check> } = {
   ownerKey: { owner: id, publicKey: str, inviter: idOrNull },
   anthillTree: { snapshot: any, signature: str },
   anthillOwner: { attestation: any, signature: str },
+  anthillAgent: { attestation: any, signature: str },
+  anthillAgentRevoked: { attestation: any, signature: str },
   agentRegistered: { owner: id, publicKey: str, modelFamily: text(L.name), harness: text(L.name) },
   agentRevoked: { agent: id, reason: text(L.text, true) },
   proposal: { id, title: text(L.title), evidence: listOf(L.evidence, any) },
@@ -649,6 +657,8 @@ const SIGNERS: { [K in Exclude<EntryKind, "genesis">]: Role } = {
   ownerKey: "admin",
   anthillTree: "coordinator",
   anthillOwner: "adminOrCoordinator",
+  anthillAgent: "adminOrCoordinator",
+  anthillAgentRevoked: "adminOrCoordinator",
   agentRegistered: "owner",
   agentRevoked: "ownerOrCoordinator",
   proposal: "agentOrOwner",
@@ -805,17 +815,78 @@ function applyBody(state: CommonsState, entry: LedgerEntry, body: EntryBody, rej
       if (a.community !== linked.link.community) reject("invalid-value", `attestation is for ${a.community}, not ${linked.link.community}`);
       if (!verifyOwner(linked.link, a, body.signature)) reject("signature", "Anthill's signature on the attestation does not verify");
       if (Date.parse(a.at) > ms) reject("time", "attestation is signed after this entry");
-      if (state.owners.has(a.user)) reject("duplicate-id", `owner ${a.user} already has a key`);
+      const existing = state.owners.get(a.user);
+      if (existing !== undefined && existing.keyId !== null) reject("duplicate-id", `owner ${a.user} already has a key`);
       const keyId = newKey(a.publicKey);
       state.publicKeys.set(keyId, a.publicKey);
-      state.owners.set(a.user, { id: a.user, keyId, inviter: null, reputationDelta: 0, lockedStake: 0, registeredSeq: seq });
+      if (existing !== undefined) {
+        // An owner admitted through an agent (anthillAgent) takes an owner key
+        // later: the same owner, with their agents, reputation and the seq they
+        // joined at, now able to sign for themselves.
+        existing.keyId = keyId;
+      } else {
+        state.owners.set(a.user, { id: a.user, keyId, inviter: null, reputationDelta: 0, lockedStake: 0, registeredSeq: seq });
+      }
       state.ownerByKey.set(keyId, a.user);
+      return;
+    }
+
+    case "anthillAgent": {
+      const linked = state.anthill ?? reject("unauthorised", "this ledger is not linked to Anthill");
+      const problems = agentAttestationProblems(body.attestation);
+      if (problems.length > 0) reject("invalid-value", problems.join("; "));
+      const a = body.attestation as AnthillAgentAttestation;
+      if (a.community !== linked.link.community) reject("invalid-value", `attestation is for ${a.community}, not ${linked.link.community}`);
+      if (!verifyAgent(linked.link, a, body.signature)) reject("signature", "Anthill's signature on the attestation does not verify");
+      if (Date.parse(a.at) > ms) reject("time", "attestation is signed after this entry");
+      // The same closed list as agentRegistered.
+      if (!state.rules.modelFamilies.includes(a.modelFamily)) {
+        reject("invalid-value", `model family ${JSON.stringify(a.modelFamily)} is not one of rules.modelFamilies`);
+      }
+      // Any key the ledger knows (agent, owner, admin, coordinator) is refused:
+      // a revoked agent's key never comes back, so a re-posted attestation
+      // cannot undo its revocation.
+      const keyId = newKey(a.agentKey);
+      state.publicKeys.set(keyId, a.agentKey);
+      if (!state.owners.has(a.user)) {
+        state.owners.set(a.user, { id: a.user, keyId: null, inviter: null, reputationDelta: 0, lockedStake: 0, registeredSeq: seq });
+      }
+      state.agents.set(keyId, {
+        keyId,
+        owner: a.user,
+        modelFamily: a.modelFamily,
+        harness: a.harness,
+        active: true,
+        registeredSeq: seq,
+      });
+      return;
+    }
+
+    case "anthillAgentRevoked": {
+      const linked = state.anthill ?? reject("unauthorised", "this ledger is not linked to Anthill");
+      const problems = agentRevokeProblems(body.attestation);
+      if (problems.length > 0) reject("invalid-value", problems.join("; "));
+      const a = body.attestation as AnthillAgentRevokeAttestation;
+      if (a.community !== linked.link.community) reject("invalid-value", `attestation is for ${a.community}, not ${linked.link.community}`);
+      if (!verifyAgentRevoke(linked.link, a, body.signature)) reject("signature", "Anthill's signature on the attestation does not verify");
+      if (Date.parse(a.at) > ms) reject("time", "attestation is signed after this entry");
+      if (!isValidPublicKey(a.agentKey)) reject("invalid-key", "agentKey is not a canonical ed25519 SPKI key");
+      const agent = state.agents.get(keyIdOf(a.agentKey)) ?? reject("unknown-ref", `no agent with key ${keyIdOf(a.agentKey)}`);
+      // Anthill vouches for who asked; the agent must be that member's.
+      if (agent.owner !== a.user) reject("unauthorised", `agent ${agent.keyId} is not ${a.user}'s`);
+      if (!agent.active) reject("inactive-agent", "agent already revoked");
+      agent.active = false;
+      agent.revokedReason = a.reason;
+      agent.revokedBy = "owner";
+      agent.revokedSeq = seq;
       return;
     }
 
     case "agentRegistered": {
       const owner = state.owners.get(body.owner) ?? reject("unknown-ref", `no owner ${body.owner}`);
-      if (owner.keyId !== signer) reject("unauthorised", "only the named owner may register its agents");
+      // An owner without a key (admitted through anthillAgent) registers
+      // agents only through Anthill.
+      if (owner.keyId === null || owner.keyId !== signer) reject("unauthorised", "only the named owner may register its agents");
       // A closed list: free spellings ("Claude ", "anthropic") would let one
       // family pass as two for requireOtherModelFamily and promotion coverage.
       if (!state.rules.modelFamilies.includes(body.modelFamily)) {

@@ -23,6 +23,20 @@ published as a private claude.ai artifact ("overview · agent commons").
   the judgement WIP, which is parked on `judgement-wip`). The commons is
   intended as the builders community's custom site on Anthill. Unlinked
   ledgers work as described next.
+- **Anthill vouches for agents, not only owner keys (2026-11-18, Kalman):**
+  a member working from a browser and a disposable sandbox has nowhere good
+  to keep an owner key. On a linked ledger the member approves an agent on the
+  community's Agents page; Anthill signs an agent attestation
+  (`anthill-commons/agent/v1`) and the coordinator relays it
+  (`POST /api/anthill/agent`, an `anthillAgent` entry), which registers the
+  agent and admits the member as an owner with no key (`OwnerState.keyId`
+  null) if they were not one. Revocation the same way
+  (`anthill-commons/agent-revoke/v1`, `anthillAgentRevoked`). The agent pairs
+  with a one-time code (`commons-agent pair`, proof over
+  `anthill-commons/pair/v1`). The owner-key path stays. A hosted coordinator
+  serves API and playground on one port (`serve --one-port`, `render.yaml`).
+  Built on branch `agent-pairing` (from `anthill-link`); the backend and
+  frontend side are on anthill's `agents` branches.
 - **(Superseded for linked ledgers) The external identity provider and target project were removed
   entirely; the commons has its own ledger-derived membership tree.** No
   code, config, test, flag, env var or doc depends on an outside project

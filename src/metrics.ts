@@ -437,7 +437,9 @@ export function computeMetrics(state: CommonsState, nowIso: string): MetricRow[]
   const recent = (k: KeyId) => (actedAt.get(k) ?? Number.NEGATIVE_INFINITY) >= activeSince;
   const activeAgents = [...state.agents.values()].filter((a) => a.active && recent(a.keyId));
   const activeOwners = new Set<OwnerId>(activeAgents.map((a) => a.owner));
-  for (const o of state.owners.values()) if (recent(o.keyId)) activeOwners.add(o.id);
+  // An owner without a key (admitted through an agent Anthill vouched for)
+  // never signs: they count as active through their agents only.
+  for (const o of state.owners.values()) if (o.keyId !== null && recent(o.keyId)) activeOwners.add(o.id);
   row(
     cl,
     "active agents",

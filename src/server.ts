@@ -41,6 +41,14 @@
 //   responseTimeoutMs more, so a client that never reads cannot either. Behind a reverse proxy, name it in
 //   trustedProxies: only then is the client address read from
 //   X-Forwarded-For, and every client gets its own budget again.
+// - On a ledger linked to Anthill, POST /api/anthill/owner, /api/anthill/agent
+//   and /api/anthill/agent-revoke take {attestation, signature} as Anthill
+//   signed them and relay them as anthillOwner, anthillAgent and
+//   anthillAgentRevoked entries (the ledger checks Anthill's signature, so the
+//   relay adds no trust). Re-posting an agent attestation that already
+//   landed answers 409 already-registered (already-revoked for a revoke),
+//   which a caller retrying after a lost answer treats as done.
+//   GET /api/agents?owner=<id> lists an owner's agents, revoked ones too.
 // - GET /api/tasks (open=1: claimable ones) and GET /api/tasks/:id describe
 //   tasks from replay, GET /api/entries?since= serves the signed entries
 //   themselves (since inclusive; continue with `next`), so an agent can find
@@ -52,7 +60,7 @@
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
-import { canonical, keyIdOf, sha256hex, verify } from "./crypto";
+import { canonical, isValidPublicKey, keyIdOf, sha256hex, verify } from "./crypto";
 import { parsePatch } from "./github";
 import { entryMessage, Ledger, LedgerError, type LedgerState, reviewCommitsClosedBy, type Signer, submissionDead } from "./ledger";
 import { commitDeadlineMs } from "./plants";
@@ -279,9 +287,11 @@ export type CoordinatorServerOptions = {
   // Requests no route here matches (e.g. the playground's GET routes).
   // src/playground.ts exports no request handler today, only startPlayground.
   fallback?: http.RequestListener;
-  // Addresses of reverse proxies in front of this server. A request from one
-  // of them is attributed to the last X-Forwarded-For hop that is not a
-  // trusted proxy; from anyone else the header is ignored.
+  // Addresses of reverse proxies in front of this server, exact or as IPv4
+  // CIDR ranges (10.0.0.0/8: a hosting provider's load balancers connect from
+  // changing private addresses). A request from one of them is attributed to
+  // the last X-Forwarded-For hop that is not a trusted proxy; from anyone else
+  // the header is ignored.
   trustedProxies?: readonly string[];
 };
 
@@ -329,7 +339,7 @@ export function createCoordinatorServer(opts: CoordinatorServerOptions): Coordin
   const ipRate = bucket(limits.ipRatePerMinute, 60_000);
 
   const ctx: Ctx = { opts, limits, policy, store, ownerRate, ownerBytes };
-  const trusted = new Set(opts.trustedProxies ?? []);
+  const trusted = proxyMatcher(opts.trustedProxies ?? []);
   let inFlight = 0;
   const perIp = new Map<string, number>();
   const server = http.createServer((req, res) => {
@@ -383,13 +393,50 @@ const MAX_BUCKETS = 10_000;
 // trusted proxy the last X-Forwarded-For hop that is not itself a trusted
 // proxy (the leftmost hops are the client's to forge, the rightmost were
 // appended by proxies we trust), grouped by addressGroup.
-function clientAddress(req: http.IncomingMessage, trusted: ReadonlySet<string>): string {
+function clientAddress(req: http.IncomingMessage, trusted: (ip: string) => boolean): string {
   const peer = req.socket.remoteAddress ?? "unknown";
-  if (!trusted.has(peer)) return addressGroup(peer);
+  if (!trusted(peer)) return addressGroup(peer);
   const header = req.headers["x-forwarded-for"];
   const hops = (Array.isArray(header) ? header.join(",") : (header ?? "")).split(",").map((h) => h.trim()).filter((h) => h !== "");
-  for (let i = hops.length - 1; i >= 0; i--) if (!trusted.has(hops[i] as string)) return addressGroup(hops[i] as string);
+  for (let i = hops.length - 1; i >= 0; i--) if (!trusted(hops[i] as string)) return addressGroup(hops[i] as string);
   return addressGroup(peer);
+}
+
+const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+
+function ipv4(ip: string): number | null {
+  const m = IPV4_RE.exec(ip.replace(/^::ffff:/i, ""));
+  if (!m) return null;
+  const parts = m.slice(1).map(Number);
+  if (parts.some((p) => p > 255)) return null;
+  return ((parts[0] as number) * 2 ** 24 + (parts[1] as number) * 2 ** 16 + (parts[2] as number) * 2 ** 8 + (parts[3] as number)) >>> 0;
+}
+
+// Whether an address is one of `entries`: exact addresses (an IPv4-mapped
+// IPv6 peer matches its IPv4 spelling) or IPv4 CIDR ranges. A malformed range
+// throws at startup rather than trusting nothing (or everything) silently.
+export function proxyMatcher(entries: readonly string[]): (ip: string) => boolean {
+  const exact = new Set<string>();
+  const ranges: { base: number; mask: number }[] = [];
+  for (const e of entries) {
+    const cidr = /^([^/]+)\/(\d{1,2})$/.exec(e);
+    if (cidr === null) {
+      exact.add(e);
+      continue;
+    }
+    const base = ipv4(cidr[1] as string);
+    const bits = Number(cidr[2]);
+    if (base === null || bits > 32) throw new Error(`trusted proxy ${e}: expected an address or an IPv4 range like 10.0.0.0/8`);
+    const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+    ranges.push({ base: (base & mask) >>> 0, mask });
+  }
+  return (ip) => {
+    if (exact.has(ip)) return true;
+    const v4 = ipv4(ip);
+    if (v4 === null) return false;
+    if (exact.has(ip.replace(/^::ffff:/i, ""))) return true;
+    return ranges.some((r) => ((v4 & r.mask) >>> 0) === r.base);
+  };
 }
 
 // One host commonly holds a whole IPv6 /64, so IPv6 clients are counted per
@@ -444,6 +491,9 @@ async function handle(ctx: Ctx, req: http.IncomingMessage, res: http.ServerRespo
     if (method === "GET" && p === "/api/head") return send(res, 200, ctx.store.head());
     if (method === "POST" && p === "/api/entries") return send(res, 201, await postEntry(ctx, req));
     if (method === "POST" && p === "/api/anthill/owner") return send(res, 201, await postAnthillOwner(ctx, req));
+    if (method === "POST" && p === "/api/anthill/agent") return send(res, 201, await postAnthillAgent(ctx, req, "anthillAgent"));
+    if (method === "POST" && p === "/api/anthill/agent-revoke") return send(res, 201, await postAnthillAgent(ctx, req, "anthillAgentRevoked"));
+    if (method === "GET" && p === "/api/agents") return send(res, 200, ownerAgents(ctx, url));
     if (method === "GET" && p === "/api/assignments") return send(res, 200, assignments(ctx, url));
     if (method === "GET" && p === "/api/tasks") return send(res, 200, tasks(ctx, url));
     const task = /^\/api\/tasks\/([^/]+)$/.exec(p);
@@ -678,8 +728,15 @@ async function postEntry(ctx: Ctx, req: http.IncomingMessage): Promise<{ seq: nu
 // ledger checks it, so the relay adds no trust. The per-address limits every
 // request passes apply.
 async function postAnthillOwner(ctx: Ctx, req: http.IncomingMessage): Promise<{ seq: number; hash: string; owner: OwnerId }> {
-  const before = ctx.store.state();
-  if (before.anthill === undefined) throw new HttpError(404, "not-linked", "this commons is not linked to Anthill");
+  const parsed = await readAttestation(ctx, req);
+  const body = { kind: "anthillOwner", attestation: parsed.attestation, signature: parsed.signature } as EntryBody;
+  const stored = await relay(ctx, body);
+  return { seq: stored.seq, hash: stored.hash, owner: (parsed.attestation as { user: OwnerId }).user };
+}
+
+// {attestation, signature} exactly, on a linked ledger only.
+async function readAttestation(ctx: Ctx, req: http.IncomingMessage): Promise<{ attestation: unknown; signature: string }> {
+  if (ctx.store.state().anthill === undefined) throw new HttpError(404, "not-linked", "this commons is not linked to Anthill");
   const raw = await readBody(req, ctx.limits.entryBytes, ctx.limits.minBodyBytesPerSecond, ctx.limits.bodyGraceMs);
   let parsed: unknown;
   try {
@@ -690,14 +747,78 @@ async function postAnthillOwner(ctx: Ctx, req: http.IncomingMessage): Promise<{ 
   if (!isObject(parsed) || Object.keys(parsed).sort().join(",") !== "attestation,signature" || typeof parsed.signature !== "string") {
     throw new HttpError(400, "malformed", "expected {attestation, signature} as Anthill signed them");
   }
-  const body = { kind: "anthillOwner", attestation: parsed.attestation, signature: parsed.signature } as EntryBody;
+  return { attestation: parsed.attestation, signature: parsed.signature };
+}
+
+// Appends as the coordinator; `body` may be built under the store lock from
+// the state it is appended to (and may refuse with an HttpError there).
+async function relay(ctx: Ctx, body: EntryBody | ((state: CommonsState) => EntryBody)): Promise<LedgerEntry> {
   try {
-    const stored = await ctx.store.appendAsCoordinator(body);
-    return { seq: stored.seq, hash: stored.hash, owner: (parsed.attestation as { user: OwnerId }).user };
+    return await ctx.store.appendAsCoordinator(body);
   } catch (e) {
     if (e instanceof LedgerError) throw new HttpError(e.code === "torn" || e.code === "stale" ? 503 : 400, e.code, e.message);
     throw e;
   }
+}
+
+// An agent the member approved on Anthill (anthillAgent), or one they revoked
+// there (anthillAgentRevoked). Anthill relays it right after signing, and
+// retries when an answer is lost, so a repeat of what already landed is a
+// distinct 409 the caller can treat as done, decided under the store lock
+// against the state the entry would be appended to. A repeat for a revoked
+// agent is not "done": its key can never be registered again, and saying so
+// lets the website tell the member to pair a new key.
+async function postAnthillAgent(
+  ctx: Ctx,
+  req: http.IncomingMessage,
+  kind: "anthillAgent" | "anthillAgentRevoked",
+): Promise<{ seq: number; hash: string; agent: KeyId; owner: OwnerId }> {
+  const parsed = await readAttestation(ctx, req);
+  const a = parsed.attestation as { agentKey?: unknown; user?: unknown } | null;
+  const agentKey = isObject(a) && typeof a.agentKey === "string" ? a.agentKey : null;
+  const user = isObject(a) && typeof a.user === "string" ? a.user : null;
+  // The ledger refuses anything else with its own code; these only name the result.
+  if (agentKey === null || !isValidPublicKey(agentKey) || user === null) {
+    throw new HttpError(400, "invalid-value", "attestation must name an agentKey (base64url SPKI DER) and a user");
+  }
+  const agent = keyIdOf(agentKey);
+  const stored = await relay(ctx, (state) => {
+    const known = state.agents.get(agent);
+    if (known !== undefined && known.owner === user) {
+      if (kind === "anthillAgent" && known.active) {
+        throw new HttpError(409, "already-registered", `agent ${agent} is already registered to ${user}`, { agent, owner: user });
+      }
+      if (kind === "anthillAgent") {
+        throw new HttpError(400, "agent-revoked", `agent ${agent} was revoked and its key cannot be registered again; pair a new key`, { agent, owner: user });
+      }
+      if (!known.active) throw new HttpError(409, "already-revoked", `agent ${agent} is already revoked`, { agent, owner: user });
+    }
+    return { kind, attestation: parsed.attestation, signature: parsed.signature } as EntryBody;
+  });
+  return { seq: stored.seq, hash: stored.hash, agent, owner: user };
+}
+
+// GET /api/agents?owner=<id>: an owner's agents, oldest first, revoked ones
+// included (all of it is in the ledger anyway). publicKey is there so Anthill
+// can sign a revoke attestation for an agent without having kept its key.
+function ownerAgents(ctx: Ctx, url: URL) {
+  const owner = url.searchParams.get("owner");
+  if (owner === null || owner === "") throw new HttpError(400, "malformed", "owner query parameter is required");
+  const state = ctx.store.state();
+  const entries = ctx.store.ledger.entries();
+  const agents = [...state.agents.values()]
+    .filter((a) => a.owner === owner)
+    .sort((x, y) => (x.registeredSeq ?? 0) - (y.registeredSeq ?? 0))
+    .map((a) => ({
+      keyId: a.keyId,
+      publicKey: state.publicKeys.get(a.keyId) ?? null,
+      modelFamily: a.modelFamily,
+      harness: a.harness,
+      active: a.active,
+      ...(a.active ? {} : { revokedReason: a.revokedReason ?? "", revokedBy: a.revokedBy ?? "owner" }),
+      registeredAt: a.registeredSeq === undefined ? null : (entries[a.registeredSeq]?.at ?? null),
+    }));
+  return { owner, agents };
 }
 
 // An open submission still occupies a PR slot: not merged and not dead (a

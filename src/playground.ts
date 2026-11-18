@@ -15,7 +15,9 @@
 // reviewer scores) are cached per ledger version and per minute of the clock,
 // so a page costs one render per minute per change, however many tabs reload
 // it. The clock is floored to the minute for the same reason. There is no rate
-// limit here: deploy behind a reverse proxy that limits requests per client.
+// limit here: deploy behind a reverse proxy that limits requests per client,
+// or mount the handler as the coordinator server's fallback (`commons serve
+// --coordinator --one-port`), whose per-address limits then cover it.
 
 import * as fs from "node:fs";
 import * as http from "node:http";
@@ -26,14 +28,14 @@ import { reviewerScores } from "./review";
 import { route, type Site } from "./playground/render";
 import type { LedgerEntry } from "./types";
 
-export type PlaygroundOptions = {
+export type PlaygroundHandlerOptions = {
   ledgerPath: string;
-  port: number;
-  host?: string;
   // Fixed clock for tests and reproducible renders; otherwise the wall clock,
   // floored to the minute.
   nowIso?: string;
 };
+
+export type PlaygroundOptions = PlaygroundHandlerOptions & { port: number; host?: string };
 
 // Upper bound on cached bodies per (version, minute); past it the cache is
 // dropped and refilled. Keys are bounded by the objects in the ledger, but each
@@ -91,7 +93,10 @@ function applyTail(path: string, f: Followed): boolean {
   return true;
 }
 
-export function startPlayground(opts: PlaygroundOptions): http.Server {
+// The playground as a request handler, for a server of its own
+// (startPlayground) or as another server's fallback (one port for the
+// coordinator API and the site, as a hosted service has).
+export function createPlaygroundHandler(opts: PlaygroundHandlerOptions): http.RequestListener {
   let cur: Followed | null = null;
   let memoKey = "";
   let memo = new Map<string, unknown>();
@@ -154,7 +159,7 @@ export function startPlayground(opts: PlaygroundOptions): http.Server {
     };
   };
 
-  const server = http.createServer((req, res) => {
+  return (req, res) => {
     let r;
     try {
       r = route(load, req.method ?? "GET", req.url ?? "/", log);
@@ -167,7 +172,11 @@ export function startPlayground(opts: PlaygroundOptions): http.Server {
     }
     res.writeHead(r.status, { ...r.headers, "Content-Length": String(Buffer.byteLength(r.body)) });
     res.end(req.method === "HEAD" ? undefined : r.body);
-  });
+  };
+}
+
+export function startPlayground(opts: PlaygroundOptions): http.Server {
+  const server = http.createServer(createPlaygroundHandler(opts));
   server.listen(opts.port, opts.host);
   return server;
 }

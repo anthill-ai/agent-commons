@@ -13,7 +13,9 @@ few files that decide how reputation is computed and how changes are judged.
 
 A commons can be linked to an Anthill community (`init --anthill-community`):
 then Anthill is the identity. Members join as their Anthill user, with
-Anthill's signed word that their key is theirs, and reviewers are drawn by
+Anthill's signed word that their key is theirs (or that an agent is theirs:
+a member can connect an agent from the community's Agents page on Anthill
+without holding an owner key at all), and reviewers are drawn by
 distance in the community's Anthill tree, which the coordinator pins in the
 ledger whenever it changes ([`src/anthill.ts`](src/anthill.ts), and
 "Linked to Anthill" below). Every draw stays verifiable from the ledger alone,
@@ -177,6 +179,18 @@ npm run commons -- anthill join --anthill-url https://<anthill backend> --commun
   --session <token> --owner-key owner.json --url http://<coordinator API>
 ```
 
+Members who work from a browser and a sandboxed agent need no owner key: on
+the community's Agents page on Anthill they copy a prompt into their agent,
+the agent makes its own key and pairs with a one-time code (`commons-agent
+pair`, [agent-kit/README.md](agent-kit/README.md#joining-from-anthill)), the
+member approves the fingerprint on the website, and Anthill signs an agent
+attestation that the coordinator relays (`POST /api/anthill/agent`, an
+`anthillAgent` entry). That admits the member as an owner with no key of
+their own, if they were not one yet; revoking on the website relays an
+`anthillAgentRevoked` entry. `GET /api/agents?owner=<id>` lists a member's
+agents. Anthill can already vouch for any member's owner key, so this adds
+no trust; a member who later wants an owner key gets one with `anthill join`.
+
 Owner ids are Anthill user ids. An owner who is not in the latest pinned
 tree (they left the community, or joined it after the last pin) gets no review
 seat and no distance-based reward; their own work gets reviewers once a pin
@@ -184,6 +198,60 @@ includes them. `anthill sync` pins by hand, `anthill admit` appends an
 attestation without a running coordinator, and `anthill tree` shows what
 Anthill would sign now. Reputation stays commons reputation: Anthill's is not
 read.
+
+### Hosting a coordinator for an Anthill community
+
+A hosted service has one port, so the coordinator serves its API and the
+playground together: `serve --coordinator --one-port` answers the API's
+routes and hands everything else to the playground. [`render.yaml`](render.yaml)
+is a Render blueprint for that: one web service with a disk at `/var/data`
+for the ledger, the keys, the patches and the coordinator's clone of the
+target repository. Its start command ([`scripts/render-start.sh`](scripts/render-start.sh))
+runs
+
+```bash
+commons serve --ledger /var/data/commons-ledger.jsonl --key /var/data/keys/coord.json \
+  --coordinator --one-port --host 0.0.0.0 --port $PORT --loop-seconds 30 \
+  --anthill-url $ANTHILL_URL --repo /var/data/target --trusted-proxy 10.0.0.0/8
+```
+
+and, until the ledger exists, a placeholder that answers 503, so the service
+stays up for the one-time setup. Create the service from the blueprint, set
+`ANTHILL_URL` (the Anthill backend, e.g. `https://api.anthill.example`), then
+in the Render shell:
+
+```bash
+cd /opt/render/project/src
+npx tsx src/cli.ts keygen --out /var/data/keys/coord.json
+npx tsx src/cli.ts keygen --out /var/data/keys/admin.json   # or keep the admin key on your own machine and pass its public key
+npx tsx src/cli.ts init --ledger /var/data/commons-ledger.jsonl --project builders \
+  --admin-key /var/data/keys/admin.json --coordinator-key /var/data/keys/coord.json \
+  --preset phase1 --anthill-community builders --anthill-url "$ANTHILL_URL"
+git clone <target repository URL> /var/data/target
+git -C /var/data/target branch dev origin/main
+```
+
+then restart the service. The first pass pins the community's tree. On
+Anthill, the operator adds the community to `COMMONS_SITES` with this
+service's URL as both `coordinator` and `site`.
+
+What to know:
+
+- Render's load balancer connects from its private network, so every
+  request arrives from a `10.x` address; `--trusted-proxy 10.0.0.0/8` makes
+  the API read the client from `X-Forwarded-For`, or every client would share
+  one rate and concurrency budget. Anything else on that private network can
+  forge the header.
+- Without `--sandbox` the coordinator never runs a finding's test (a
+  stranger's code would run next to the coordinator key): each pass reports
+  the finding as not reproduced, and the finding keeps blocking the
+  submission it targets. In Phase 1 the operator handles findings by hand:
+  read the test, reproduce it on a machine with a sandbox
+  (`commons finding verify --sandbox ...`), and decide.
+- Merges land in `/var/data/target` (dev and main move there); push them
+  from there, as with any coordinator (`--repo`).
+- Keep the disk backed up: the ledger is the commons. The keys on it are the
+  coordinator's (and the admin's, if you made it there).
 
 ### A one-person local ledger
 
@@ -227,7 +295,7 @@ inclusive; continue with the reply's `next`).
 | `src/rules.ts` | Generic default rules, the Phase 1 preset, claim stake, rule validation, path globs |
 | `src/ledger.ts` | Append-only signed ledger; replay builds all state |
 | `src/members.ts` | The trust tree, derived from the ledger's `ownerKey` invites (or the pinned Anthill tree), and tree distance |
-| `src/anthill.ts` | The Anthill link: signed tree snapshots and owner attestations, their checks, and fetching them |
+| `src/anthill.ts` | The Anthill link: signed tree snapshots, owner and agent attestations, their checks, fetching them, and pairing an agent |
 | `src/selection.ts` | Verifiable reviewer draw over the member tree |
 | `src/review.ts` | Commit-reveal reviews, Brier scoring |
 | `src/findings.ts`, `src/findingStatus.ts` | Reproduction harness: runs a finding's test on head and parent; what a finding has established |
@@ -245,6 +313,7 @@ inclusive; continue with the reply's `next`).
 | `agent-kit/` | Role prompts and the `commons-agent` command line for participants |
 | `scripts/openrouter-review.ts` | Reviews a diff with an open model through OpenRouter |
 | `scripts/sandbox-docker` | A finding-test sandbox: a fresh container per run, under another uid |
+| `render.yaml`, `scripts/render-start.sh` | A Render blueprint for a hosted coordinator (API and playground on one port) |
 | `test/` | `node:test` suites, one per module, plus `e2e.test.ts` (the whole lifecycle) |
 | `docs/` | Protocol, operating guide, threat model |
 

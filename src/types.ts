@@ -5,7 +5,9 @@
 // Conventions:
 // - Ids are strings. An OwnerId names a person (or organisation) the admin
 //   registered with an ownerKey entry, or, on a ledger linked to an Anthill
-//   community, an Anthill user id admitted with an anthillOwner entry. The
+//   community, an Anthill user id admitted with an anthillOwner entry (or,
+//   without an owner key, by Anthill vouching for one of their agents with an
+//   anthillAgent entry). The
 //   trust tree (members.ts) is the owners under their inviters, or the latest
 //   pinned Anthill tree on a linked ledger. A KeyId is the hex sha256 of a raw ed25519 public
 //   key, first 16 bytes (32 hex chars).
@@ -14,7 +16,13 @@
 // - Reputation amounts are integers (points). No floats in the ledger except
 //   probabilities in reviews.
 
-import type { AnthillLink, AnthillOwnerAttestation, AnthillTreeSnapshot } from "./anthill";
+import type {
+  AnthillAgentAttestation,
+  AnthillAgentRevokeAttestation,
+  AnthillLink,
+  AnthillOwnerAttestation,
+  AnthillTreeSnapshot,
+} from "./anthill";
 
 export type OwnerId = string;
 export type KeyId = string;
@@ -75,6 +83,15 @@ export type EntryBody =
   // `attestation.publicKey`. Anyone may relay it; Anthill's signature is what
   // admits them.
   | { kind: "anthillOwner"; attestation: AnthillOwnerAttestation; signature: string }
+  // signer: admin or coordinator, on a linked ledger only. Registers the agent
+  // key Anthill vouched for under owner `attestation.user`, exactly as
+  // agentRegistered would; the owner is created, with no owner key, if they
+  // were not one yet. The member approved it on the website; Anthill's
+  // signature is what registers it.
+  | { kind: "anthillAgent"; attestation: AnthillAgentAttestation; signature: string }
+  // signer: admin or coordinator, on a linked ledger only. Revokes an agent of
+  // `attestation.user` at their request through Anthill (revokedBy "owner").
+  | { kind: "anthillAgentRevoked"; attestation: AnthillAgentRevokeAttestation; signature: string }
   // signer: owner (the owner named). Registers an agent key under the owner.
   | { kind: "agentRegistered"; owner: OwnerId; publicKey: string; modelFamily: ModelFamily; harness: string }
   // signer: the agent's owner, or coordinator (automatic suspension)
@@ -286,7 +303,11 @@ export type Rules = {
 
 export type OwnerState = {
   id: OwnerId;
-  keyId: KeyId;
+  // The owner key, or null for an Anthill member admitted only through an
+  // agent Anthill vouched for (anthillAgent): such an owner signs nothing
+  // themselves, and Anthill acts for them. An anthillOwner entry later binds
+  // a key to them.
+  keyId: KeyId | null;
   inviter: OwnerId | null;
   // Sum of settlements in this project: the owner's commons reputation. It
   // backs stakes (with rules.stake.allowance) and sizes PR slots.

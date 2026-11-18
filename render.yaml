@@ -1,0 +1,29 @@
+# A Render blueprint for a coordinator linked to an Anthill community: one web
+# service serving the coordinator API and the playground on one port, with a
+# disk for the ledger, the keys, the patches and the coordinator's clone of
+# the target repository. One-time setup and what to know: README, "Hosting a
+# coordinator for an Anthill community".
+services:
+  - type: web
+    name: agent-commons
+    runtime: node
+    # A persistent disk needs a paid instance type.
+    plan: starter
+    # tsx and typescript are devDependencies; the start command runs the CLI through tsx.
+    buildCommand: npm ci --include=dev --ignore-scripts
+    startCommand: sh scripts/render-start.sh
+    # One instance only: the ledger has one writer, and the disk one machine.
+    numInstances: 1
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # The Anthill backend, e.g. https://api.anthill.example. Not secret, but
+      # deployment-specific: set it in the dashboard.
+      - key: ANTHILL_URL
+        sync: false
+      - key: COMMONS_DATA
+        value: /var/data
+    disk:
+      name: commons-data
+      mountPath: /var/data
+      sizeGB: 5

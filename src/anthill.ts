@@ -14,13 +14,28 @@
 //   commons key is theirs. Anthill signs that attestation, and an
 //   anthillOwner entry carrying it admits the member as an owner whose id is
 //   their Anthill user id.
+// - which agents a member runs: a member who works from a browser and a
+//   disposable sandbox has nowhere good to keep an owner key, so Anthill can
+//   vouch for an agent key directly. The member approves the agent on the
+//   website (signed in), Anthill signs an agent attestation, and an
+//   anthillAgent entry carrying it registers the agent under the member,
+//   admitting them as an owner without a key if they were not one yet. This
+//   is no new trust: Anthill can already vouch for any member's owner key.
+//   An agent-revoke attestation (anthillAgentRevoked) revokes such an agent
+//   the same way.
 //
 // Anthill signs with its own ed25519 key, named in genesis.anthill.publicKey.
-// Both messages are domain-separated canonical JSON, so a signature over one
-// kind can never be replayed as the other. anthill-backend/src/commonsLink.ts
+// Every message is domain-separated canonical JSON, so a signature over one
+// kind can never be replayed as another. anthill-backend/src/commonsLink.ts
 // builds the same messages; test/anthill.test.ts pins the format.
+//
+// Pairing (anthill-backend's pairing routes, and `commons-agent pair`): an
+// agent claims a one-time code with a proof that it holds the key it names,
+// its own signature over pairMessage. The commons never checks a pairing
+// proof (Anthill does), but the message is defined here, next to the others,
+// so both sides build it from one definition.
 
-import { canonical, verify } from "./crypto";
+import { canonical, sha256hex, sign, verify } from "./crypto";
 import type { CommonsState, EntryBody } from "./types";
 
 export type AnthillLink = { community: string; publicKey: string };
@@ -44,8 +59,46 @@ export type AnthillOwnerAttestation = {
   at: string;
 };
 
+// Anthill vouching that `agentKey` is an agent run by its user `user`, a
+// member of `community` when it signed, declared as `modelFamily` (one of the
+// ledger's rules.modelFamilies; the ledger checks) under `harness`.
+export type AnthillAgentAttestation = {
+  agentKey: string;
+  at: string;
+  community: string;
+  harness: string;
+  modelFamily: string;
+  user: string;
+};
+
+// Anthill, at its user's request, revoking the agent `agentKey` it vouched for.
+export type AnthillAgentRevokeAttestation = {
+  agentKey: string;
+  at: string;
+  community: string;
+  reason: string;
+  user: string;
+};
+
+// What an agent signs with its own key to claim a pairing code.
+export type PairClaim = {
+  agentKey: string;
+  code: string;
+  community: string;
+  harness: string;
+  modelFamily: string;
+};
+
 export const TREE_DOMAIN = "anthill-commons/tree/v1";
 export const OWNER_DOMAIN = "anthill-commons/owner/v1";
+export const AGENT_DOMAIN = "anthill-commons/agent/v1";
+export const AGENT_REVOKE_DOMAIN = "anthill-commons/agent-revoke/v1";
+export const PAIR_DOMAIN = "anthill-commons/pair/v1";
+
+// Field limits of the agent messages, as anthill-backend applies them when it
+// signs: harness is free text, a revoke reason a short sentence.
+export const MAX_HARNESS = 64;
+export const MAX_REVOKE_REASON = 200;
 
 // Most members one snapshot may hold. The ledger keeps every snapshot and
 // every node replays them, so a snapshot is bounded like every other field.
@@ -57,6 +110,9 @@ export const MAX_SNAPSHOT_MEMBERS = 20_000;
 export const ANTHILL_USER_RE = /^0x[0-9a-f]{40}$/;
 
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
+// Control characters (C0, DEL, C1): a harness name is shown on the website and
+// the playground, and must not carry line breaks or terminal escapes.
+const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/;
 
 export function treeMessage(snapshot: AnthillTreeSnapshot): string {
   return `${TREE_DOMAIN}\n${canonical(snapshot)}`;
@@ -64,6 +120,27 @@ export function treeMessage(snapshot: AnthillTreeSnapshot): string {
 
 export function ownerMessage(attestation: AnthillOwnerAttestation): string {
   return `${OWNER_DOMAIN}\n${canonical(attestation)}`;
+}
+
+export function agentMessage(attestation: AnthillAgentAttestation): string {
+  return `${AGENT_DOMAIN}\n${canonical(attestation)}`;
+}
+
+export function agentRevokeMessage(attestation: AnthillAgentRevokeAttestation): string {
+  return `${AGENT_REVOKE_DOMAIN}\n${canonical(attestation)}`;
+}
+
+export function pairMessage(claim: PairClaim): string {
+  return `${PAIR_DOMAIN}\n${canonical(claim)}`;
+}
+
+// What a person compares on the website with what their agent printed: the
+// first 8 bytes of sha256 over the agent key's DER, as 4 groups of 4 hex
+// digits (3f2a-91bc-07de-55e1). Short enough to read aloud, long enough that
+// nobody can make a key to match a given one.
+export function keyFingerprint(publicKey: string): string {
+  const hex = sha256hex(Buffer.from(publicKey, "base64url")).slice(0, 16);
+  return (hex.match(/.{4}/g) as string[]).join("-");
 }
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
@@ -110,12 +187,54 @@ export function attestationProblems(a: unknown): string[] {
   return problems;
 }
 
+// The time in the one spelling the agent messages use: toISOString's, with
+// milliseconds, in UTC.
+const isExactIso = (v: unknown): v is string => typeof v === "string" && isIso(v) && new Date(v).toISOString() === v;
+
+export function agentAttestationProblems(a: unknown): string[] {
+  if (!isPlainObject(a)) return ["attestation is not an object"];
+  const keys = ["agentKey", "at", "community", "harness", "modelFamily", "user"];
+  if (!exactKeys(a, keys)) return [`attestation must have exactly ${keys.join(", ")}`];
+  const problems: string[] = [];
+  if (typeof a.agentKey !== "string") problems.push("agentKey must be a string");
+  if (!isExactIso(a.at)) problems.push("at must be an ISO time in UTC with milliseconds");
+  if (typeof a.community !== "string" || a.community === "") problems.push("community must be a non-empty string");
+  if (typeof a.harness !== "string" || a.harness === "" || a.harness.length > MAX_HARNESS || CONTROL_RE.test(a.harness)) {
+    problems.push(`harness must be 1 to ${MAX_HARNESS} characters with no control characters`);
+  }
+  // Membership of rules.modelFamilies is the ledger's check: it depends on the rules in force.
+  if (typeof a.modelFamily !== "string" || a.modelFamily === "") problems.push("modelFamily must be a non-empty string");
+  if (typeof a.user !== "string" || !ANTHILL_USER_RE.test(a.user)) problems.push("user is not an Anthill user id");
+  return problems;
+}
+
+export function agentRevokeProblems(a: unknown): string[] {
+  if (!isPlainObject(a)) return ["attestation is not an object"];
+  const keys = ["agentKey", "at", "community", "reason", "user"];
+  if (!exactKeys(a, keys)) return [`attestation must have exactly ${keys.join(", ")}`];
+  const problems: string[] = [];
+  if (typeof a.agentKey !== "string") problems.push("agentKey must be a string");
+  if (!isExactIso(a.at)) problems.push("at must be an ISO time in UTC with milliseconds");
+  if (typeof a.community !== "string" || a.community === "") problems.push("community must be a non-empty string");
+  if (typeof a.reason !== "string" || a.reason.length > MAX_REVOKE_REASON) problems.push(`reason must be at most ${MAX_REVOKE_REASON} characters`);
+  if (typeof a.user !== "string" || !ANTHILL_USER_RE.test(a.user)) problems.push("user is not an Anthill user id");
+  return problems;
+}
+
 export function verifyTree(link: AnthillLink, snapshot: AnthillTreeSnapshot, signature: string): boolean {
   return verify(link.publicKey, treeMessage(snapshot), signature);
 }
 
 export function verifyOwner(link: AnthillLink, attestation: AnthillOwnerAttestation, signature: string): boolean {
   return verify(link.publicKey, ownerMessage(attestation), signature);
+}
+
+export function verifyAgent(link: AnthillLink, attestation: AnthillAgentAttestation, signature: string): boolean {
+  return verify(link.publicKey, agentMessage(attestation), signature);
+}
+
+export function verifyAgentRevoke(link: AnthillLink, attestation: AnthillAgentRevokeAttestation, signature: string): boolean {
+  return verify(link.publicKey, agentRevokeMessage(attestation), signature);
 }
 
 // ---------------------------------------------------------------------------
@@ -199,4 +318,65 @@ export async function syncAnthillTree(
   }
   await append({ kind: "anthillTree", snapshot: signed.snapshot, signature: signed.signature });
   return signed.snapshot.version;
+}
+
+// ---------------------------------------------------------------------------
+// Pairing an agent through Anthill (the agent side: commons-agent pair).
+// ---------------------------------------------------------------------------
+
+// A pairing code as the website shows it: 24 letters and digits in groups of
+// four. People paste codes with spaces, lowercase or without dashes, so the
+// code is put in this one spelling before it is signed and sent: the proof
+// covers exactly the code the backend receives.
+export function normalisePairingCode(code: string): string | null {
+  const plain = code.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (plain.length !== 24) return null;
+  return (plain.match(/.{4}/g) as string[]).join("-");
+}
+
+export type PairingAnswer = { httpStatus: number; body: Record<string, unknown> | null; text: string };
+
+async function postPairing(fetchFn: Fetch, url: string, body: unknown): Promise<PairingAnswer> {
+  const res = await fetchFn(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const text = await res.text();
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    const v: unknown = JSON.parse(text);
+    if (isPlainObject(v)) parsed = v;
+  } catch {
+    // Not JSON: the caller reports the status and the start of the text.
+  }
+  return { httpStatus: res.status, body: parsed, text };
+}
+
+const pairingsUrl = (url: string, community: string) => `${base(url)}/c/${encodeURIComponent(community)}/commons/pairings`;
+
+// Claims a pairing code for the agent key `key`, with the key's signature over
+// pairMessage as proof that the agent holds it. Anthill answers
+// { status: "claimed", fingerprint } and shows the claim to the member who
+// made the code.
+export async function claimPairing(
+  url: string,
+  claim: PairClaim,
+  privateKey: string,
+  fetchFn: Fetch = globalThis.fetch,
+): Promise<PairingAnswer> {
+  const proof = sign(privateKey, pairMessage(claim));
+  return postPairing(fetchFn, `${pairingsUrl(url, claim.community)}/claim`, {
+    code: claim.code,
+    agentKey: claim.agentKey,
+    modelFamily: claim.modelFamily,
+    harness: claim.harness,
+    proof,
+  });
+}
+
+// Where a claimed pairing stands. POST, so the code stays out of URLs and logs.
+export async function pairingStatus(url: string, community: string, code: string, fetchFn: Fetch = globalThis.fetch): Promise<PairingAnswer> {
+  return postPairing(fetchFn, `${pairingsUrl(url, community)}/claim-status`, { code });
 }

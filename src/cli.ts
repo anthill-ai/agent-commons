@@ -86,7 +86,7 @@ import { plantCommitment, reviewWindowClosed } from "./plants";
 import { commitmentFor } from "./review";
 import { ringOf } from "./gates/rings";
 import { claimStake, defaultRules, phase1Rules, validateRules } from "./rules";
-import { createCoordinatorServer, findingTestFile, LedgerStore, patchFile, SAFE_ID, type SubmitPolicy, summarisePatch } from "./server";
+import { createCoordinatorServer, findingTestFile, LedgerStore, patchFile, proxyMatcher, SAFE_ID, type SubmitPolicy, summarisePatch } from "./server";
 import type {
   CommonsState,
   EntryBody,
@@ -119,6 +119,8 @@ export type MetricsApi = {
 };
 export type PlaygroundApi = {
   startPlayground(opts: { ledgerPath: string; port: number; host?: string }): http.Server;
+  // The same site as a request handler, mounted behind the coordinator API by `serve --one-port`.
+  createPlaygroundHandler(opts: { ledgerPath: string }): http.RequestListener;
 };
 
 export type ModuleName =
@@ -2724,26 +2726,38 @@ const COMMANDS: Record<string, Command> = {
   ),
 
   serve: command(
-    "the read-only playground; with --coordinator also the coordinator API (and its loop)",
+    "the read-only playground; with --coordinator also the coordinator API (and its loop), on its own port or with --one-port on the same one",
     {
       ...COORDINATOR_FLAGS,
-      port: { type: "string", help: "playground port (default 8080)" },
+      port: { type: "string", help: "playground port (default 8080); with --one-port, the one port" },
       host: { type: "string", help: "listen address (default 127.0.0.1)" },
       coordinator: { type: "boolean", help: "also serve the coordinator API (needs the coordinator --key)" },
       "api-port": { type: "string", help: "coordinator API port (default port + 1)" },
+      "one-port": { type: "boolean", help: "with --coordinator: serve the API and the playground together on --port (a hosted service has one port)" },
       "loop-seconds": { type: "string", help: "with --coordinator: run a coordinator pass this often (default: never)" },
-      "trusted-proxy": { type: "list", help: "address of a reverse proxy in front of the API (repeatable); only its X-Forwarded-For is believed" },
+      "trusted-proxy": { type: "list", help: "address (or IPv4 range, 10.0.0.0/8) of a reverse proxy in front of the API (repeatable); only its X-Forwarded-For is believed" },
     },
     async (ctx) => {
       const f = ctx.flags;
       const port = int(f, "port", { min: 0, dflt: 8080 }) as number;
       const host = str(f, "host") ?? "127.0.0.1";
       const ledger = ledgerPath(ctx);
+      const onePort = bool(f, "one-port");
+      if (onePort && !bool(f, "coordinator")) usage("--one-port needs --coordinator: without it the playground already has the port to itself");
+      if (onePort && str(f, "api-port") !== undefined) usage("--one-port serves the API on --port; drop --api-port");
+      try {
+        proxyMatcher(list(f, "trusted-proxy"));
+      } catch (e) {
+        usage(`--trusted-proxy: ${(e as Error).message}`);
+      }
       state(ctx); // fail now on a missing or invalid ledger
       const servers: http.Server[] = [];
-      const pg = (ctx.io.load("playground") as PlaygroundApi).startPlayground({ ledgerPath: ledger, port, host });
-      servers.push(pg);
-      pg.on("listening", () => ctx.out(`playground on http://${host}:${addrPort(pg)}`));
+      const playground = ctx.io.load("playground") as PlaygroundApi;
+      if (!onePort) {
+        const pg = playground.startPlayground({ ledgerPath: ledger, port, host });
+        servers.push(pg);
+        pg.on("listening", () => ctx.out(`playground on http://${host}:${addrPort(pg)}`));
+      }
       let timer: NodeJS.Timeout | undefined;
       if (bool(f, "coordinator")) {
         const clock = () => ctx.io.now().toISOString();
@@ -2755,9 +2769,16 @@ const COMMANDS: Record<string, Command> = {
           patchesDir: patchesDir(ctx),
           policy: ctx.io.load("incentives") as SubmitPolicy,
           trustedProxies: list(f, "trusted-proxy"),
+          // One port: whatever the API does not answer is the playground's.
+          // /api/entries is the API's (the same contract); the site's other
+          // pages and /api/state, /api/metrics pass through, under the API's
+          // per-address limits.
+          ...(onePort ? { fallback: playground.createPlaygroundHandler({ ledgerPath: ledger }) } : {}),
         });
-        const apiPort = int(f, "api-port", { min: 0 }) ?? (port === 0 ? 0 : port + 1);
-        api.listen(apiPort, host, () => ctx.out(`coordinator API on http://${host}:${addrPort(api)}`));
+        const apiPort = onePort ? port : (int(f, "api-port", { min: 0 }) ?? (port === 0 ? 0 : port + 1));
+        api.listen(apiPort, host, () =>
+          ctx.out(onePort ? `coordinator API and playground on http://${host}:${addrPort(api)}` : `coordinator API on http://${host}:${addrPort(api)}`),
+        );
         servers.push(api);
         const every = int(f, "loop-seconds", { min: 1 });
         if (every !== undefined) {

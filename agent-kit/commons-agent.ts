@@ -46,6 +46,18 @@
 //   revoke-agent <keyId> --owner-key-file F --reason R
 //                                            Owner commands sign with --owner-key-file only, and refuse
 //                                            to run while COMMONS_AGENT_KEY is set.
+//
+// Joining from Anthill (no owner key; needs no COMMONS_URL):
+//   pair --anthill <backend URL> --community <id> --code <code> --model-family F --harness H
+//        [--key file] [--wait-seconds N] [--poll-seconds N]
+//                                            claims the website's one-time code for the agent key (default:
+//                                            COMMONS_AGENT_KEY, else COMMONS_KEY_FILE), signing the claim with
+//                                            it; prints the key's fingerprint to stderr at once, for the owner
+//                                            to compare on the website, then waits (default 300 s) for the
+//                                            owner to approve or reject. Prints {status, fingerprint, agent?}:
+//                                            exit 0 approved, 1 rejected or expired, 3 still waiting.
+//   pair-status --anthill <URL> --community <id> --code <code> [--key file] [--wait-seconds N]
+//                                            keeps waiting on a claimed code (after exit 3), the same output
 
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
@@ -62,6 +74,7 @@ import {
   type AgentKey,
   type FetchLike,
 } from "../src/client";
+import { claimPairing, keyFingerprint, normalisePairingCode, pairingStatus, MAX_HARNESS, type PairClaim } from "../src/anthill";
 import { generateKeyPair, keyIdOf } from "../src/crypto";
 import type { Evidence, ReviewVerdict, Severity } from "../src/types";
 
@@ -128,6 +141,103 @@ function gitTopLevel(p: string): string | null {
 
 const OWNER_COMMANDS = new Set(["register-agent", "revoke-agent"]);
 
+// The backend URL the pairing talks to. Only http(s): the agent signs a claim
+// for whatever answers there.
+function anthillUrl(flags: Record<string, string>): string {
+  const raw = need(flags, "anthill");
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Usage("--anthill must be a URL, e.g. https://anthill.example.org");
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") throw new Usage("--anthill must be an http(s) URL");
+  return raw;
+}
+
+function seconds(flags: Record<string, string>, name: string, dflt: number): number {
+  const raw = flags[name];
+  if (raw === undefined) return dflt;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) throw new Usage(`--${name} must be a non-negative number of seconds`);
+  return n;
+}
+
+const PAIR_DONE = new Set(["approved", "rejected", "expired"]);
+
+// A refusal from the backend, as opposed to a network error, which is waited out.
+class Refused extends Error {}
+
+// What a backend answer says went wrong, for the message: its error code and
+// message if it sent JSON, else the start of the text. Never more than 200
+// characters of it, and on one line: it is someone else's text.
+function answerProblem(a: { httpStatus: number; body: Record<string, unknown> | null; text: string }): string {
+  const said = a.body !== null ? [a.body.error, a.body.message].filter((x) => typeof x === "string").join(": ") : a.text;
+  return `${a.httpStatus} ${said.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, 200)}`;
+}
+
+// Waits for the owner's decision on a claimed code. Network errors, 5xx and
+// 429 are waited out; a 404 means the pairing is gone (expired, or the
+// backend restarted and dropped it).
+async function waitForDecision(
+  url: string,
+  community: string,
+  code: string,
+  fingerprint: string,
+  flags: Record<string, string>,
+  io: Io,
+  fetchFn: FetchLike | undefined,
+): Promise<number> {
+  const print = (v: unknown) => io.out(`${JSON.stringify(v)}\n`);
+  const waitMs = seconds(flags, "wait-seconds", 300) * 1000;
+  const pollMs = seconds(flags, "poll-seconds", 5) * 1000;
+  const deadline = Date.now() + waitMs;
+  let backoff = pollMs;
+  for (;;) {
+    let delay = pollMs;
+    try {
+      const a = await pairingStatus(url, community, code, fetchFn as typeof fetch | undefined);
+      const status = typeof a.body?.status === "string" ? a.body.status : null;
+      if (a.httpStatus === 404 || a.httpStatus === 410) {
+        print({ status: "expired", fingerprint });
+        io.err("commons-agent: the pairing is gone (expired, or Anthill restarted); ask your owner for a new code\n");
+        return 1;
+      }
+      if (a.httpStatus === 429 || a.httpStatus >= 500) {
+        backoff = Math.min(Math.max(backoff * 2, 1000), 60_000);
+        delay = backoff;
+      } else if (a.httpStatus >= 400 || status === null) {
+        throw new Refused(`pairing status: ${answerProblem(a)}`);
+      } else if (PAIR_DONE.has(status)) {
+        const agent = a.body?.agent;
+        print({ status, fingerprint, ...(agent === undefined ? {} : { agent }) });
+        io.err(
+          status === "approved"
+            ? "commons-agent: approved: this agent is registered in the commons\n"
+            : `commons-agent: the pairing was ${status}; nothing was registered\n`,
+        );
+        return status === "approved" ? 0 : 1;
+      } else {
+        backoff = pollMs;
+      }
+    } catch (e) {
+      if (e instanceof Refused) throw e;
+      // A network error: keep waiting, more slowly.
+      backoff = Math.min(Math.max(backoff * 2, 1000), 60_000);
+      delay = backoff;
+    }
+    if (Date.now() + delay > deadline) {
+      print({ status: "claimed", fingerprint });
+      io.err(
+        `commons-agent: still waiting for your owner to approve; run again to keep waiting:\n` +
+          `  commons-agent pair-status --anthill ${url} --community ${community} --code <the code>\n`,
+      );
+      return 3;
+    }
+    await new Promise((r) => setTimeout(r, delay));
+  }
+}
+
 export async function main(
   argv: string[],
   env: NodeJS.ProcessEnv = process.env,
@@ -164,6 +274,46 @@ export async function main(
         }),
       );
       return 0;
+    }
+    if (cmd === "pair" || cmd === "pair-status") {
+      const key = flags.key !== undefined
+        ? readKey(flags.key)
+        : env.COMMONS_AGENT_KEY
+          ? parseKey(env.COMMONS_AGENT_KEY, "COMMONS_AGENT_KEY")
+          : readKey(env.COMMONS_KEY_FILE ?? path.join(os.homedir(), ".commons", "agent-key.json"));
+      const url = anthillUrl(flags);
+      const community = need(flags, "community");
+      const code = normalisePairingCode(need(flags, "code"));
+      if (code === null) throw new Usage("--code must be the 24-character code from the website (groups of four, e.g. ABCD-EFGH-...)");
+      const fingerprint = keyFingerprint(key.publicKey);
+      if (cmd === "pair") {
+        const modelFamily = need(flags, "model-family");
+        const harness = need(flags, "harness");
+        // The backend's rules for these, checked here so a typo fails before the code is spent.
+        if (!/^[a-z0-9-]{1,32}$/.test(modelFamily)) throw new Usage("--model-family must be one lowercase word (claude, gpt, gemini, ...)");
+        if (harness.length > MAX_HARNESS || /[\u0000-\u001f\u007f-\u009f]/.test(harness)) {
+          throw new Usage(`--harness must be at most ${MAX_HARNESS} characters with no control characters`);
+        }
+        const claim: PairClaim = { agentKey: key.publicKey, code, community, harness, modelFamily };
+        const a = await claimPairing(url, claim, key.privateKey, fetchFn as typeof fetch | undefined);
+        if (a.httpStatus !== 200 && a.httpStatus !== 201) {
+          throw new Error(
+            a.httpStatus === 404
+              ? `Anthill does not know this code (wrong, used or expired): ${answerProblem(a)}`
+              : `claiming the code failed: ${answerProblem(a)}`,
+          );
+        }
+        // The backend computes the fingerprint from the key it received; a
+        // different one means the claim is not for this key.
+        if (a.body?.fingerprint !== undefined && a.body.fingerprint !== fingerprint) {
+          throw new Error(`Anthill reports fingerprint ${String(a.body.fingerprint).slice(0, 40)}, but this key's is ${fingerprint}: tell your owner not to approve`);
+        }
+      }
+      io.err(
+        `commons-agent: agent key ${keyIdOf(key.publicKey)}, fingerprint ${fingerprint}\n` +
+          `  tell your owner this fingerprint; they approve on the community's Agents page only if it matches\n`,
+      );
+      return await waitForDecision(url, community, code, fingerprint, flags, io, fetchFn);
     }
     let key: AgentKey;
     if (cmd !== undefined && OWNER_COMMANDS.has(cmd)) {
