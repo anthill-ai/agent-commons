@@ -525,6 +525,44 @@ export function cloneOrigin(target: string): string | undefined {
   return r.ok && r.out !== "" ? r.out : undefined;
 }
 
+// The project moved (a repository renamed, or transferred to an organization)
+// and the operator set the new address: the clone keeps the old one as its
+// origin, which following upstream and the mirror would go on using, and an
+// old address someone forks into stops being the project. So when the
+// configured target differs from the clone's origin, the origin is moved to
+// it, but only when it is the same project: its main must share history with
+// the clone's main, one containing the other. Anything else (unreachable, no
+// main, unrelated history) leaves the origin alone and says why: this never
+// stops the coordinator, and the next start tries again.
+export async function retargetClone(target: string, targetRepo: string, log: (line: string) => void, allowFile = false): Promise<"same" | "moved" | "kept"> {
+  const origin = cloneOrigin(target);
+  if (origin === undefined || origin === targetRepo) return "same";
+  const problems = targetRepoProblems(targetRepo, allowFile);
+  if (problems.length > 0) {
+    log(`target: not moving the clone's origin: ${settingName("targetRepo")} ${problems[0]}`);
+    return "kept";
+  }
+  const fetched = await gitAsync(target, ["fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--", targetRepo, "refs/heads/main"], 10 * 60_000);
+  if (!fetched.ok) {
+    log(`target: ${settingName("targetRepo")} differs from the clone's origin, but its main couldn't be fetched (${fetched.err.split("\n").slice(-1)[0]}): keeping the old origin, and trying again at the next start`);
+    return "kept";
+  }
+  const theirs = git(target, ["rev-parse", "--verify", "--quiet", "FETCH_HEAD^{commit}"]).out;
+  const ours = git(target, ["rev-parse", "--verify", "--quiet", "refs/heads/main^{commit}"]).out;
+  const within = (a: string, b: string) => git(target, ["merge-base", "--is-ancestor", a, b]).ok;
+  if (theirs === "" || ours === "" || !(within(ours, theirs) || within(theirs, ours))) {
+    log(`target: ${settingName("targetRepo")} differs from the clone's origin and its main doesn't share history with this clone's main: not the same project, so the origin stays as it is`);
+    return "kept";
+  }
+  const set = git(target, ["remote", "set-url", "origin", targetRepo]);
+  if (!set.ok) {
+    log(`target: could not move the clone's origin: ${set.err}`);
+    return "kept";
+  }
+  log(`target: the project moved: the clone's origin is now ${settingName("targetRepo")} (same history as before)`);
+  return "moved";
+}
+
 // What a ledger made earlier still needs before it can be served.
 export function missingForServe(l: HostLayout): string[] {
   const missing: string[] = [];

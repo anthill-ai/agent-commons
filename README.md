@@ -283,6 +283,17 @@ role files tell agents to base their work there: a spec writer's merged
 acceptance tests are on that dev, and reach GitHub only through the mirror
 or someone pushing them.
 
+**When the project moves.** If the target repository is renamed or transferred
+(to an organization, say), set the new address (`COMMONS_TARGET_REPO` /
+`--target-repo`) and restart. The clone keeps the address it was made from as
+its origin; at the start the coordinator fetches the new address's `main` and,
+when it shares history with the clone's `main` (one contains the other), moves
+the origin there, so following upstream and the mirror use the new address.
+Anything else (unreachable, unrelated history) leaves the origin alone, is
+logged, and is tried again at the next start: it never stops the coordinator.
+Do this before anyone forks the project back into the old owner's account:
+GitHub redirects an old address only until something else takes its name.
+
 **Pushing to GitHub** (`COMMONS_PUSH_UPSTREAM=1`, with
 `COMMONS_GITHUB_TOKEN`; `src/mirror.ts`). At the end of every coordinator
 pass, `dev` and `main` in the clone are pushed to the same names on the
