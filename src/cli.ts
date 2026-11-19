@@ -83,7 +83,7 @@ import { HARNESS_DIR_PREFIX, minimalEnv, reproduceFinding } from "./findings";
 import { normaliseBasePath } from "./basePath";
 import { followUpstream } from "./gitHost";
 import { githubMirror, GITHUB_TOKEN_ENV, type Mirror, pushUpstreamProblems } from "./mirror";
-import { cloneOrigin, HOST_SETTINGS, hostLayout, missingForServe, readHostSettings, settingName, SetupError, setUp } from "./host";
+import { cloneOrigin, HOST_SETTINGS, hostLayout, missingForServe, readHostSettings, retargetClone, settingName, SetupError, setUp } from "./host";
 import { applyUnifiedDiff, checkRepoPath, createGitHub, type FetchLike as GitHubFetch, FULL_SHA, parsePatch } from "./github";
 import { forkChecker, parseGithubRepo, pullRequestSync, type PullRequestSync, type SourceKind, sourceExists, sourceOf, sourceTip, verifySourceLocal } from "./forks";
 import {
@@ -3304,6 +3304,11 @@ const COMMANDS: Record<string, Command> = {
         if (missing.length > 0) {
           say(`the ledger exists, but ${missing.join(" and ")} is missing; setup never runs over a ledger`);
           return fail("This commons cannot start; the operator has the details in the logs.");
+        }
+        // the project moved since setup: follow it (host.ts retargetClone)
+        const configured = pick("targetRepo")?.trim();
+        if (configured !== undefined && configured !== "") {
+          await retargetClone(layout.target, configured, say, bool(f, "test-allow-file-target") || env.COMMONS_TEST_ALLOW_FILE_TARGET === "1");
         }
       }
 
