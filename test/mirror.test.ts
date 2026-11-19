@@ -11,7 +11,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { localGitBridge, main } from "../src/cli";
 import { followUpstream } from "../src/gitHost";
-import { githubMirror, mirrorGitEnv, mirrorTargetProblems, pushUpstreamProblems } from "../src/mirror";
+import { githubMirror, mirrorFailureReason, mirrorGitEnv, mirrorTargetProblems, pushUpstreamProblems } from "../src/mirror";
 
 const dirs: string[] = [];
 after(() => {
@@ -34,11 +34,18 @@ const TOKEN = "github_pat_TESTONLY0123456789abcdef";
 
 test("the token reaches git only through the environment, as a header scoped to https://github.com/", () => {
   const env = mirrorGitEnv(TOKEN);
-  assert.equal(env.GIT_CONFIG_COUNT, "2");
+  assert.equal(env.GIT_CONFIG_COUNT, "4");
   assert.equal(env.GIT_CONFIG_KEY_0, "http.https://github.com/.extraheader");
   assert.equal(env.GIT_CONFIG_VALUE_0, `Authorization: Basic ${Buffer.from(`x-access-token:${TOKEN}`).toString("base64")}`);
   assert.equal(env.GIT_CONFIG_KEY_1, "credential.helper");
   assert.equal(env.GIT_CONFIG_VALUE_1, "");
+  assert.equal(env.GIT_CONFIG_KEY_2, "http.https://github.com/.followRedirects");
+  assert.equal(env.GIT_CONFIG_VALUE_2, "false");
+  assert.equal(env.GIT_CONFIG_KEY_3, "http.https://github.com/.sslVerify");
+  assert.equal(env.GIT_CONFIG_VALUE_3, "true");
+  // Neither the system nor the global config file is read.
+  assert.equal(env.GIT_CONFIG_NOSYSTEM, "1");
+  assert.equal(env.GIT_CONFIG_GLOBAL, "/dev/null");
   // Git reads it as config for github.com URLs, and for no other host.
   const urlmatch = (url: string) =>
     spawnSync("git", ["config", "--get-urlmatch", "http.extraheader", url], { encoding: "utf8", env: { ...process.env, ...env } }).stdout.trim();
@@ -56,14 +63,28 @@ test("the mirror pushes only to https://github.com/<owner>/<repo>, and needs the
     "https://github.com.evil.example/org/repo",
     "https://github.com/org",
     "https://github.com/org/repo/tree/main",
-    "https://user@github.com/org/repo",
     "https://github.com/org/..",
-    "git@github.com:org/repo.git",
     "file:///tmp/x.git",
   ]) {
     assert.match(mirrorTargetProblems(bad).join(""), /not an https:\/\/github\.com\/<owner>\/<repo> URL/, bad);
   }
   assert.deepEqual(mirrorTargetProblems("file:///tmp/x.git", true), []);
+  // The problem text is logged: a secret in the URL never shows in it.
+  for (const leaky of [
+    "https://bot:SECRET1@github.com/o/r",
+    "https://SECRET1@github.com/o/r",
+    "https://github.com/o/r?access_token=SECRET1",
+    "https://github.com/o/r#SECRET1",
+    "https://bot:SECRET1@gitlab.example/o/r",
+    "file:///tmp/x.git?SECRET1",
+  ]) {
+    const text = mirrorTargetProblems(leaky, true).join("; ") + pushUpstreamProblems(leaky, { COMMONS_GITHUB_TOKEN: TOKEN }).join("; ");
+    assert.match(text, /must not carry credentials, a query or a fragment/, leaky);
+    assert.ok(!text.includes("SECRET1") && !text.includes("bot"), text);
+  }
+  assert.deepEqual(mirrorTargetProblems("not a url SECRET1"), ["the target is not a URL"]);
+  assert.deepEqual(mirrorTargetProblems("git@github.com:org/repo.git"), ["the target is not a URL"]);
+  assert.deepEqual(mirrorTargetProblems("https://gitlab.com/o/r.git/"), ['the target "https://gitlab.com/o/r.git/" is not an https://github.com/<owner>/<repo> URL']);
   assert.deepEqual(pushUpstreamProblems("https://github.com/o/r", {}), ["COMMONS_GITHUB_TOKEN is not set"]);
   assert.deepEqual(pushUpstreamProblems("https://github.com/o/r", { COMMONS_GITHUB_TOKEN: "  " }), ["COMMONS_GITHUB_TOKEN is not set"]);
   assert.deepEqual(pushUpstreamProblems("https://github.com/o/r", { COMMONS_GITHUB_TOKEN: TOKEN }), []);
@@ -76,17 +97,24 @@ test("no git the mirror runs carries the token in its argv", { skip: process.pla
   fs.mkdirSync(bin);
   const log = path.join(dir, "calls.log");
   // A stand-in git that records its argv and the config it was given, and fails.
-  fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\nprintf 'ARGV %s\\n' "$*" >> "${log}"\nprintf 'ENV %s\\n' "$GIT_CONFIG_KEY_0=$GIT_CONFIG_VALUE_0" >> "${log}"\nexit 1\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\nprintf 'ARGV %s\\n' "$*" >> "${log}"\nprintf 'ENV %s\\n' "$GIT_CONFIG_KEY_0=$GIT_CONFIG_VALUE_0" >> "${log}"\nprintf 'DROP [%s][%s][%s][%s]\\n' "$GIT_SSL_NO_VERIFY" "$GIT_TRACE2_ENV_VARS" "$GIT_TRACE_CURL" "$GIT_CONFIG_PARAMETERS" >> "${log}"\nprintf 'ISO %s %s\\n' "$GIT_CONFIG_NOSYSTEM" "$GIT_CONFIG_GLOBAL" >> "${log}"\nexit 1\n`, { mode: 0o755 });
   const saved = process.env.PATH;
+  const risky = { GIT_SSL_NO_VERIFY: "1", GIT_TRACE2_ENV_VARS: "COMMONS_GITHUB_TOKEN", GIT_TRACE_CURL: "1", GIT_CONFIG_PARAMETERS: "'http.sslverify'='false'" };
   process.env.PATH = `${bin}${path.delimiter}${saved ?? ""}`;
+  Object.assign(process.env, risky);
   try {
     const r = await githubMirror({ repo: dir, url: "https://github.com/org/repo", token: TOKEN }).pass();
     assert.equal(r.pushed.length, 0);
     assert.ok(r.problems.every((p) => !p.includes(TOKEN)));
   } finally {
     process.env.PATH = saved;
+    for (const k of Object.keys(risky)) delete process.env[k];
   }
   const lines = fs.readFileSync(log, "utf8").split("\n");
+  // Tracing, unverified TLS and inherited config never reach it; system and global config are not read.
+  assert.ok(lines.some((l) => l === "DROP [][][][]"), lines.join("\n"));
+  assert.ok(!lines.some((l) => l.startsWith("DROP ") && l !== "DROP [][][][]"), lines.join("\n"));
+  assert.ok(lines.some((l) => l === "ISO 1 /dev/null"), lines.join("\n"));
   const basic = Buffer.from(`x-access-token:${TOKEN}`).toString("base64");
   assert.ok(lines.some((l) => l.startsWith("ARGV ") && l.includes("ls-remote")), lines.join("\n"));
   for (const l of lines.filter((x) => x.startsWith("ARGV "))) assert.ok(!l.includes(TOKEN) && !l.includes(basic), l);
@@ -264,4 +292,50 @@ test("coordinator run-once --push-upstream: pushes the clone to its origin; with
   assert.match(out.stdout, /mirror: pushed dev [0-9a-f]{12} to GitHub/);
   assert.equal(w.on("refs/heads/dev"), git(w.target, "rev-parse", "dev"));
   assert.ok(!out.stdout.includes(TOKEN) && !out.stderr.includes(TOKEN));
+});
+
+test("mirror: an unreachable GitHub is one stable reason, so an outage is said once, not every pass", async () => {
+  const curl = (ms: number, port = 443) => ({ code: 128, out: "", err: `fatal: unable to access 'https://github.com/o/r/': Failed to connect to github.com port ${port} after ${ms} ms: Couldn't connect to server` });
+  const reasons = new Set([
+    mirrorFailureReason(curl(21034), "refs/heads/dev"),
+    mirrorFailureReason(curl(130), "refs/heads/dev"),
+    mirrorFailureReason({ code: 128, out: "", err: "fatal: unable to access 'https://github.com/o/r/': Could not resolve host: github.com" }, "refs/heads/dev"),
+    mirrorFailureReason({ code: 128, out: "", err: "fatal: unable to access 'https://github.com/o/r/': Recv failure: Connection reset by peer" }, "refs/heads/dev"),
+    mirrorFailureReason({ code: 128, out: "", err: "fatal: unable to access 'https://github.com/o/r/': Operation timed out after 300012 milliseconds with 0 bytes received" }, "refs/heads/dev"),
+    mirrorFailureReason({ code: 128, out: "", err: "fatal: unable to access 'https://github.com/o/r/': SSL_ERROR_SYSCALL in connection to github.com:443" }, "refs/heads/dev"),
+  ]);
+  assert.deepEqual([...reasons], ["cannot reach GitHub (network, DNS or TLS)"]);
+  // Anything else keeps its words, with numbers that carry units blanked.
+  const a = mirrorFailureReason({ code: 1, out: "", err: "error: RPC failed; HTTP 500 curl 22 after 1234 ms, 52.5 KiB sent" }, "refs/heads/dev");
+  const b = mirrorFailureReason({ code: 1, out: "", err: "error: RPC failed; HTTP 500 curl 22 after 98 ms, 3 KiB sent" }, "refs/heads/dev");
+  assert.equal(a, b);
+  assert.match(a, /RPC failed; HTTP 500 curl 22 after N ms, N KiB sent/);
+  assert.equal(mirrorFailureReason({ code: null, out: "", err: "fatal: partial output 123 ms" }, "refs/heads/dev"), "git did not finish (it timed out or could not run)");
+
+  // A real refused connection (nothing listens on port 1 here): said once.
+  const w = world();
+  const down = githubMirror({ repo: w.target, url: "https://127.0.0.1:1/o/r", token: TOKEN, timeoutMs: 20_000 });
+  const first = await down.pass();
+  assert.equal(first.problems.length, 1);
+  assert.match(first.problems[0] as string, /cannot reach GitHub \(network, DNS or TLS\)/);
+  assert.deepEqual(await down.pass(), { pushed: [], problems: [] });
+});
+
+test("mirror: what was said is bounded: a ref keeps only its latest commit's problems, and forgets them once it pushes", async () => {
+  const w = world();
+  const hook = path.join(w.gh, "hooks", "pre-receive");
+  const protect = () => fs.writeFileSync(hook, "#!/bin/sh\nwhile read old new ref; do [ \"$ref\" = refs/heads/main ] && exit 1; done\nexit 0\n", { mode: 0o755 });
+  protect();
+  const mirror = githubMirror({ repo: w.target, url: w.url, token: TOKEN });
+  await mirror.pass();
+  for (const f of ["a1", "a2", "a3", "a4"]) {
+    w.merge(`${f}.txt`);
+    await w.promote();
+    assert.equal((await mirror.pass()).problems.length, 1, f);
+    assert.equal(mirror.remembered(), 1, "only main's latest commit");
+  }
+  fs.rmSync(hook);
+  const r = await mirror.pass();
+  assert.deepEqual(r.pushed.map((p) => p.ref), ["refs/heads/main"]);
+  assert.equal(mirror.remembered(), 0, "forgotten once pushed");
 });

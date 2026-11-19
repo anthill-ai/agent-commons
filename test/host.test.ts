@@ -404,6 +404,13 @@ test("host: without its settings it says which are missing; --hold-on-failure an
   err = "";
   assert.equal(await main(["host", "--data", data, "--check"], { ...io, env: { ...settings, COMMONS_GITHUB_TOKEN: "t0ken" } }), 0);
   assert.doesNotMatch(err, /PUSH_UPSTREAM/);
+  // A target carrying a secret: --check never prints it.
+  for (const leaky of ["https://bot:SECRET9@github.com/o/r", "https://github.com/o/r?access_token=SECRET9"]) {
+    err = "";
+    await main(["host", "--data", data, "--check"], { ...io, env: { ...settings, COMMONS_TARGET_REPO: leaky, COMMONS_GITHUB_TOKEN: "t0ken" } });
+    assert.match(err, /COMMONS_PUSH_UPSTREAM \(--push-upstream\) is on, but the target must not carry credentials, a query or a fragment/, leaky);
+    assert.ok(!err.includes("SECRET9") && !err.includes("t0ken"), err);
+  }
 
   const port = await freePort();
   let stop = () => {};

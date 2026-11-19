@@ -47,17 +47,31 @@ const GIT_SAFE = [
   "push.gpgSign=false",
 ];
 
-// Tracing would print the request headers (redacted by default, but not
-// worth relying on): none of it reaches a git that carries the token.
-const TRACE_ENV = ["GIT_TRACE", "GIT_TRACE_CURL", "GIT_TRACE_CURL_NO_DATA", "GIT_CURL_VERBOSE", "GIT_TRACE_PACKET", "GIT_TRACE_REDACT", "GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF"];
+// Dropped from the environment of every git that carries the token: tracing
+// (GIT_TRACE*, GIT_TRACE2* and GIT_CURL_VERBOSE would print requests,
+// config and environment; redaction is a default, not worth relying on),
+// GIT_SSL_NO_VERIFY (a header sent over unverified TLS is a header given
+// away), and config a parent git passed down (GIT_CONFIG_PARAMETERS).
+const dropEnv = (k: string) => k.startsWith("GIT_TRACE") || k === "GIT_CURL_VERBOSE" || k === "GIT_SSL_NO_VERIFY" || k === "GIT_CONFIG_PARAMETERS";
 
 // The mirror pushes only to a GitHub repository over https, the one place the
-// header is scoped to. file: only for tests.
+// header is scoped to. file: only for tests. The problem text is logged, so
+// it never echoes the raw URL: one that carries credentials or a query is
+// named only as such, and any other only by scheme, host and path.
 export function mirrorTargetProblems(url: string, allowFile = false): string[] {
-  if (allowFile && url.startsWith("file://")) return [];
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return ["the target is not a URL"];
+  }
+  if (u.username !== "" || u.password !== "" || u.search !== "" || u.hash !== "" || /[@?#]/.test(url)) {
+    return ["the target must not carry credentials, a query or a fragment"];
+  }
+  if (allowFile && u.protocol === "file:") return [];
   const m = /^https:\/\/github\.com\/([A-Za-z0-9-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(url);
   if (m === null || /^\.+$/.test(m[2] as string)) {
-    return [`the target ${JSON.stringify(url.slice(0, 200))} is not an https://github.com/<owner>/<repo> URL`];
+    return [`the target ${JSON.stringify(`${u.protocol}//${u.host}${u.pathname}`.slice(0, 200))} is not an https://github.com/<owner>/<repo> URL`];
   }
   return [];
 }
@@ -76,26 +90,37 @@ export function pushUpstreamProblems(url: string | undefined, env: NodeJS.Proces
 // GIT_CONFIG_KEY_<n> and GIT_CONFIG_VALUE_<n> (git 2.31+) as command-line
 // config, so nothing secret is in any process's argv. The header is scoped by
 // http.<url>.extraHeader to https://github.com/ (git matches the scheme, the
-// host exactly and the path by segments), so a remote anywhere else never
-// sees it. GitHub takes a token as the password of Basic auth; the name is
-// not checked. An empty credential.helper drops any helper the machine
-// configures, so nothing is read from or stored to a keychain.
+// host exactly and the path by segments), so git adds it only to requests for
+// that URL; followRedirects=false keeps a redirect from github.com from
+// carrying such a request elsewhere, and sslVerify stays on there whatever
+// the clone's config says. GitHub takes a token as the password of Basic
+// auth; the name is not checked. An empty credential.helper drops any helper
+// the machine configures, so nothing is read from or stored to a keychain.
+// The system and global config files are not read (a helper, a proxy or an
+// insteadOf rewrite there would apply to these requests); the clone's own
+// config still is.
 export function mirrorGitEnv(token: string): Record<string, string> {
   const basic = Buffer.from(`x-access-token:${token}`, "utf8").toString("base64");
   return {
-    GIT_CONFIG_COUNT: "2",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_COUNT: "4",
     GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
     GIT_CONFIG_VALUE_0: `Authorization: Basic ${basic}`,
     GIT_CONFIG_KEY_1: "credential.helper",
     GIT_CONFIG_VALUE_1: "",
+    GIT_CONFIG_KEY_2: "http.https://github.com/.followRedirects",
+    GIT_CONFIG_VALUE_2: "false",
+    GIT_CONFIG_KEY_3: "http.https://github.com/.sslVerify",
+    GIT_CONFIG_VALUE_3: "true",
   };
 }
 
-type GitResult = { code: number | null; out: string; err: string };
+export type GitResult = { code: number | null; out: string; err: string };
 
 function run(repo: string, args: string[], env: Record<string, string>, timeoutMs: number): Promise<GitResult> {
-  const base: NodeJS.ProcessEnv = { ...process.env };
-  for (const k of TRACE_ENV) delete base[k];
+  const base: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) if (!dropEnv(k)) base[k] = v;
   return new Promise((resolve) => {
     const child = spawn("git", [...GIT_SAFE, ...args], {
       cwd: repo,
@@ -124,7 +149,8 @@ export type MirrorOptions = {
 // one is reported once; the caller logs them).
 export type MirrorReport = { pushed: { ref: string; sha: string }[]; problems: string[] };
 
-export type Mirror = { pass: () => Promise<MirrorReport> };
+// remembered: how many problems it keeps as said (diagnostics and tests; bounded).
+export type Mirror = { pass: () => Promise<MirrorReport>; remembered: () => number };
 
 export function githubMirror(opts: MirrorOptions): Mirror {
   const env = mirrorGitEnv(opts.token);
@@ -136,8 +162,14 @@ export function githubMirror(opts: MirrorOptions): Mirror {
   const git = (args: string[]) => run(opts.repo, args, env, timeoutMs);
   // What GitHub holds, as last read or pushed; null until read.
   let remote: Map<string, string | null> | null = null;
+  // Problems said, as `${what}\0...` keys. Bounded: a ref keeps only those
+  // about its latest commit, and forgets them once it pushes.
   const said = new Set<string>();
+  const forget = (prefix: string, keep?: string) => {
+    for (const k of said) if (k.startsWith(prefix) && (keep === undefined || !k.startsWith(keep))) said.delete(k);
+  };
   return {
+    remembered: () => said.size,
     pass: async () => {
       const report: MirrorReport = { pushed: [], problems: [] };
       const once = (key: string, line: string) => {
@@ -149,10 +181,11 @@ export function githubMirror(opts: MirrorOptions): Mirror {
         if (remote === null) {
           const ls = await git(["ls-remote", "--", opts.url, ...refs]);
           if (ls.code !== 0) {
-            const reason = failureReason(ls, "");
+            const reason = mirrorFailureReason(ls, "");
             once(`ls-remote\0${reason}`, `cannot read the branches of ${opts.url}: ${reason}; tried again every pass`);
             return report;
           }
+          forget("ls-remote\0");
           const seen = new Map<string, string | null>(refs.map((r) => [r, null]));
           for (const line of ls.out.split("\n")) {
             const [sha, ref] = line.split("\t");
@@ -172,9 +205,11 @@ export function githubMirror(opts: MirrorOptions): Mirror {
           if (pushed.code === 0) {
             remote.set(ref, local);
             report.pushed.push({ ref, sha: local });
+            forget(`${ref}\0`);
             continue;
           }
-          const reason = failureReason(pushed, ref);
+          const reason = mirrorFailureReason(pushed, ref);
+          forget(`${ref}\0`, `${ref}\0${local}\0`);
           once(`${ref}\0${local}\0${reason}`, `${ref.replace("refs/heads/", "")} at ${local.slice(0, 12)} not pushed to ${opts.url}: ${reason}; tried again every pass, never forced`);
         }
       } catch (e) {
@@ -187,8 +222,11 @@ export function githubMirror(opts: MirrorOptions): Mirror {
 }
 
 // A stable reason for a failed ls-remote or push, so the same refusal is said
-// once however many passes retry it.
-function failureReason(r: GitResult, ref: string): string {
+// once however many passes retry it: curl's messages carry timings, ports
+// and addresses that change every attempt, so a GitHub that cannot be
+// reached is one reason, and what is left has its numbers with units
+// blanked.
+export function mirrorFailureReason(r: GitResult, ref: string): string {
   const status = r.out.split("\n").find((l) => l.startsWith("!\t"));
   const why = status === undefined ? null : (/\[(?:remote )?rejected\] \((.*)\)\s*$/.exec(status)?.[1] ?? status.split("\t")[2] ?? "");
   const branch = ref.replace("refs/heads/", "");
@@ -201,7 +239,14 @@ function failureReason(r: GitResult, ref: string): string {
     }
     return `refused (${why})`;
   }
-  if (r.code === null) return r.err;
+  if (r.code === null) return "git did not finish (it timed out or could not run)";
+  if (
+    /Failed to connect|Could not resolve (host|proxy)|Couldn't resolve|Couldn't connect|Connection (reset|refused|timed out)|timed out|Operation timed out|SSL|TLS|certificate|gnutls|schannel|Empty reply from server|(Recv|Send) failure|Network is unreachable|No route to host/i.test(
+      r.err,
+    )
+  ) {
+    return "cannot reach GitHub (network, DNS or TLS)";
+  }
   if (/Authentication failed|could not read Username|terminal prompts disabled|returned error: 40[13]|Permission to .* denied|Write access to repository not granted/i.test(r.err)) {
     return `authentication or permission refused (${GITHUB_TOKEN_ENV} must be valid, with Contents read and write on this repository)`;
   }
@@ -212,5 +257,7 @@ function failureReason(r: GitResult, ref: string): string {
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l !== "" && !l.startsWith("hint:") && !l.startsWith("To "));
-  return (lines.slice(-2).join(" / ") || `exit ${r.code}`).slice(0, 300);
+  return (lines.slice(-2).join(" / ") || `exit ${r.code}`)
+    .replace(/\d+(?:\.\d+)?\s*(ms|milliseconds?|s|sec|seconds?|bytes?|[KMG]i?B|%)(?![A-Za-z])/g, "N $1")
+    .slice(0, 300);
 }

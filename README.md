@@ -314,8 +314,11 @@ coordinator serves on without pushing.
   costs nothing.
 - How it reaches git: through the environment only (`GIT_CONFIG_COUNT`,
   `GIT_CONFIG_KEY_n`, `GIT_CONFIG_VALUE_n`: an `Authorization` header scoped
-  by `http.https://github.com/.extraheader`, credential helpers off, no
-  prompts, tracing off), never in a URL, an argument list or a log line.
+  by `http.https://github.com/.extraheader`, redirects off and TLS
+  verification on for github.com, credential helpers off, the system and
+  global git config not read, no prompts, tracing and `GIT_SSL_NO_VERIFY`
+  dropped), never in a URL, an argument list or a log line. A target URL
+  that carries credentials or a query is reported as such, never echoed.
 - The blast radius: the coordinator now holds a write credential. Anyone who
   controls its process or reads its environment (the Render dashboard and
   shell, a compromised dependency of this code) can push anything the token
