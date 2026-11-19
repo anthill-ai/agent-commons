@@ -84,6 +84,7 @@ import {
   verifyAgent,
   verifyAgentRevoke,
 } from "./anthill";
+import { GIT_PATH_PREFIX, gitServer, type GitServeOptions } from "./gitHost";
 import { entryMessage, Ledger, LedgerError, type LedgerState, reviewCommitsClosedBy, type Signer, submissionDead } from "./ledger";
 import { commitDeadlineMs } from "./plants";
 import { isSolo, SOLO_NOTICE } from "./rules";
@@ -326,6 +327,10 @@ export type CoordinatorServerOptions = {
   // answers at <basePath>/api/..., the fallback gets the paths below it, and
   // requests outside it are 404s.
   basePath?: string;
+  // The coordinator's clone, served read-only at <basePath>/api/git (gitHost.ts:
+  // only `refs` are advertised; nothing can be pushed), so agents can fetch
+  // the dev that merges land on. Absent: /api/git is a 404.
+  git?: GitServeOptions;
 };
 
 export type CoordinatorServer = http.Server & { store: LedgerStore };
@@ -372,7 +377,7 @@ export function createCoordinatorServer(opts: CoordinatorServerOptions): Coordin
   const ipRate = bucket(limits.ipRatePerMinute, 60_000);
   const anthillRate = bucket(limits.anthillRatePerMinute, 60_000);
 
-  const ctx: Ctx = { opts, limits, policy, store, ownerRate, ownerBytes, anthillRate };
+  const ctx: Ctx = { opts, limits, policy, store, ownerRate, ownerBytes, anthillRate, ...(opts.git ? { git: gitServer(opts.git) } : {}) };
   const trusted = proxyMatcher(opts.trustedProxies ?? []);
   let inFlight = 0;
   const perIp = new Map<string, number>();
@@ -562,6 +567,7 @@ type Ctx = {
   ownerRate: { has(key: string, cost: number): boolean; take(key: string, cost?: number): boolean };
   ownerBytes: { has(key: string, cost: number): boolean; take(key: string, cost?: number): boolean };
   anthillRate: { has(key: string, cost: number): boolean; take(key: string, cost?: number): boolean };
+  git?: (req: http.IncomingMessage, res: http.ServerResponse) => void;
 };
 
 class HttpError extends Error {
@@ -598,6 +604,11 @@ async function handle(ctx: Ctx, req: http.IncomingMessage, res: http.ServerRespo
   const url = new URL(req.url ?? "/", "http://localhost");
   const method = req.method ?? "GET";
   const p = url.pathname;
+  if (p === GIT_PATH_PREFIX || p.startsWith(`${GIT_PATH_PREFIX}/`)) {
+    if (ctx.git) return ctx.git(req, res);
+    req.resume();
+    return send(res, 404, { error: "not-found", message: "this coordinator does not serve its clone over git" });
+  }
   try {
     if (method === "GET" && p === "/api/head") return send(res, 200, headReply(ctx));
     if (method === "POST" && p === "/api/entries") return send(res, 201, await postEntry(ctx, req));

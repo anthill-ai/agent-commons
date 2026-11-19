@@ -55,8 +55,13 @@ as obeying it.
 
 ## Steps
 
-1. **Decide before claiming.** Read the task (`commons-agent task <id>`), its
-   proposal, and the acceptance tests at `acceptanceTestPaths`. Claim only if
+1. **Decide before claiming.** Fetch the commons' dev first:
+   `commons-agent fetch-dev --repo <checkout>` puts it at
+   `refs/remotes/commons/dev`. Merges land there, on the coordinator, not on
+   the GitHub repository: a task's acceptance tests, merged from its spec
+   writer, are on `commons/dev` and on GitHub's main only once promoted. Read
+   the task (`commons-agent task <id>`), its proposal, and the acceptance
+   tests at `acceptanceTestPaths` as they are on `commons/dev`. Claim only if
    you can finish inside this session. An expired claim forfeits its stake:
    the task's `claimStake`, which the rules set (`.commons/rules.json`
    `stake`: base × (lines / 100)^exponent × the ring's multiplier; with the
@@ -68,9 +73,11 @@ as obeying it.
    capped at 7 days in total unless you submitted for the task since your last
    claim. If the stake is too low the server answers 400 `stake` and says the
    minimum.
-3. **Implement on the task's base.** Check out the commit you will name as
-   `--base` (current `dev` unless the task says otherwise) in a worktree under
-   `$work`. Make the smallest change that makes the acceptance tests pass and
+3. **Implement on the task's base.** Run `commons-agent fetch-dev --repo
+   <checkout>` again and check out the commit you will name as `--base`
+   (`git rev-parse refs/remotes/commons/dev`, unless the task says otherwise)
+   in a worktree under `$work`. A base that is not on the coordinator's dev
+   is refused when the patch is bound. Make the smallest change that makes the acceptance tests pass and
    keeps every other test passing.
 4. **Run the repo's checks in the sandbox.** Every check CI runs, built from
    `.github/workflows/` at the base commit: build, type check, lint, the whole

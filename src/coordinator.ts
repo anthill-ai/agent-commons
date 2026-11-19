@@ -127,9 +127,18 @@ export const MERGE_GATE = "merge";
 // ended below quorum (the ledger takes no second assignment). With one owner
 // and one seat there is no slack, and such a submission would hold the
 // owner's PR slot for good. The failed gate makes it dead, as MERGE_GATE
-// does; the author resubmits and gets a fresh draw. Other ledgers keep
-// waiting, as they always did.
+// does; the author resubmits and gets a fresh draw. Also, under
+// humanMergeApproval "unlessFlagged", a submission a revealed review flagged
+// that no mergeApproval reached within SOLO_FLAG_GRACE_HOURS (soloFlagged):
+// on a hosted solo commons nobody can sign one (the author's own owner may
+// not, and the admin key is on the service's disk), and two such submissions
+// would leave the one owner with no PR slot. Other ledgers keep waiting, as
+// they always did.
 export const REVIEW_GATE = "review";
+
+// How long a flagged solo submission waits for a mergeApproval, from the
+// first flagging reveal, before it is closed with a failed REVIEW_GATE.
+export const SOLO_FLAG_GRACE_HOURS = 1;
 
 // What a bridge throws when the head does not merge cleanly onto dev (and
 // only then: any other error is retried on the next pass).
@@ -199,7 +208,8 @@ export type Action =
   // the ledger (reviewWindowClosed), which closes the window for plants.ts, so
   // the merge waits a plant-reveal grace after it. `missing` never revealed.
   | { kind: "closeReviewWindow"; submissionId: string; missing: KeyId[] }
-  // Solo only: a failed REVIEW_GATE for a submission no review can reach.
+  // Solo only: a failed REVIEW_GATE for a submission no review can reach, or
+  // one a reviewer flagged that no mergeApproval reached in time.
   | { kind: "closeUnreviewable"; submissionId: string; reason: string }
   | { kind: "merge"; submissionId: string }
   | { kind: "snapshot"; id: string; commit: CommitSha; previousSnapshotId: string | null; submissionIds: string[] }
@@ -247,6 +257,9 @@ export type PlanOptions = {
   // Ledger entries, to time the review window from the assignment entry.
   // Without them the window never counts as closed (fail closed).
   entries?: readonly LedgerEntry[];
+  // Solo only: hours a flagged submission waits for a mergeApproval before it
+  // is closed (soloFlagged). Default SOLO_FLAG_GRACE_HOURS.
+  soloFlagGraceHours?: number;
   // Tasks an operator approved; appended as coordinator task entries once.
   approvedTasks?: readonly TaskBody[];
   // Decoy hits observed outside the ledger; appended once each.
@@ -280,6 +293,45 @@ export function soloUnreviewable(state: CommonsState, submissionId: string, nowI
   if (committed >= quorum) return null;
   if (Date.parse(nowIso) < commitDeadlineMs(state.rules, s.assignment.at)) return null;
   return `solo: review quorum can never be met: ${committed} of ${quorum} assigned reviewers committed before the commit phase ended (the ledger takes no second assignment); resubmit for a fresh draw`;
+}
+
+// Solo only (REVIEW_GATE), under humanMergeApproval "unlessFlagged": why a
+// flagged submission is closed, or null. Once a revealed review says p >=
+// CATCH_THRESHOLD, only a mergeApproval can merge it, which the author's own
+// owner may not sign. If none came within the grace after the first flagging
+// reveal, it is closed so its PR slot and stakes come back; the author fixes
+// what the review said and resubmits. The reveal's time comes from the
+// entries: without them nothing is closed (fail closed).
+export function soloFlagged(
+  state: CommonsState,
+  submissionId: string,
+  nowIso: string,
+  opts: Pick<PlanOptions, "entries" | "soloFlagGraceHours">,
+): string | null {
+  const s = state.submissions.get(submissionId);
+  if (!s || s.merged || s.approval || !isSolo(state.rules) || state.rules.humanMergeApproval !== "unlessFlagged") return null;
+  const flags = s.reviews.filter((r) => r.verdict !== undefined && r.verdict.defectProbability >= CATCH_THRESHOLD && r.revealedSeq !== undefined);
+  if (flags.length === 0) return null;
+  const first = Math.min(...flags.map((r) => r.revealedSeq as number));
+  const entry = opts.entries?.[first];
+  if (!entry || entry.seq !== first) return null;
+  const hours = opts.soloFlagGraceHours ?? SOLO_FLAG_GRACE_HOURS;
+  if (Date.parse(nowIso) < Date.parse(entry.at) + hours * HOUR) return null;
+  const p = Math.max(...flags.map((r) => r.verdict?.defectProbability ?? 0));
+  return (
+    `solo: a reviewer flagged a defect (p ${p} >= ${CATCH_THRESHOLD}) and no mergeApproval came within ${hours}h of the reveal ` +
+    `(the author's own owner cannot sign one); closed so its PR slot comes back: fix what the review says and resubmit`
+  );
+}
+
+// Solo only: why the submission is closed with a failed REVIEW_GATE, or null.
+export function soloClosure(
+  state: CommonsState,
+  submissionId: string,
+  nowIso: string,
+  opts: Pick<PlanOptions, "reviewQuorum" | "entries" | "soloFlagGraceHours">,
+): string | null {
+  return soloUnreviewable(state, submissionId, nowIso, opts) ?? soloFlagged(state, submissionId, nowIso, opts);
 }
 
 // Why a submission can or cannot merge now. `waiting` lists every unmet rule.
@@ -632,7 +684,7 @@ export function planActions(state: CommonsState, nowIso: string, opts: PlanOptio
       actions.push({ kind: "assignReviewers", submissionId: s.id });
       continue;
     }
-    const stuck = soloUnreviewable(state, s.id, nowIso, opts);
+    const stuck = soloClosure(state, s.id, nowIso, opts);
     if (stuck !== null) {
       actions.push({ kind: "closeUnreviewable", submissionId: s.id, reason: stuck });
       continue;
@@ -975,8 +1027,8 @@ async function execute(action: Action, deps: ExecuteDeps, append: Append): Promi
     case "closeUnreviewable": {
       let reason = action.reason;
       await append((state) => {
-        const now = soloUnreviewable(state, action.submissionId, deps.recheck.clock(), deps.recheck.opts);
-        if (now === null) fail("the submission's review can still reach quorum");
+        const now = soloClosure(state, action.submissionId, deps.recheck.clock(), deps.recheck.opts);
+        if (now === null) fail("the submission can still merge (its review can reach quorum, or no unapproved flag is past its grace)");
         reason = now;
         return { kind: "gateResult", submissionId: action.submissionId, gate: REVIEW_GATE, pass: false, details: gateDetails(now) };
       });

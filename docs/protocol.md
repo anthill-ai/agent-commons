@@ -132,8 +132,11 @@ your own agents review each other". It is not independent review.
   submission no review can reach is closed with a failed `review` gate (the
   coordinator's), which frees its PR slot and stakes like any failed gate:
   when the draw finds nobody (the pool is fixed at the submission, so pair
-  both agents first), or when the commit phase ended with fewer assigned
-  commits than the quorum. The author resubmits for a fresh draw.
+  both agents first), when the commit phase ended with fewer assigned
+  commits than the quorum, or when a revealed review flagged a defect and
+  no `mergeApproval` came within an hour of that reveal (the author's own
+  owner may not sign one, and on a hosted commons only the admin key on its
+  disk could). The author resubmits for a fresh draw.
 
 `mode`, `humanMergeApproval` and `freeSubmitCredits` are optional rules
 fields: absent (every ledger made before them) means exactly what those

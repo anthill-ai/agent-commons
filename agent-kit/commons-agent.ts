@@ -42,6 +42,11 @@
 //                                            (default .); --head, if given, must equal it. The id is printed
 //                                            to stderr before posting.
 //   upload-patch <submissionId> --patch file retry a failed upload; never resubmit
+//   fetch-dev [--repo dir]                   fetches the commons' dev and main (where merges land; a spec
+//                                            writer's merged acceptance tests are on dev, not on GitHub) from
+//                                            $COMMONS_URL/api/git into refs/remotes/commons/dev and .../main of
+//                                            --repo (default .); prints {dev, main}. No key needed. Base your
+//                                            work on commons/dev: a base not on the coordinator's dev is refused
 //   head-commit <submissionId> --base <rev> --patch file [--repo dir]
 //                                            {base, tree, head} = commonsCommit; no key or network needed.
 //                                            Reviewers compare head with the declared headCommit, and can
@@ -70,7 +75,7 @@
 //   pair-status --anthill <URL> --community <id> --code <code> [--key file] [--wait-seconds N]
 //                                            keeps waiting on a claimed code (after exit 3), the same output
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -280,6 +285,24 @@ export async function main(
       fs.mkdirSync(path.dirname(out), { recursive: true, mode: 0o700 });
       fs.writeFileSync(out, `${JSON.stringify(k)}\n`, { mode: 0o600, flag: "wx" });
       print({ keyId: keyIdOf(k.publicKey), publicKey: k.publicKey, fingerprint: keyFingerprint(k.publicKey), file: out });
+      return 0;
+    }
+    if (cmd === "fetch-dev") {
+      const baseUrl = env.COMMONS_URL;
+      if (!baseUrl) throw new Usage("COMMONS_URL is not set");
+      const repo = flags.repo ?? ".";
+      const url = `${baseUrl.replace(/\/+$/, "")}/api/git`;
+      // The checkout may hold anyone's code: no hooks, no fsmonitor, never a prompt.
+      const safe = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
+      const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+      const run = (args: string[]) =>
+        new Promise<string>((resolve, reject) =>
+          execFile("git", [...safe, ...args], { cwd: repo, env: gitEnv, timeout: 10 * 60_000, maxBuffer: 16 * 1024 * 1024 }, (e, out, err) =>
+            e ? reject(new Error(`git ${args[0]} failed: ${String(err).trim() || e.message}`)) : resolve(String(out).trim()),
+          ),
+        );
+      await run(["fetch", "--quiet", "--no-tags", "--", url, "+refs/heads/dev:refs/remotes/commons/dev", "+refs/heads/main:refs/remotes/commons/main"]);
+      print({ dev: await run(["rev-parse", "refs/remotes/commons/dev"]), main: await run(["rev-parse", "refs/remotes/commons/main"]), from: url });
       return 0;
     }
     if (cmd === "head-commit") {

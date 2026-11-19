@@ -81,6 +81,7 @@ import {
 import { canonical, generateKeyPair, isValidPublicKey, keyIdOf, randomSalt, sha256hex } from "./crypto";
 import { HARNESS_DIR_PREFIX, minimalEnv, reproduceFinding } from "./findings";
 import { normaliseBasePath } from "./basePath";
+import { followUpstream } from "./gitHost";
 import { HOST_SETTINGS, hostLayout, missingForServe, readHostSettings, settingName, SetupError, setUp } from "./host";
 import { applyUnifiedDiff, checkRepoPath, FULL_SHA, parsePatch } from "./github";
 import {
@@ -99,7 +100,7 @@ import {
 import { plantCommitment, reviewWindowClosed } from "./plants";
 import { commitmentFor } from "./review";
 import { ringOf } from "./gates/rings";
-import { claimStake, defaultRules, isPresetName, isSolo, PRESETS, SOLO_NOTICE, validateRules } from "./rules";
+import { claimStake, defaultRules, isPresetName, isSolo, PRESETS, SOLO_NOTICE, soloRules, validateRules } from "./rules";
 import { createCoordinatorServer, findingTestFile, LedgerStore, patchFile, proxyMatcher, SAFE_ID, type SubmitPolicy, summarisePatch } from "./server";
 import type {
   CommonsState,
@@ -1342,7 +1343,7 @@ const noBridge: GithubBridge = {
 // bound head (refused on conflicts); fastForwardMain() moves `mainRef`, only
 // forward. Both are idempotent: a head already on dev returns dev's tip, a main
 // already at or past the commit is left alone. The operator pushes dev and
-// main from this clone. Refs move with compare-and-swap (update-ref old new),
+// main from this clone, or agents fetch them from it (serve --serve-git). Refs move with compare-and-swap (update-ref old new),
 // so a concurrent writer makes the call fail instead of losing a commit.
 export function localGitBridge(repo: string, devRef: string = DEFAULT_DEV_REF, mainRef = "refs/heads/main"): GithubBridge {
   const g = (args: string[], env: Record<string, string> = {}) => rawGit(repo, args, { env }).toString("utf8").trim();
@@ -1447,6 +1448,10 @@ const COORDINATOR_FLAGS: Record<string, FlagSpec> = {
   "main-ref": { type: "string", help: "the main branch in --repo (default refs/heads/main)" },
   patches: { type: "string", help: "patches and finding tests directory (default <ledger dir>/patches)" },
   "approved-tasks": { type: "string", help: "JSON file of task bodies the operator approved, re-read every pass; each is appended once" },
+  "follow-upstream": {
+    type: "boolean",
+    help: "each pass first fetches --repo's origin main and brings it into dev (a fast-forward, else a merge commit; a conflict leaves dev alone), so commits pushed upstream after setup are valid bases",
+  },
   "timeout-ms": { type: "string", help: "per finding-test run (default the harness's)" },
   "snapshot-every": { type: "string", help: "merged submissions that trigger a snapshot (default: never)" },
   "anthill-url": { type: "string", help: "on a ledger linked to Anthill: its backend URL; each pass first pins its tree if it changed" },
@@ -1673,6 +1678,9 @@ function patchesDir(ctx: Ctx): string {
 // every 30 seconds it would fill the log with the line.
 const IDLE_LINE_EVERY_MS = 10 * 60_000;
 
+// The last upstream problem said for each clone (coordinatorPass).
+const upstreamSaid = new Map<string, string>();
+
 // idleLine: what a pass that did nothing prints, null for nothing (run-once
 // always says "nothing to do").
 async function coordinatorPass(ctx: Ctx, store: LedgerStore, idleLine: () => string | null = () => "nothing to do"): Promise<number> {
@@ -1690,6 +1698,20 @@ async function coordinatorPass(ctx: Ctx, store: LedgerStore, idleLine: () => str
   const repo = str(f, "repo") === undefined ? null : resolvePath(ctx, req(f, "repo"));
   const rule = mergeRule(ctx);
   const devRef = devRefOf(ctx);
+  if (bool(f, "follow-upstream")) {
+    if (repo === null) usage("--follow-upstream needs --repo");
+    // A failure or a conflict leaves dev as it is; the pass goes on. Each
+    // distinct problem is said once, not every pass.
+    const up = await followUpstream(repo, devRef);
+    if (up.kind === "fastForward" || up.kind === "merged") {
+      upstreamSaid.delete(repo);
+      ctx.out(`upstream: ${up.kind === "merged" ? "merged" : "fast-forwarded"} origin's main ${up.upstream.slice(0, 12)} into dev (now ${up.dev.slice(0, 12)})`);
+    } else if (up.kind === "conflict" || up.kind === "error") {
+      const line = up.kind === "conflict" ? `${up.detail}; dev stays where it is until upstream merges cleanly` : up.detail;
+      if (upstreamSaid.get(repo) !== line) ctx.io.stderr(`upstream: ${line}\n`);
+      upstreamSaid.set(repo, line);
+    } else upstreamSaid.delete(repo);
+  }
   const snapshotEvery = int(f, "snapshot-every", { min: 1 });
   const dir = patchesDir(ctx);
   const tasksFile = str(f, "approved-tasks") === undefined ? null : resolvePath(ctx, req(f, "approved-tasks"));
@@ -2880,6 +2902,10 @@ const COMMANDS: Record<string, Command> = {
         type: "string",
         help: "serve under this path behind a reverse proxy that forwards the full path, e.g. /commons/builders: the API at <path>/api/..., the playground and its links at <path>/",
       },
+      "serve-git": {
+        type: "boolean",
+        help: "with --coordinator and --repo: serve dev and main (only those) read-only over git's smart HTTP at <base path>/api/git, so agents fetch the dev merges land on",
+      },
     },
     async (ctx) => {
       const f = ctx.flags;
@@ -2895,6 +2921,7 @@ const COMMANDS: Record<string, Command> = {
       const onePort = bool(f, "one-port");
       if (onePort && !bool(f, "coordinator")) usage("--one-port needs --coordinator: without it the playground already has the port to itself");
       if (onePort && str(f, "api-port") !== undefined) usage("--one-port serves the API on --port; drop --api-port");
+      if (bool(f, "serve-git") && (!bool(f, "coordinator") || str(f, "repo") === undefined)) usage("--serve-git needs --coordinator and --repo");
       try {
         proxyMatcher(list(f, "trusted-proxy"));
       } catch (e) {
@@ -2920,6 +2947,7 @@ const COMMANDS: Record<string, Command> = {
           policy: ctx.io.load("incentives") as SubmitPolicy,
           trustedProxies: list(f, "trusted-proxy"),
           basePath,
+          ...(bool(f, "serve-git") ? { git: { repo: resolvePath(ctx, req(f, "repo")), refs: [devRefOf(ctx), str(f, "main-ref") ?? "refs/heads/main"] } } : {}),
           // One port: whatever the API does not answer is the playground's.
           // /api/entries is the API's (the same contract); the site's other
           // pages and /api/state, /api/metrics pass through, under the API's
@@ -2989,6 +3017,10 @@ const COMMANDS: Record<string, Command> = {
       "public-url": { type: "string", help: "the coordinator's public URL, for the COMMONS_SITES line setup prints (env COMMONS_PUBLIC_URL; default RENDER_EXTERNAL_URL + base path)" },
       "trusted-proxy": { type: "list", help: "as serve --trusted-proxy (loopback for a parent process proxying on this machine)" },
       embedded: { type: "boolean", help: "run by a parent that proxies it and lists its site itself (Anthill's backend): setup prints no COMMONS_SITES line (env COMMONS_EMBEDDED=1)" },
+      "follow-upstream": {
+        type: "string",
+        help: "1 (default): every pass fetches the target's main and brings it into dev, so commits pushed upstream after setup are valid bases; 0: dev moves only by merges (env COMMONS_FOLLOW_UPSTREAM)",
+      },
       "loop-seconds": { type: "string", help: "a coordinator pass this often (default 30)" },
       "setup-retry-seconds": { type: "string", help: "first wait before retrying a setup step that may succeed later (network, Anthill, git host); doubles up to 600 (default 60)" },
       "hold-on-failure": { type: "boolean", help: "if setup or serve cannot start, keep answering 503 on the port instead of exiting (a service with no other way in than its shell)" },
@@ -3159,16 +3191,26 @@ const COMMANDS: Record<string, Command> = {
             writeRulesPresetMarker(layout.rulesPresetMarker, { preset: rulesPreset, kernelSigners: signerIds, seq, hash: ledger.entries()[seq]?.hash ?? "" });
           }
         }
-      } else if (!fresh && pick("preset") !== undefined) {
-        // COMMONS_PRESET is read at setup only: say so when it no longer matches.
-        let solo: boolean | null = null;
+      } else if (!fresh) {
+        let rules: Rules | null = null;
         try {
-          solo = isSolo(Ledger.open(layout.ledger).state().rules);
+          rules = Ledger.open(layout.ledger).state().rules;
         } catch {
           // serve reports a ledger it cannot read
         }
-        if (solo !== null && solo !== (pick("preset")?.trim() === "solo")) {
-          say(`note: ${settingName("preset")} is read at setup only; this ledger's rules are ${solo ? "solo" : "not solo"}. To switch them set ${settingName("rulesPreset")}`);
+        // COMMONS_PRESET is read at setup only: say so when it no longer matches.
+        if (rules !== null && pick("preset") !== undefined && isSolo(rules) !== (pick("preset")?.trim() === "solo")) {
+          say(`note: ${settingName("preset")} is read at setup only; this ledger's rules are ${isSolo(rules) ? "solo" : "not solo"}. To switch them set ${settingName("rulesPreset")}`);
+        }
+        // Rules are frozen in the ledger: a solo ledger set up by an older
+        // commons keeps that commons' solo preset (a 24-hour soak, say) until
+        // an admin applies the current one.
+        const stale = rules === null ? [] : staleSoloFields(rules);
+        if (stale.length > 0) {
+          say(
+            `note: this ledger's solo rules are an older solo preset (${stale.join("; ")}); rules are frozen in the ledger, so they stay until ` +
+              `${settingName("rulesPreset")} is set to solo once and the service restarted (an admin-signed rulesChange with keys/admin.json)`,
+          );
         }
       }
 
@@ -3195,6 +3237,16 @@ const COMMANDS: Record<string, Command> = {
           // serve reports a ledger it cannot read
         }
       }
+      const followSetting = pick("followUpstream")?.trim() ?? "1";
+      if (followSetting !== "0" && followSetting !== "1") {
+        say(`cannot serve: ${settingName("followUpstream")} must be 0 or 1, not ${JSON.stringify(followSetting.slice(0, 20))}`);
+        return fail("This commons cannot start; the operator has the details in the logs.");
+      }
+      const follow = followSetting === "1";
+      say(
+        `git: dev and main are served read-only at ${basePath}/api/git (git fetch <this site>/api/git dev); ` +
+          (follow ? "every pass brings the target's upstream main into dev" : `dev moves only by merges (${settingName("followUpstream")} 0)`),
+      );
       say(`snapshots: ${snapshotEvery === null ? "never (nothing is promoted; set " + settingName("snapshotEvery") + ")" : `every ${snapshotEvery} merged submission${snapshotEvery === 1 ? "" : "s"}`}; approved tasks: ${layout.approvedTasks}${fs.existsSync(layout.approvedTasks) ? "" : " (absent: none)"}`);
       const serveArgv = [
         "serve",
@@ -3208,6 +3260,8 @@ const COMMANDS: Record<string, Command> = {
         "--repo", layout.target,
         "--patches", layout.patches,
         "--approved-tasks", layout.approvedTasks,
+        "--serve-git",
+        ...(follow ? ["--follow-upstream"] : []),
         ...(snapshotEvery === null ? [] : ["--snapshot-every", String(snapshotEvery)]),
         ...(basePath === "" ? [] : ["--base-path", basePath]),
         ...list(f, "trusted-proxy").flatMap((p) => ["--trusted-proxy", p]),
@@ -3222,7 +3276,7 @@ const COMMANDS: Record<string, Command> = {
   ),
 
   "coordinator run-once": command(
-    "one coordinator pass: settle, reproduce findings, bind patches, gate, assign, merge, snapshot, promote (git fetch --repo first)",
+    "one coordinator pass: settle, reproduce findings, bind patches, gate, assign, merge, snapshot, promote (with --follow-upstream, first bring --repo's origin main into dev)",
     COORDINATOR_FLAGS,
     (ctx) => {
       const store = openStore(ctx, () => ctx.io.now().toISOString());
@@ -3230,6 +3284,25 @@ const COMMANDS: Record<string, Command> = {
     },
   ),
 };
+
+// On a solo ledger: how its rules differ from the current solo preset applied
+// to them (what `rules set --preset solo` would change), one "field now,
+// preset" item each; empty when they are the preset, or not solo.
+export function staleSoloFields(rules: Rules): string[] {
+  if (!isSolo(rules)) return [];
+  const want = soloRules(rules);
+  const out: string[] = [];
+  const walk = (a: unknown, b: unknown, at: string) => {
+    if (canonical(a ?? null) === canonical(b ?? null)) return;
+    if (typeof a === "object" && a !== null && !Array.isArray(a) && typeof b === "object" && b !== null && !Array.isArray(b)) {
+      for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) walk((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k], at === "" ? k : `${at}.${k}`);
+      return;
+    }
+    out.push(`${at} ${JSON.stringify(a ?? null)}, the preset ${JSON.stringify(b ?? null)}`);
+  };
+  walk({ ...rules, version: 0 }, { ...want, version: 0 }, "");
+  return out;
+}
 
 // <data>/rules-preset.json: the COMMONS_RULES_PRESET value commons host last
 // applied (or found already in force), its kernel signers, and the last

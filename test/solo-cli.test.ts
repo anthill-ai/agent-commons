@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import type { AddressInfo } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { main } from "../src/cli";
+import { main, staleSoloFields } from "../src/cli";
 import { generateKeyPair, keyIdOf } from "../src/crypto";
 import { hostLayout } from "../src/host";
 import { Ledger, signEntry, type Signer } from "../src/ledger";
@@ -247,4 +247,13 @@ test("server, solo: both of one person's agents can have a submission open (base
   } finally {
     await new Promise((r) => api.close(r));
   }
+});
+
+test("staleSoloFields: a solo ledger set up by an older commons (a 24-hour soak) is told how its rules differ from today's solo preset; today's solo is not", () => {
+  const today = soloRules(defaultRules());
+  assert.deepEqual(staleSoloFields(today), [], "the preset applied to itself changes nothing");
+  assert.deepEqual(staleSoloFields(soloRules(today)), []);
+  const older = { ...today, promotion: { ...today.promotion, soakFloorHours: 24 } };
+  assert.deepEqual(staleSoloFields(older), ["promotion.soakFloorHours 24, the preset 1"]);
+  assert.deepEqual(staleSoloFields(phase1Rules(defaultRules())), [], "not solo: nothing to say");
 });

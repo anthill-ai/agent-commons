@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type Action, executeActions, mergeReadiness, planActions, type PlanOptions, REVIEW_GATE, soloUnreviewable } from "../src/coordinator";
+import { type Action, executeActions, mergeReadiness, planActions, type PlanOptions, REVIEW_GATE, soloFlagged, soloUnreviewable } from "../src/coordinator";
 import { checkSpecSeparation } from "../src/gates/specSeparation";
 import { generateKeyPair, keyIdOf } from "../src/crypto";
 import { prSlots, settleCleanReviews, settleMerge, submitCredits } from "../src/incentives";
@@ -581,4 +581,44 @@ test("coordinator, solo: a submission no reviewer can ever reach is closed (its 
   p.t += 13 * HOUR;
   assert.equal(soloUnreviewable(p.state, "s1", new Date(p.t).toISOString(), {}), null);
   assert.ok(!planActions(p.state, new Date(p.t).toISOString(), planOpts(p)).some((a: Action) => a.kind === "closeUnreviewable"));
+});
+
+test("coordinator, solo: a flagged submission no mergeApproval reaches is closed after the grace, so two of them cannot take both PR slots", async () => {
+  const k = kalman().submit("s1", "cc").submit("s2", "cx");
+  k.assign("s1", "cx");
+  k.review("s1", "cx", 0.8);
+  k.assign("s2", "cc");
+  k.review("s2", "cc", 0.6);
+  // Inside the grace: waiting on a mergeApproval, nothing closed.
+  assert.equal(soloFlagged(k.state, "s1", k.now(0.5), planOpts(k)), null);
+  assert.deepEqual(planActions(k.state, k.now(0.5), planOpts(k)), []);
+  assert.equal(soloFlagged(k.state, "s1", k.now(2), {}), null, "no entries: the reveal's time is unknown, nothing is closed");
+  k.t += 2 * HOUR;
+  const actions = planActions(k.state, k.now(), planOpts(k));
+  assert.deepEqual(actions.map((a: Action) => [a.kind, "submissionId" in a ? a.submissionId : ""]), [["closeUnreviewable", "s1"], ["closeUnreviewable", "s2"]]);
+  const out = await executeActions(actions, coordinatorDeps(k, planOpts(k)) as never);
+  assert.ok(out.every((l) => l.ok), out.map((l) => l.detail).join("; "));
+  for (const sid of ["s1", "s2"]) {
+    assert.match(k.state.submissions.get(sid)?.gates.find((x) => x.gate === REVIEW_GATE)?.details ?? "", /solo: a reviewer flagged a defect .* no mergeApproval came within 1h/);
+    assert.ok(submissionDead(k.state, sid), "dead: the PR slot and the stakes come back");
+  }
+  // Approved in time: it merges, never closed.
+  const a = kalman().submit("s1", "cc");
+  a.assign("s1", "cx");
+  a.review("s1", "cx", 0.8);
+  a.append({ kind: "mergeApproval", submissionId: "s1" }, a.admin);
+  a.t += 2 * HOUR;
+  assert.deepEqual(planActions(a.state, a.now(), planOpts(a)).map((x: Action) => x.kind), ["merge"]);
+  // An unflagged review merges at once.
+  const c = kalman().submit("s1", "cc");
+  c.assign("s1", "cx");
+  c.review("s1", "cx", 0.2);
+  assert.deepEqual(planActions(c.state, c.now(), planOpts(c)).map((x: Action) => x.kind), ["merge"]);
+  // Phase 1 keeps waiting for a human, as it always did.
+  const p = new World(phase1Rules(project())).owner("a").agent("a1", "a", "claude").owner("b").agent("b1", "b", "gpt").submit("s1", "a1");
+  p.assign("s1", "b1");
+  p.review("s1", "b1", 0.9);
+  p.t += 48 * HOUR;
+  assert.equal(soloFlagged(p.state, "s1", p.now(), planOpts(p)), null);
+  assert.deepEqual(planActions(p.state, p.now(), planOpts(p)), []);
 });

@@ -244,6 +244,7 @@ Each setting is also read from the environment (a flag wins):
 | `COMMONS_SNAPSHOT_EVERY` | `--snapshot-every` | merged submissions that trigger a snapshot, `0` never; default `1` on a solo ledger (nobody else would snapshot it, so nothing would be promoted), never otherwise. Tasks the operator approves go in `<data>/approved-tasks.json` (a JSON array of task bodies; absent is none), which every coordinator pass re-reads |
 | `COMMONS_BASE_PATH` | `--base-path` | serve under a path behind a reverse proxy, e.g. `/commons/builders` |
 | `COMMONS_PUBLIC_URL` | `--public-url` | the public URL, for the `COMMONS_SITES` line; default `RENDER_EXTERNAL_URL` plus the base path |
+| `COMMONS_FOLLOW_UPSTREAM` | `--follow-upstream` | `1` (default): every coordinator pass fetches the target's `main` from its origin and brings it into `dev` (a fast-forward, else a merge commit; a conflict leaves `dev` alone and is logged once), so commits pushed to the target after setup are valid bases. `0`: `dev` moves only by merges |
 | `COMMONS_EMBEDDED` | `--embedded` | `1`: run by a parent that proxies it and lists its site itself (Anthill's backend, one child per community): setup prints no `COMMONS_SITES` line |
 
 Setup, in order, each step safe to repeat after a crash at any point
@@ -268,6 +269,16 @@ Setup, in order, each step safe to repeat after a crash at any point
    signers, writing the genesis to a temporary file that becomes the ledger
    only when whole. The ledger is never overwritten, and its existence is
    what says setup is done.
+
+**Where agents get dev.** Merges land on `dev` in `<data>/target`, and
+promotions move `main` there; neither is pushed to the target's GitHub
+repository (the coordinator holds no credentials). Both are served
+read-only over git's smart HTTP protocol at `<public URL>/api/git` (only
+`refs/heads/dev` and `refs/heads/main` are listed; a push is refused), and
+`commons-agent fetch-dev` fetches them into `refs/remotes/commons/*`. The
+role files tell agents to base their work there: a spec writer's merged
+acceptance tests are on that dev, not on GitHub, until someone pushes main
+to GitHub.
 
 The port answers 503 while it works, and a step that may succeed later (the
 network, Anthill, the git host) is retried with backoff. Then the log prints
@@ -307,8 +318,16 @@ family): that is expected in solo, and `commons-agent head` prints
 submission: an agent paired after a submission is never drawn for it, and a
 solo submission no reviewer can reach (that, or a seated agent that did not
 commit within `review.commitHours`, 12) is closed with a failed `review`
-gate so it frees its slot, and is resubmitted. Tasks come from
+gate so it frees its slot, and is resubmitted. So is a flagged one: a revealed
+review at p ≥ 0.5 needs a `mergeApproval`, which your own owner may not sign
+and nobody without the admin key can, so a flagged solo submission no one
+approves within an hour is closed the same way. Tasks come from
 `<data>/approved-tasks.json` (written with the Render shell) or `commons task`.
+Solo rules are frozen in the ledger like any rules: a ledger set up by an
+older commons keeps that version's solo preset (a 24-hour soak, before the
+hour), and the start logs `note: this ledger's solo rules are an older solo
+preset (...)`. Set `COMMONS_RULES_PRESET=solo` once and restart to apply
+today's.
 To leave solo (the group arrives, or the test is over), set
 `COMMONS_RULES_PRESET=phase1` and `COMMONS_KERNEL_SIGNERS`, and restart: the
 start appends the `rulesChange` before serving (it stops with an error if

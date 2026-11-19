@@ -5,7 +5,9 @@
 //   <data>/commons-ledger.jsonl   the ledger
 //   <data>/keys/coord.json        the coordinator key (0600, in a 0700 dir)
 //   <data>/keys/admin.json        the admin key (on the disk by default; README)
-//   <data>/target                 the coordinator's clone, with a dev branch
+//   <data>/target                 the coordinator's clone, with a dev branch (served
+//                                 read-only at <base path>/api/git; every pass brings
+//                                 origin's main into dev: gitHost.ts)
 //   <data>/patches                patches and finding tests
 //
 // Setup runs only while there is no ledger, and every step is safe to repeat
@@ -101,6 +103,11 @@ export const HOST_SETTINGS = {
   // never. Unset: 1 on a solo ledger (nothing else would ever snapshot it,
   // so nothing would be promoted), never otherwise.
   snapshotEvery: { flag: "snapshot-every", env: "COMMONS_SNAPSHOT_EVERY" },
+  // "1" (default): every coordinator pass fetches the target's main from its
+  // origin and brings it into dev (serve --follow-upstream), so commits the
+  // repository's owner pushes after setup are valid bases. "0": dev moves
+  // only by merges.
+  followUpstream: { flag: "follow-upstream", env: "COMMONS_FOLLOW_UPSTREAM" },
 } as const;
 
 export const settingName = (k: keyof typeof HOST_SETTINGS) => `${HOST_SETTINGS[k].env} (--${HOST_SETTINGS[k].flag})`;

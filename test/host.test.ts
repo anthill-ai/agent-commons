@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as net from "node:net";
@@ -505,6 +505,96 @@ test("host: preset solo sets up with no kernel signer and snapshots by default; 
     });
     assert.equal(code, 2);
     assert.match(err, /cannot switch the rules to phase1/);
+  } finally {
+    await anthill.close();
+  }
+});
+
+// Async git: the host under test runs in this process.
+const agit = (cwd: string, ...args: string[]) =>
+  new Promise<{ code: number; out: string; err: string }>((resolve) => {
+    execFile("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd, timeout: 30_000 }, (e, out, err) =>
+      resolve({ code: e ? ((e as { code?: number }).code ?? 1) : 0, out: String(out).trim(), err: String(err) }),
+    );
+  });
+
+test("host: agents fetch dev from <base>/api/git, and a commit pushed upstream after setup reaches dev, so it is a valid base", { timeout: 90_000 }, async () => {
+  const dir = tmp();
+  const anthill = await fakeAnthill();
+  try {
+    const target = bareTarget(dir);
+    const data = path.join(dir, "data");
+    const running = await host(data, anthill.url, target, ["--loop-seconds", "1"], { COMMONS_PRESET: "solo" });
+    try {
+      await until200(running.port, "/commons/builders/api/head", running.err);
+      assert.match(running.err(), /git: dev and main are served read-only at \/commons\/builders\/api\/git/);
+      const url = `http://127.0.0.1:${running.port}/commons/builders/api/git`;
+      const devOf = async () => {
+        const r = await agit(dir, "ls-remote", url, "refs/heads/dev");
+        assert.equal(r.code, 0, r.err + running.err());
+        return r.out.split("\t")[0];
+      };
+      assert.equal(await devOf(), git(path.join(data, "target"), "rev-parse", "dev"));
+      // The repository's owner pushes to the public target after setup.
+      const work = path.join(dir, "work");
+      fs.writeFileSync(path.join(work, "later.md"), "pushed after setup\n");
+      git(work, "add", ".");
+      git(work, "commit", "-q", "-m", "later");
+      git(work, "push", "-q", target.replace(/^file:\/\//, ""), "HEAD:main");
+      const later = git(work, "rev-parse", "HEAD");
+      const end = Date.now() + 30_000;
+      while ((await devOf()) !== later) {
+        assert.ok(Date.now() < end, running.err());
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      // An agent fetches it: the base it names is on the coordinator's dev.
+      const agent = path.join(dir, "agent");
+      assert.equal((await agit(dir, "init", "-q", agent)).code, 0);
+      const fetched = await agit(agent, "fetch", "-q", url, "+refs/heads/dev:refs/remotes/commons/dev");
+      assert.equal(fetched.code, 0, fetched.err);
+      assert.equal((await agit(agent, "rev-parse", "refs/remotes/commons/dev")).out, later);
+      // Nothing can be pushed.
+      const pushed = await agit(agent, "push", url, "refs/remotes/commons/dev:refs/heads/x");
+      assert.notEqual(pushed.code, 0);
+    } finally {
+      assert.equal(await running.stop(), 0);
+    }
+    // A solo ledger set up by an older commons (a 24-hour soak): rules are
+    // frozen, so the start says how to apply today's preset.
+    const ledgerFile = path.join(data, "commons-ledger.jsonl");
+    const admin = JSON.parse(fs.readFileSync(path.join(data, "keys", "admin.json"), "utf8")) as { publicKey: string; privateKey: string };
+    {
+      const ledger = Ledger.open(ledgerFile);
+      const r = ledger.state().rules;
+      assert.equal(r.promotion.soakFloorHours, 1);
+      assert.doesNotMatch(running.err(), /older solo preset/);
+      const older = { ...r, version: r.version + 1, promotion: { ...r.promotion, soakFloorHours: 24 } };
+      ledger.append({ kind: "rulesChange", rules: older, pollId: "older" }, admin, new Date(Date.parse(ledger.entries().at(-1)?.at ?? "") + 1000).toISOString());
+    }
+    // COMMONS_FOLLOW_UPSTREAM 0: dev moves only by merges.
+    const work = path.join(dir, "work");
+    fs.writeFileSync(path.join(work, "again.md"), "x\n");
+    git(work, "add", ".");
+    git(work, "commit", "-q", "-m", "again");
+    git(work, "push", "-q", target.replace(/^file:\/\//, ""), "HEAD:main");
+    const still = await host(data, anthill.url, target, ["--loop-seconds", "1"], { COMMONS_FOLLOW_UPSTREAM: "0" });
+    try {
+      await until200(still.port, "/commons/builders/api/head", still.err);
+      assert.match(still.err(), /dev moves only by merges/);
+      assert.match(still.err(), /older solo preset \(promotion\.soakFloorHours 24, the preset 1\).*COMMONS_RULES_PRESET/);
+      await new Promise((r) => setTimeout(r, 2500));
+      assert.notEqual(git(path.join(data, "target"), "rev-parse", "dev"), git(work, "rev-parse", "HEAD"));
+    } finally {
+      assert.equal(await still.stop(), 0);
+    }
+    const fixed = await host(data, anthill.url, target, [], { COMMONS_RULES_PRESET: "solo" });
+    try {
+      await until200(fixed.port, "/commons/builders/api/head", fixed.err);
+      assert.equal(Ledger.open(ledgerFile).state().rules.promotion.soakFloorHours, 1, fixed.err());
+      assert.doesNotMatch(fixed.err(), /older solo preset/);
+    } finally {
+      assert.equal(await fixed.stop(), 0);
+    }
   } finally {
     await anthill.close();
   }

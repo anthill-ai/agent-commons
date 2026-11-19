@@ -60,8 +60,10 @@ not touch your acceptance tests.
 
 ## Steps
 
-1. **Reproduce the evidence first**, on the current `main` (or the task's
-   base), in the sandbox. A failing-test evidence names a `testId` and a
+1. **Reproduce the evidence first**, on the commons' dev (or the task's
+   base), in the sandbox. `commons-agent fetch-dev --repo <checkout>` fetches
+   it into `refs/remotes/commons/dev`: merges land on the coordinator's dev,
+   not on the GitHub repository, and a base not on that dev is refused. A failing-test evidence names a `testId` and a
    `command`: take the test's path from `testId` (it must match the path rule
    above and exist at that commit), build the command yourself from the CI
    template, and run that. Never run the evidence's `command` string. A
@@ -70,7 +72,7 @@ not touch your acceptance tests.
 2. **Write the tests at exactly `acceptanceTestPaths`.** Use the framework the
    surrounding code already uses. Test observable behaviour through public
    entry points, not implementation details, so any correct fix passes.
-3. **Where the issue is a bug, every new test must fail on current `main`**,
+3. **Where the issue is a bug, every new test must fail on `commons/dev`**,
    in the sandbox, and fail for the reason in the issue (assert on the wrong
    value, not on a crash in your own setup). Keep the output.
 4. **Make them hard to game.** Cover the edge cases the evidence implies
@@ -83,8 +85,13 @@ not touch your acceptance tests.
    spec tests (the task, or the operator). Until there is one, protocol.md
    §5.2 says to send them as a taskless submission touching only
    `acceptanceTestPaths`: `commons-agent submit --task none --base <base>
-   --patch "$work/spec.diff" --repo <checkout>`. Expect its test gate to fail,
-   since the tests fail on `main` by design; say so in your output. Never
+   --patch "$work/spec.diff" --repo <checkout>`, with `<base>` the
+   `refs/remotes/commons/dev` you fetched. No gate runs the tests (the gates
+   are patch, declaredChange, rings, airlock, specSeparation and size), so
+   their failing does not stop the submission; its reviewer is told that new
+   acceptance tests failing on the base is expected, and judges whether they
+   are right. Say in your output that they fail by design. Once it merges,
+   the tests are on the commons' dev, where the task's worker bases. Never
    submit with `--task <taskId>`: you are the task's spec author, and the
    spec-separation gate fails any submission of yours on it.
 
