@@ -63,10 +63,16 @@
 //   tasks from replay, GET /api/entries?since= serves the signed entries
 //   themselves (since inclusive; continue with `next`), so an agent can find
 //   work and check everything without a second port.
+// - PUT /api/agent-state stores one opaque blob per agent (its state,
+//   encrypted by the agent: agentState.ts), GET /api/agent-state returns it.
+//   Both are signed by a registered, active agent over agentStateMessage,
+//   with a time within the clock skew; a write must be later than the stored
+//   one. Kept in agentStateDir, outside the ledger.
 //
 // Every ledger write (agent entries here, coordinator entries from the loop in
 // coordinator.ts) goes through one LedgerStore, whose mutex serialises them.
 
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import { BlockList, isIPv4, isIPv6 } from "node:net";
@@ -197,6 +203,7 @@ export type ServerLimits = {
   entryBytes: number; // POST /api/entries body
   patchBytes: number; // POST /api/patches/:id body
   testBytes: number; // POST /api/findings/:id/test body
+  agentStateBytes: number; // PUT /api/agent-state body (one agent's encrypted state)
   clockSkewMs: number; // |entry.at - now| must not exceed this
   ratePerMinute: number; // token bucket per owner (or admin key), burst = one minute's worth
   dailyBytesPerOwner: number; // ledger bytes an owner may add per day (bucket, refilled continuously)
@@ -224,6 +231,7 @@ export const DEFAULT_LIMITS: ServerLimits = {
   entryBytes: 32 * 1024,
   patchBytes: 1024 * 1024,
   testBytes: 256 * 1024,
+  agentStateBytes: 256 * 1024,
   clockSkewMs: 5 * 60_000,
   ratePerMinute: 60,
   dailyBytesPerOwner: 2 * 1024 * 1024,
@@ -296,12 +304,32 @@ export function uploadMessage(route: UploadRoute, id: string, contentSha256: str
   return canonical({ purpose: "commons-upload/v1", route, id, sha256: contentSha256 });
 }
 
+// What an agent signs to store or fetch its encrypted state (PUT and GET
+// /api/agent-state). Its own domain, so no entry or upload signature doubles
+// as one; `at` is checked against the server's clock, and a write's must be
+// later than the stored one's, so a captured request cannot be replayed or an
+// older state put back. `prev` (writes only): the sha256 of the stored blob
+// the client merged into this one, null if it found none; absent, the write
+// replaces whatever is stored.
+export const AGENT_STATE_PURPOSE = "anthill-commons/agent-state/v1";
+
+export type AgentStateRequest =
+  | { op: "put"; agent: KeyId; at: string; sha256: string; prev?: string | null }
+  | { op: "get"; agent: KeyId; at: string };
+
+export function agentStateMessage(r: AgentStateRequest): string {
+  return canonical({ purpose: AGENT_STATE_PURPOSE, ...r });
+}
+
 export type CoordinatorServerOptions = {
   ledgerPath?: string; // opened here unless `store` is given
   store?: LedgerStore; // share one store with the coordinator loop
   coordinatorKey: Signer;
   clock: () => string;
   patchesDir: string;
+  // Agents' encrypted state blobs (PUT/GET /api/agent-state), one file per
+  // agent. Not part of the ledger. Default: agent-state beside patchesDir.
+  agentStateDir?: string;
   limits?: Partial<ServerLimits>;
   policy?: SubmitPolicy; // default: src/incentives.ts
   // Transition only: also accept upload signatures over bare sha256hex(content)
@@ -629,6 +657,8 @@ async function handle(ctx: Ctx, req: http.IncomingMessage, res: http.ServerRespo
     }
     const test = /^\/api\/findings\/([^/]+)\/test$/.exec(p);
     if (test && method === "POST") return send(res, 201, await postFindingTest(ctx, req, decodeURIComponent(test[1] ?? "")));
+    if (method === "PUT" && p === "/api/agent-state") return send(res, 200, await putAgentState(ctx, req));
+    if (method === "GET" && p === "/api/agent-state") return send(res, 200, getAgentState(ctx, req));
   } catch (e) {
     if (e instanceof HttpError) {
       const headers: Record<string, string> = {};
@@ -1221,6 +1251,135 @@ async function postFindingTest(ctx: Ctx, req: http.IncomingMessage, fid: string)
   verifyUpload(ctx, auth, "findingTest", fid, content);
   utf8(content);
   return { findingId: fid, sha256: sha256hex(content), created: storeOnce(ctx, auth.principal, file, content) };
+}
+
+// ---------------------------------------------------------------------------
+// PUT / GET /api/agent-state: one opaque blob per agent, so an agent that
+// runs on a fresh machine every time (a cloud scheduled task) keeps its
+// commit salts between runs. The agent encrypts it (agentState.ts); this
+// server holds ciphertext it cannot read. It is not part of the ledger and
+// never enters it.
+// ---------------------------------------------------------------------------
+
+type StoredAgentState = { agent: KeyId; at: string; sha256: string; blob: string; storedAt: string };
+
+function agentStateDir(ctx: Ctx): string {
+  return ctx.opts.agentStateDir ?? path.join(path.dirname(ctx.opts.patchesDir), "agent-state");
+}
+
+// The keyId is 32 hex characters (keyIdOf), so it is a safe file name.
+function agentStateFile(ctx: Ctx, agent: KeyId): string {
+  return path.join(agentStateDir(ctx), `${agent}.json`);
+}
+
+function readAgentState(file: string): StoredAgentState | null {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8")) as StoredAgentState;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw e;
+  }
+}
+
+// The headers both requests carry, checked before anything is read from
+// disk or the body: a well-formed key, a time within the clock skew, and an
+// agent the ledger has registered and not revoked. A revoked agent's state
+// is deleted: nothing it stored may be used again.
+function agentStateAuth(ctx: Ctx, req: http.IncomingMessage): { key: string; agent: KeyId; at: string; sig: string; owner: OwnerId } {
+  const key = req.headers["x-commons-key"];
+  const at = req.headers["x-commons-at"];
+  const sig = req.headers["x-commons-sig"];
+  if (typeof key !== "string" || typeof at !== "string" || typeof sig !== "string") {
+    throw new HttpError(401, "unauthenticated", "x-commons-key, x-commons-at and x-commons-sig are required");
+  }
+  if (!isValidPublicKey(key)) throw new HttpError(400, "malformed", "x-commons-key must be an ed25519 public key (base64url SPKI DER)");
+  const atMs = Date.parse(at);
+  if (Number.isNaN(atMs) || new Date(atMs).toISOString() !== at) throw new HttpError(400, "time", "x-commons-at must be an ISO time as toISOString() writes it");
+  if (Math.abs(atMs - Date.parse(ctx.opts.clock())) > ctx.limits.clockSkewMs) {
+    throw new HttpError(400, "clock-skew", `x-commons-at must be within ${ctx.limits.clockSkewMs / 1000}s of the server clock`);
+  }
+  const agent = keyIdOf(key);
+  const state = ctx.store.state();
+  const a = state.agents.get(agent);
+  if (a === undefined || state.publicKeys.get(agent) !== key) throw new HttpError(403, "unauthorised", "only an agent registered in this commons keeps state here");
+  if (!a.active) {
+    fs.rmSync(agentStateFile(ctx, agent), { force: true });
+    throw new HttpError(403, "signer-revoked", "this agent is revoked; its state is deleted");
+  }
+  return { key, agent, at, sig, owner: a.owner };
+}
+
+async function putAgentState(ctx: Ctx, req: http.IncomingMessage) {
+  const auth = agentStateAuth(ctx, req);
+  const prevHeader = req.headers["x-commons-prev"];
+  if (prevHeader !== undefined && (typeof prevHeader !== "string" || !(prevHeader === "none" || /^[0-9a-f]{64}$/.test(prevHeader)))) {
+    throw new HttpError(400, "malformed", "x-commons-prev must be the stored blob's sha256 or none");
+  }
+  const prev = prevHeader === undefined ? undefined : prevHeader === "none" ? null : prevHeader;
+  const blob = await readBody(req, ctx.limits.agentStateBytes, ctx.limits.minBodyBytesPerSecond, ctx.limits.bodyGraceMs);
+  if (blob.length === 0) throw new HttpError(400, "malformed", "the body is empty");
+  const sha256 = sha256hex(blob);
+  if (!verify(auth.key, agentStateMessage({ op: "put", agent: auth.agent, at: auth.at, sha256, prev }), auth.sig)) {
+    throw new HttpError(401, "signature", "invalid signature");
+  }
+  // From here to the rename nothing awaits, so two writes for one agent
+  // cannot interleave between the check and the write.
+  const file = agentStateFile(ctx, auth.agent);
+  const stored = readAgentState(file);
+  if (stored !== null && Date.parse(auth.at) <= Date.parse(stored.at)) {
+    throw new HttpError(409, "stale", "x-commons-at must be later than the stored state's", { storedAt: stored.at });
+  }
+  if (prev !== undefined && prev !== (stored?.sha256 ?? null)) {
+    throw new HttpError(409, "state-changed", "the stored state changed since it was fetched; fetch, merge and try again", {
+      storedAt: stored?.at ?? null,
+    });
+  }
+  // Charged only for a signed, fresh write by a live agent, so replaying
+  // someone's request cannot spend their owner's budget.
+  if (!ctx.ownerRate.take(`owner:${auth.owner}`)) throw new HttpError(429, "rate-limited", `more than ${ctx.limits.ratePerMinute} requests a minute`);
+  const record: StoredAgentState = { agent: auth.agent, at: auth.at, sha256, blob: blob.toString("base64url"), storedAt: ctx.opts.clock() };
+  writePrivateAtomic(file, `${JSON.stringify(record)}\n`);
+  return { agent: auth.agent, at: auth.at, sha256, bytes: blob.length };
+}
+
+function getAgentState(ctx: Ctx, req: http.IncomingMessage) {
+  req.resume();
+  const auth = agentStateAuth(ctx, req);
+  if (!verify(auth.key, agentStateMessage({ op: "get", agent: auth.agent, at: auth.at }), auth.sig)) {
+    throw new HttpError(401, "signature", "invalid signature");
+  }
+  const stored = readAgentState(agentStateFile(ctx, auth.agent));
+  if (stored === null) throw new HttpError(404, "no-state", "this agent has stored no state");
+  return { agent: stored.agent, at: stored.at, sha256: stored.sha256, bytes: Buffer.from(stored.blob, "base64url").length, blob: stored.blob };
+}
+
+// Written whole or not at all, readable by this uid only: temp file, fsync,
+// rename, fsync of the directory.
+function writePrivateAtomic(file: string, text: string): void {
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  const fd = fs.openSync(tmp, "wx", 0o600);
+  try {
+    fs.fchmodSync(fd, 0o600);
+    fs.writeSync(fd, text);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  try {
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    fs.rmSync(tmp, { force: true });
+    throw e;
+  }
+  const d = fs.openSync(dir, "r");
+  try {
+    fs.fsyncSync(d);
+  } finally {
+    fs.closeSync(d);
+  }
 }
 
 function utf8(content: Buffer): string {

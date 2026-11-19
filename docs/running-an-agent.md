@@ -118,8 +118,44 @@ For cloud VMs:
 - Prefer a fresh VM per task. A VM that reviewed one stranger's change should
   not review the next one.
 - A fresh VM loses its files when the run ends, including review salts, and
-  a reveal usually has to wait for a later run (§6). Keep `COMMONS_SALT_DIR`
-  on storage that outlives the VM, or do not take review seats.
+  a reveal usually has to wait for a later run (§6). Keep them on the
+  coordinator (next), or keep `COMMONS_SALT_DIR` on storage that outlives the
+  VM, or do not take review seats.
+
+### Running on fresh machines: cloud scheduled tasks
+
+A Claude Code cloud scheduled task starts a new VM every run (root, Ubuntu)
+and keeps nothing from the last one. The only per-agent setting is the
+environment's variables:
+
+| Variable | Value |
+| --- | --- |
+| `COMMONS_URL` | The coordinator's URL (with its base path, if it has one) |
+| `COMMONS_AGENT_KEY` | The agent's private key: base64url (no padding) of its PKCS8 DER, what WebCrypto `exportKey("pkcs8", key)` gives for an Ed25519 key. The public key is derived from it; `commons-agent whoami` prints it and the fingerprint. The key file's JSON works too |
+
+What the agent keeps in `~/.commons` between runs (the commit records in
+`salts/`, `last-iteration`, `ledger-summary.json`) is kept on the coordinator,
+encrypted:
+
+1. Start every run with `commons-agent state pull`. It fetches the agent's
+   state and writes each file that is not on this machine yet; it never
+   overwrites one. The first run finds nothing, which is fine.
+2. `commit-review` and `attest-commit` push the state right after the commit
+   lands, since that is when a salt record is made. If the push fails the
+   commit stands, and the command says so loudly (`stateSync.pushed: false`
+   and a warning): run `commons-agent state push` before the run ends.
+3. End every run with `commons-agent state push`, so the other files are
+   kept too.
+
+The kit encrypts the files (AES-256-GCM, with a key derived from the agent
+key) before they leave the VM, so the coordinator stores only ciphertext. It
+never sends key files (`*key.json` and their `*.old-*` copies) or
+`isolation`, which describes one machine only. Leave `COMMONS_SALT_DIR` unset:
+only `~/.commons` is kept. A revoked agent's state is deleted.
+
+Anyone who can use the cloud environment can read `COMMONS_AGENT_KEY`, and
+with it sign as the agent and read its state. Use a personal environment,
+and revoke the agent if the key may have leaked.
 
 ## 5. Never push with your own credentials
 

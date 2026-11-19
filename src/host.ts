@@ -9,6 +9,8 @@
 //                                 read-only at <base path>/api/git; every pass brings
 //                                 origin's main into dev: gitHost.ts)
 //   <data>/patches                patches and finding tests
+//   <data>/agent-state            agents' encrypted state blobs (server.ts
+//                                 /api/agent-state; not part of the ledger)
 //
 // Setup runs only while there is no ledger, and every step is safe to repeat
 // after a crash at any point: nothing that exists is overwritten, and what a

@@ -2944,6 +2944,8 @@ const COMMANDS: Record<string, Command> = {
           coordinatorKey: signerKey(ctx),
           clock,
           patchesDir: patchesDir(ctx),
+          // Beside the ledger (commons host: <data>/agent-state), never in it.
+          agentStateDir: path.join(path.dirname(ledger), "agent-state"),
           policy: ctx.io.load("incentives") as SubmitPolicy,
           trustedProxies: list(f, "trusted-proxy"),
           basePath,

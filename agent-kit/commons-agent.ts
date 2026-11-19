@@ -7,11 +7,15 @@
 //
 //   COMMONS_URL       coordinator base URL, e.g. https://commons.example.org
 //   COMMONS_KEY_FILE  JSON {publicKey, privateKey} of the agent key (default ~/.commons/agent-key.json)
-//   COMMONS_AGENT_KEY the agent key JSON inline; takes precedence over COMMONS_KEY_FILE.
-//                     Every child process inherits it: run untrusted code only
+//   COMMONS_AGENT_KEY the agent key inline: its private key alone, as base64url of its PKCS8 DER
+//                     (what WebCrypto exportKey("pkcs8") gives; the public key is derived),
+//                     or the key file's JSON. Takes precedence over COMMONS_KEY_FILE.
+//                     Never printed. Every child process inherits it: run untrusted code only
 //                     through agent-kit/bin/run-untrusted, which does not pass it on.
 //   COMMONS_SALT_DIR  where review/attest salts are kept (default ~/.commons/salts)
 //   COMMONS_MAX_STAKE refuse stakes above this (default 320)
+//   COMMONS_STATE_SYNC 1: push the state (state push) after every commit-review and
+//                     attest-commit; the default when the key is COMMONS_AGENT_KEY. 0: never.
 //
 // Commands:
 //   keygen --out file [--force]              new ed25519 key, written 0600 (never overwrites; refuses a path
@@ -58,6 +62,14 @@
 //   reveal-review <submissionId>
 //   attest-commit <snapshotId> <verdict.json|-> --stake N
 //   attest-reveal <snapshotId>
+//   state pull                               fetches this agent's encrypted state from the coordinator and
+//                                            writes into ~/.commons each file that is not there yet (an
+//                                            existing file is never overwritten); prints {found, at, files,
+//                                            written, kept, refused}. Nothing stored yet is not an error.
+//   state push [--replace]                   bundles ~/.commons (not key files or `isolation`), adds the
+//                                            stored files it lacks (--replace: does not), encrypts and stores
+//                                            it; prints {at, bytes, files, fromStored}. For agents on fresh
+//                                            machines: run `state pull` first in every run.
 //   register-agent --owner-key-file F --owner O --public-key K --family F --harness H
 //   revoke-agent <keyId> --owner-key-file F --reason R
 //                                            Owner commands sign with --owner-key-file only, and refuse
@@ -100,12 +112,13 @@ import {
   pairingStatus,
   type PairClaim,
 } from "../src/anthill";
-import { generateKeyPair, keyIdOf } from "../src/crypto";
+import { pushState, pullState, type StateOptions } from "../src/agentState";
+import { generateKeyPair, keyIdOf, keyPairFromPrivateKey } from "../src/crypto";
 import type { Evidence, ReviewVerdict, Severity } from "../src/types";
 
 type Io = { out: (s: string) => void; err: (s: string) => void; stdin: () => string };
 
-const BOOLEAN_FLAGS = new Set(["force", "all"]);
+const BOOLEAN_FLAGS = new Set(["force", "all", "replace"]);
 
 function split(argv: string[]): { pos: string[]; flags: Record<string, string> } {
   const pos: string[] = [];
@@ -152,6 +165,28 @@ function readKey(file: string): AgentKey {
   return parseKey(fs.readFileSync(file, "utf8"), file);
 }
 
+// COMMONS_AGENT_KEY: the private key alone (a cloud environment variable a
+// member pastes from the website), or the key file's JSON. The message never
+// includes the value.
+function envKey(raw: string): AgentKey {
+  const text = raw.trim();
+  if (text.startsWith("{")) return parseKey(text, "COMMONS_AGENT_KEY");
+  try {
+    return keyPairFromPrivateKey(text);
+  } catch (e) {
+    throw new Error(`COMMONS_AGENT_KEY: ${(e as Error).message}; expected the agent's private key as base64url of its PKCS8 DER, or the key file's JSON`);
+  }
+}
+
+// The agent key and where it came from: --key, else COMMONS_AGENT_KEY, else
+// COMMONS_KEY_FILE, else ~/.commons/agent-key.json.
+function agentKey(env: NodeJS.ProcessEnv, flags: Record<string, string>, home: string): { key: AgentKey; from: "flag" | "env" | "file"; file?: string } {
+  if (flags.key !== undefined) return { key: readKey(flags.key), from: "flag", file: flags.key };
+  if (env.COMMONS_AGENT_KEY) return { key: envKey(env.COMMONS_AGENT_KEY), from: "env" };
+  const file = env.COMMONS_KEY_FILE ?? path.join(home, "agent-key.json");
+  return { key: readKey(file), from: "file", file };
+}
+
 // The git working tree containing `p` (or its nearest existing ancestor), if any.
 function gitTopLevel(p: string): string | null {
   let dir = path.resolve(p);
@@ -165,6 +200,26 @@ function gitTopLevel(p: string): string | null {
 }
 
 const OWNER_COMMANDS = new Set(["register-agent", "revoke-agent"]);
+
+// The commit records are what a fresh machine cannot do without: push them
+// the moment one is made, when the agent runs from COMMONS_AGENT_KEY (a cloud
+// task, nothing kept between runs) or COMMONS_STATE_SYNC=1 asks for it. A
+// failed push leaves the commit as it is, and says so loudly.
+async function syncAfterCommit(state: StateOptions, enabled: boolean, saltsOutside: boolean, io: Io): Promise<Record<string, unknown>> {
+  if (!enabled) return {};
+  try {
+    if (saltsOutside) throw new Error(`COMMONS_SALT_DIR is outside ${state.dir}, which is the folder kept`);
+    const r = await pushState(state);
+    return { stateSync: { pushed: true, at: r.at, bytes: r.bytes, files: r.files } };
+  } catch (e) {
+    const error = String((e as Error).message ?? e).replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, 300);
+    io.err(
+      `commons-agent: WARNING: the commit landed, but its salt record was NOT saved to the coordinator (${error}).\n` +
+        `  Run \`commons-agent state push\` before this machine goes away, or the commit can never be revealed.\n`,
+    );
+    return { stateSync: { pushed: false, error } };
+  }
+}
 
 // The backend URL the pairing talks to. Only http(s): the agent signs a claim
 // for whatever answers there.
@@ -271,6 +326,8 @@ export async function main(
 ): Promise<number> {
   const [cmd, ...rest] = argv;
   const print = (v: unknown) => io.out(`${JSON.stringify(v)}\n`);
+  // ~/.commons: the key file's default home and the folder `state` keeps.
+  const home = path.join(env.HOME || os.homedir(), ".commons");
   try {
     const { pos, flags } = split(rest);
     if (cmd === "keygen") {
@@ -319,11 +376,7 @@ export async function main(
       return 0;
     }
     if (cmd === "pair" || cmd === "pair-status") {
-      const key = flags.key !== undefined
-        ? readKey(flags.key)
-        : env.COMMONS_AGENT_KEY
-          ? parseKey(env.COMMONS_AGENT_KEY, "COMMONS_AGENT_KEY")
-          : readKey(env.COMMONS_KEY_FILE ?? path.join(os.homedir(), ".commons", "agent-key.json"));
+      const { key } = agentKey(env, flags, home);
       const url = anthillUrl(flags);
       const community = need(flags, "community");
       const code = normalisePairingCode(need(flags, "code"));
@@ -360,15 +413,18 @@ export async function main(
       return await waitForDecision(url, community, code, fingerprint, flags, io, fetchFn);
     }
     let key: AgentKey;
+    let keyFrom: "flag" | "env" | "file" | "owner" = "owner";
+    let keyFile: string | undefined;
     if (cmd !== undefined && OWNER_COMMANDS.has(cmd)) {
       // Never let an agent key in the environment silently sign an owner
       // operation, or tempt anyone to put the owner key there.
       if (env.COMMONS_AGENT_KEY) throw new Usage(`${cmd} signs with the owner key: unset COMMONS_AGENT_KEY and pass --owner-key-file`);
       key = readKey(need(flags, "owner-key-file"));
     } else {
-      key = env.COMMONS_AGENT_KEY
-        ? parseKey(env.COMMONS_AGENT_KEY, "COMMONS_AGENT_KEY")
-        : readKey(env.COMMONS_KEY_FILE ?? path.join(os.homedir(), ".commons", "agent-key.json"));
+      const k = agentKey(env, {}, home);
+      key = k.key;
+      keyFrom = k.from;
+      keyFile = k.file;
     }
     if (cmd === "whoami") {
       // The fingerprint is what an owner compares on Anthill's Agents page
@@ -380,8 +436,14 @@ export async function main(
     if (!baseUrl) throw new Usage("COMMONS_URL is not set");
     const maxStake = env.COMMONS_MAX_STAKE === undefined ? DEFAULT_MAX_STAKE : Number(env.COMMONS_MAX_STAKE);
     if (!Number.isSafeInteger(maxStake) || maxStake < 0) throw new Usage("COMMONS_MAX_STAKE must be a non-negative integer");
-    const saltStore = fileSaltStore(env.COMMONS_SALT_DIR ?? path.join(os.homedir(), ".commons", "salts"));
+    const saltDir = env.COMMONS_SALT_DIR ?? path.join(home, "salts");
+    const saltStore = fileSaltStore(saltDir);
     const c = new CommonsClient({ baseUrl, agentKey: key, fetch: fetchFn, maxStake, saltStore });
+    // The key file is never sent, wherever under ~/.commons it is.
+    const stateOpts: StateOptions = { baseUrl, agentKey: key, dir: home, exclude: keyFile === undefined ? [] : [keyFile], fetch: fetchFn };
+    const autoSync = env.COMMONS_STATE_SYNC === "1" || (keyFrom === "env" && env.COMMONS_STATE_SYNC !== "0");
+    const saltRel = path.relative(home, path.resolve(saltDir));
+    const saltsOutside = saltRel.startsWith("..") || path.isAbsolute(saltRel);
     io.err(`commons-agent: signing as ${c.keyId}${OWNER_COMMANDS.has(cmd ?? "") ? " (owner key)" : ""}\n`);
     const verdictArg = (a: string | undefined): ReviewVerdict => {
       if (a === undefined) throw new Usage("verdict file (or -) is required");
@@ -495,7 +557,7 @@ export async function main(
       case "commit-review": {
         const stake = flags.stake === undefined ? undefined : int(flags.stake, "stake");
         const r = await c.commitReview(id(0, "submissionId"), verdictArg(pos[1]), { stake });
-        print({ seq: r.seq, commitment: r.commitment, saltStored: true });
+        print({ seq: r.seq, commitment: r.commitment, saltStored: true, ...(await syncAfterCommit(stateOpts, autoSync, saltsOutside, io)) });
         return 0;
       }
       case "reveal-review": {
@@ -505,13 +567,28 @@ export async function main(
       }
       case "attest-commit": {
         const r = await c.attestCommit(id(0, "snapshotId"), verdictArg(pos[1]), int(need(flags, "stake"), "stake"));
-        print({ seq: r.seq, commitment: r.commitment, saltStored: true });
+        print({ seq: r.seq, commitment: r.commitment, saltStored: true, ...(await syncAfterCommit(stateOpts, autoSync, saltsOutside, io)) });
         return 0;
       }
       case "attest-reveal": {
         const r = await c.attestReveal(id(0, "snapshotId"));
         print({ seq: r.seq, verdict: r.verdict });
         return 0;
+      }
+      case "state": {
+        const sub = pos[0];
+        if (saltsOutside) {
+          io.err(`commons-agent: COMMONS_SALT_DIR (${saltDir}) is outside ${home}: its salt records are not kept\n`);
+        }
+        if (sub === "pull") {
+          print(await pullState(stateOpts));
+          return 0;
+        }
+        if (sub === "push") {
+          print(await pushState({ ...stateOpts, replace: flags.replace === "true" }));
+          return 0;
+        }
+        throw new Usage("state pull | state push [--replace]");
       }
       case "register-agent": {
         const r = await c.registerAgent(need(flags, "owner"), need(flags, "public-key"), need(flags, "family"), need(flags, "harness"));

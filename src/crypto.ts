@@ -102,6 +102,32 @@ export function isValidPublicKey(publicKey: unknown): publicKey is string {
   }
 }
 
+// The key pair of an ed25519 private key given alone, as base64url (no
+// padding) of its PKCS8 DER: what generateKeyPair's privateKey is, and what
+// WebCrypto exportKey("pkcs8") gives for an Ed25519 key (both the 48-byte
+// RFC 8410 form). Only that one spelling is accepted: Node's parser takes
+// trailing bytes and the longer form with the public key embedded, and a key
+// that verifies under several strings is a key nobody can compare by eye.
+// Errors never contain the input: it is a private key.
+export function keyPairFromPrivateKey(privateKey: string): { publicKey: string; privateKey: string } {
+  const bad = (why: string): never => {
+    throw new TypeError(`not an ed25519 private key: ${why}`);
+  };
+  if (!/^[A-Za-z0-9_-]+$/.test(privateKey)) bad("expected base64url characters only (no padding, no spaces)");
+  const der = Buffer.from(privateKey, "base64url");
+  if (der.toString("base64url") !== privateKey) bad("not canonical base64url");
+  let key: ReturnType<typeof createPrivateKey>;
+  try {
+    key = createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+  } catch {
+    return bad("not PKCS8 DER");
+  }
+  if (key.asymmetricKeyType !== "ed25519") bad(`a ${key.asymmetricKeyType ?? "unknown"} key, expected ed25519`);
+  if (!key.export({ type: "pkcs8", format: "der" }).equals(der)) bad("not the 48-byte PKCS8 form WebCrypto exportKey(\"pkcs8\") gives");
+  const publicKey = createPublicKey(key).export({ type: "spki", format: "der" }).toString("base64url");
+  return { publicKey, privateKey };
+}
+
 export function sign(privateKey: string, message: string): string {
   const key = createPrivateKey({ key: Buffer.from(privateKey, "base64url"), format: "der", type: "pkcs8" });
   if (key.asymmetricKeyType !== "ed25519") throw new TypeError("sign: not an ed25519 private key");

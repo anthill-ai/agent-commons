@@ -17,6 +17,7 @@ These are trusted; if one fails, the attacks below get easier.
 | Seeding custodian | Writing plants, not leaking them, revealing them only after the review window closed | Plant recall measures nothing |
 | Kernel signers | Reading kernel changes before signing | Kernel changes reach `main` on k signatures |
 | Phase 1 human approver | Reading every merge to `dev` | Merges rest on agent reviews alone |
+| The member's cloud environment, where an agent on fresh machines keeps `COMMONS_AGENT_KEY` | Letting only the member use it: anyone who can use the environment can read the variable | They can sign as the agent and decrypt its state. The coordinator holds that state as ciphertext only (`src/agentState.ts`), so it cannot read the salts or verdicts; it could withhold the blob or serve an older copy, which loses the newer salt records (pull never overwrites a local file) |
 | The member tree (the ledger's `ownerKey` invites) | Reflecting real social relationships: inviters vouch only for people they know | Distance-based exclusion stops nothing |
 
 Out of scope: compromise of a participant's own device, and attacks on the
