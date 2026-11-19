@@ -85,7 +85,7 @@ import { followUpstream } from "./gitHost";
 import { githubMirror, GITHUB_TOKEN_ENV, type Mirror, pushUpstreamProblems } from "./mirror";
 import { cloneOrigin, HOST_SETTINGS, hostLayout, missingForServe, readHostSettings, settingName, SetupError, setUp } from "./host";
 import { applyUnifiedDiff, checkRepoPath, createGitHub, type FetchLike as GitHubFetch, FULL_SHA, parsePatch } from "./github";
-import { forkChecker, parseGithubRepo, pullRequestSync, type PullRequestSync, type SourceKind, sourceExists, sourceOf, verifySourceLocal } from "./forks";
+import { forkChecker, parseGithubRepo, pullRequestSync, type PullRequestSync, type SourceKind, sourceExists, sourceOf, sourceTip, verifySourceLocal } from "./forks";
 import {
   DEFAULT_MAX_SKEW_MS,
   isCanonicalPath,
@@ -1460,6 +1460,10 @@ const COORDINATOR_FLAGS: Record<string, FlagSpec> = {
     type: "boolean",
     help: `after each pass, push --repo's dev and main to its origin on GitHub when they changed (a plain push, never forced; a refusal is logged once and retried); the token comes only from env ${GITHUB_TOKEN_ENV}`,
   },
+  "same-repo-pull-requests": {
+    type: "boolean",
+    help: "with --push-upstream: also open pull requests from agents/ branches in the target itself (its owner's agents); their CI runs with the target's secrets, so off by default",
+  },
   "timeout-ms": { type: "string", help: "per finding-test run (default the harness's)" },
   "snapshot-every": { type: "string", help: "merged submissions that trigger a snapshot (default: never)" },
   "anthill-url": { type: "string", help: "on a ledger linked to Anthill: its backend URL; each pass first pins its tree if it changed" },
@@ -1756,7 +1760,16 @@ function pullSyncOf(ctx: Ctx, store: LedgerStore, repo: string): PullRequestSync
   const made = pullSyncs.get(store);
   if (made !== undefined) return made;
   const target = githubTarget(repo);
-  const sync = target === null ? null : pullRequestSync({ patchesDir: patchesDir(ctx), target, github: targetGitHub(ctx) });
+  const sync =
+    target === null
+      ? null
+      : pullRequestSync({
+          patchesDir: patchesDir(ctx),
+          target,
+          github: targetGitHub(ctx),
+          branchTip: (src) => sourceTip({ repo }, src),
+          allowSameRepoHead: bool(ctx.flags, "same-repo-pull-requests"),
+        });
   if (sync !== null) ctx.out(`pull requests: verified fork sources get a pull request to ${target?.owner}/${target?.name} dev (needs Pull requests: write)`);
   pullSyncs.set(store, sync);
   return sync;
@@ -1769,7 +1782,19 @@ function pullSyncOf(ctx: Ctx, store: LedgerStore, repo: string): PullRequestSync
 async function coordinatorPass(ctx: Ctx, store: LedgerStore, idleLine: () => string | null = () => "nothing to do"): Promise<number> {
   if (!bool(ctx.flags, "push-upstream")) return passActions(ctx, store, idleLine);
   if (str(ctx.flags, "repo") === undefined) usage("--push-upstream needs --repo");
-  const mirror = mirrorOf(ctx, store, resolvePath(ctx, req(ctx.flags, "repo")));
+  const repo = resolvePath(ctx, req(ctx.flags, "repo"));
+  const mirror = mirrorOf(ctx, store, repo);
+  const prs = mirror === null ? null : pullSyncOf(ctx, store, repo);
+  const syncPulls = async () => {
+    if (prs === null) return;
+    const p = await prs.pass(store.state()).catch((e: unknown) => ({ lines: [], problems: [`pull requests: ${(e as Error).message}`] }));
+    for (const line of p.lines) ctx.out(`pull requests: ${line}`);
+    for (const line of p.problems) ctx.io.stderr(`pull requests: ${line}\n`);
+  };
+  // Before the actions too: a pull request opens only once reviewers
+  // accepted the submission, and the merge may come in this very pass.
+  // GitHub refuses one whose head is already on dev.
+  await syncPulls();
   try {
     return await passActions(ctx, store, idleLine);
   } finally {
@@ -1777,14 +1802,8 @@ async function coordinatorPass(ctx: Ctx, store: LedgerStore, idleLine: () => str
       const r = await mirror.pass();
       for (const p of r.pushed) ctx.out(`mirror: pushed ${p.ref.replace("refs/heads/", "")} ${p.sha.slice(0, 12)} to GitHub`);
       for (const line of r.problems) ctx.io.stderr(`mirror: ${line}\n`);
-      // After the push: a pull request's base is GitHub's dev, and a merged
-      // one is marked merged once that dev holds its head.
-      const prs = pullSyncOf(ctx, store, resolvePath(ctx, req(ctx.flags, "repo")));
-      if (prs !== null) {
-        const p = await prs.pass(store.state()).catch((e: unknown) => ({ lines: [], problems: [`pull requests: ${(e as Error).message}`] }));
-        for (const line of p.lines) ctx.out(`pull requests: ${line}`);
-        for (const line of p.problems) ctx.io.stderr(`pull requests: ${line}\n`);
-      }
+      // After the push: a merged one is marked merged once GitHub's dev holds its head.
+      await syncPulls();
     }
   }
 }

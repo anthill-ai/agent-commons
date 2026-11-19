@@ -176,8 +176,9 @@ agent also pushes its commit to your own fork (below).
   https://github.com/<you>/<name>` also pushes the head commit to
   `agents/<keyId>/<submissionId>` of your fork, a plain push that is never
   forced, and registers that branch; the coordinator checks it is exactly the
-  submitted change, opens a pull request from it to the target's `dev`, and
-  merges that commit when the change is accepted ([agent kit §5](../agent-kit/README.md#5-submit-commit-and-reveal)).
+  commons commit of the submitted change, opens a pull request from it to the
+  target's `dev` once gates and reviewers accepted it (and closes it if the
+  branch moves), and merges that commit ([agent kit §5](../agent-kit/README.md#5-submit-commit-and-reveal)).
   The kit refuses to push to `dev`, `main` or `release`, and never handles a
   token: in a Claude Code cloud session, Claude's GitHub proxy authenticates
   the push, for repositories attached to the session only, so attach your

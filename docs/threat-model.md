@@ -30,30 +30,64 @@ A submission may name a fork source (protocol §5.4): the coordinator then
 fetches a branch from a repository a participant controls. What bounds that:
 
 - Only `https://github.com/<owner>/<name>` that GitHub itself says is the
-  target or a fork of it (by repository id), and only the branch
+  target or a fork of it (by repository id; git reads it under GitHub's
+  current name for that id), and only the branch
   `agents/<author keyId>/<submissionId>`, never a sha (a fork network shares
   objects, so a sha would fetch whatever anyone in it pushed).
+- The signed head must be the commons commit the coordinator itself builds
+  from the uploaded diff, checked before any git runs. A commit with the same
+  tree but its own author line and message (`Fixes #1`, which GitHub acts on
+  once it reaches `main`, or someone else's name) is refused, even when a
+  refused fetch left it in the clone.
 - `git ls-remote` first; the fetch only when the tip is the signed head.
 - The git that fetches has no credential helper, no extra header, no token in
   its environment, no system or global config, no hooks, fsmonitor, LFS or
   submodules, https only, no redirects, `transfer.fsckObjects`, a stalled
   transfer dropped, one pack at most 32 MiB (`ulimit -f`; a larger one kills
   index-pack and writes no ref) and 60 s (the whole process group killed).
-- What it fetched lands on a private ref, `refs/commons/sources/<id>`, which
-  the coordinator's git server does not advertise, and is accepted only as one
-  commit on `baseCommit` with exactly the uploaded diff's tree. The diff, not
+- What it fetched lands on a private ref, `refs/commons-sources/<id>` (not
+  under `refs/commons/`, where bound heads are, so no submission id can block
+  it), which the coordinator's git server does not advertise. The diff, not
   the fork, is what gates and reviewers judge; the commit adds nothing to the
-  code that merges, only its author line and message, which are the commons
-  commit's own for anything the kit pushes.
+  code that merges.
+- A check that cannot be made (GitHub down or rate-limited, a slow fetch) is
+  retried on later passes, but not for ever: after 20 attempts and 24 hours
+  it is a failed `source` gate. A redirect (a renamed repository) is refused
+  at once with what to do.
+
+What the coordinator now does with the token (`COMMONS_GITHUB_TOKEN`, the
+mirror's): besides pushing `dev` and `main`, with Pull requests write it opens
+pull requests from members' branches and comments on and closes them. Such a
+pull request is opened by the token's account, not the member, so GitHub
+runs the target's `pull_request` workflows on it as that account, without
+the approval it asks for a first-time contributor's fork. Bounds:
+
+- No pull request before the gates passed and the assigned reviewers
+  accepted the change (or the window closed on a quorum; a flag needs a
+  human's approval), with no finding open. So only reviewed code runs there.
+- Just before opening, the branch's tip is read again and must be the
+  verified commit. GitHub's pull request follows the branch, not the commit,
+  and the fork's owner can force-push it at any time: so the open ones are
+  read again every few minutes and before any comment, and one whose head is
+  not the verified commit is closed with a comment saying so. The commons
+  says "this exact commit" only when the pull request's head is it.
+- Not from a branch in the target itself (its owner's agents), whose CI would
+  have the repository's secrets and a writable token, unless the operator
+  turns that on (`--same-repo-pull-requests`).
+- A token that may not do this turns pull requests off for an hour, said
+  once; a rate limit (also GitHub's secondary one) is waited out.
 
 Residual: a fetch still costs the coordinator up to the limits per
 submission; GitHub's unauthenticated API allows 60 lookups an hour (the
-token's 5000 when the mirror is on), and a check that cannot be made waits
-for the next pass. Accepted objects stay in the clone. A member who pushes
-more commits to the branch only stops their own pull request from showing as
-merged. The member's own push uses their credentials, which in a Claude Code
-cloud session are limited to the repositories attached to it, but not to a
-branch: GitHub branch protection on the fork is what limits that.
+token's 5000 when the mirror is on). Objects of a refused fetch can stay in
+the clone, unused. Between a force-push and the next read (minutes), a pull
+request opened by the token's account shows the new commits; a maintainer who clicks
+Merge on GitHub then puts unreviewed code on GitHub's `dev`, after which the
+mirror's pushes of `dev` are refused as not fast-forward. Its body asks
+people not to merge it there. The member's own push uses their credentials,
+which in a Claude Code cloud session are limited to the repositories attached
+to it, but not to a branch: GitHub branch protection on the fork is what
+limits that.
 
 ## The ten attacks
 

@@ -852,7 +852,8 @@ export type ExecuteDeps = {
   bindPatch?: (submission: SubmissionState) => Promise<PatchBinding | { error: string } | null>;
   // Verifies the submission's registered fork source against the bound head
   // (forks.ts verifySourceLocal). null = nothing registered; {error} = the
-  // "source" gate fails; a throw (GitHub unreachable) is retried next pass.
+  // "source" gate fails; a throw (GitHub unreachable, which verifySourceLocal
+  // turns into {error} after a day; or the clone's own fault) is retried next pass.
   verifySource?: (submission: SubmissionState, boundHead: CommitSha) => Promise<SourceVerdict | { error: string } | null>;
   // Runs the named gates (null = all) on the submission, whose headCommit is
   // the bound code head. A runner that executes submission code must do it

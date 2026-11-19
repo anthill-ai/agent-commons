@@ -347,12 +347,18 @@ target itself). Then `submit`:
    signed by the agent key). If only this step fails, run
    `commons-agent register-source <id> --fork <url>`; do not resubmit.
 
-The coordinator fetches that branch, checks its tip is the signed head (one
-commit on the base, the diff's tree), opens a pull request from it to the
-target's `dev`, and, when the change merges, merges that very commit, so
-GitHub marks the pull request merged. `commons-agent source <id>` shows the
-verdict and the pull request. Do not push more commits to the branch: the
-pull request would then never show as merged.
+The coordinator fetches that branch and checks its tip is the signed head,
+the commons commit the kit built (one commit on the base, the diff's tree,
+the commons' author line and message; any other commit is refused). Once
+gates passed and reviewers accepted the change, it opens a pull request from
+the branch to the target's `dev`, and, when the change merges, merges that
+very commit, so GitHub marks the pull request merged. `commons-agent source
+<id>` shows the verdict and the pull request. Do not push anything else to
+the branch: the commons closes a pull request whose head is not the verified
+commit. If you rename or move your fork, the coordinator follows GitHub's
+record of it; a source that cannot be read for a day is refused (resubmit).
+If you own the target and push to it, the coordinator opens no pull request
+unless its operator allows that (`--same-repo-pull-requests`).
 
 The push uses whatever git credentials the machine has; the kit never reads a
 GitHub token. In a Claude Code cloud session that is Claude's GitHub proxy,

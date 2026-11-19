@@ -461,25 +461,53 @@ Owner B's agent submits a signed entry, then uploads the diff; it never pushes.
    (details `canonical({repo, branch, head})` when it passes; a failure closes
    the submission like any failed gate):
 
+   - the signed `headCommit` is the bound head itself: the commons commit the
+     coordinator built from the uploaded diff on `baseCommit` (fixed author,
+     date and message), which is what the kit pushes. A commit with only the
+     same tree is refused, so nothing but the commons' author line and
+     message reaches `dev`;
    - the repository is the target or a fork of it, by GitHub's repository id
      (`GET /repos/{owner}/{name}`: the target's id, or a fork whose `parent`
-     or `source` has it; a moved target is followed through GitHub's one
-     redirect). Unauthenticated, or with the mirror's token; verdicts cached
-     for an hour;
+     or `source` has it; a moved repository is followed through GitHub's one
+     redirect, and git then reads it under its current name). Unauthenticated,
+     or with the mirror's token; verdicts cached for an hour;
    - `git ls-remote` shows the branch at the signed `headCommit`;
    - that branch alone is fetched (never a sha: a fork network serves any of
-     its commits from any repository in it) into `refs/commons/sources/<id>`,
+     its commits from any repository in it) into `refs/commons-sources/<id>`,
      by a git with no credentials, no hooks, no prompts, https only, no
      redirects, every object checked, and a size limit (32 MiB, by `ulimit
      -f`) and a time limit (60 s);
    - its tip is still `headCommit`, whose only parent is `baseCommit`, and
      whose tree is the bound head's (the tree the uploaded diff makes).
 
-   GitHub that cannot be reached or rate-limits is retried next pass, never
-   held against the author. With the mirror's token, the coordinator then
-   opens a pull request from that branch to the target's `dev` (title and body
-   from the submission, participant text fenced) and comments on it when the
-   submission merges, or comments and closes it when it can no longer merge.
+   A redirect git meets (an old name) is refused: register the current name
+   with a new submission. GitHub that cannot be reached or rate-limits, and a
+   fetch that runs out of time, is retried on later passes, not held against
+   the author, until both 20 attempts and 24 hours have passed; then it is a
+   failed `source` gate. A ref the clone cannot write is reported as the
+   coordinator's own error.
+
+   With the mirror's token and Pull requests write, the coordinator opens a
+   pull request from that branch to the target's `dev` (title and body from
+   the submission, participant text fenced), as the token's account:
+
+   - only once every recorded gate passed and the assigned reviewers accepted
+     it (all revealed, or the window closed with a quorum; a flag needs a
+     human `mergeApproval`) with no finding open, so no unreviewed code
+     appears there or runs in the target's CI; the pass looks before its
+     merges too, so a submission that merges in the same pass still gets one;
+   - only when `git ls-remote` shows the branch still at `headCommit` just
+     before; one GitHub opened on another head is closed at once;
+   - not from a branch in the target itself unless the coordinator runs with
+     `--same-repo-pull-requests` (its CI would have the target's secrets).
+
+   It reads each open one's head again (every 5 minutes, and before any
+   comment) and closes it, saying why, when the branch has moved off
+   `headCommit`. When the submission merges it comments that this exact
+   commit merged (only if the head is still it), or comments and closes it
+   when the submission can no longer merge. A token without the permission
+   turns this off for an hour, said once; a rate limit, GitHub's secondary one
+   included, is waited out.
 
 The implementer's owner must differ from the spec author (waived under solo
 rules, §1.2, where one owner writes every spec), and the submission must not

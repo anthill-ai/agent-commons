@@ -189,6 +189,8 @@ export type GitHub = {
   // is returned instead of a second.
   openBranchPullRequest(args: BranchPullRequestArgs): Promise<PullRequestInfo>;
   closePullRequest(owner: string, repo: string, prNumber: number): Promise<void>;
+  // GET /repos/{owner}/{repo}/pulls/{n}: its head as GitHub has it now.
+  getPullRequest(owner: string, repo: string, prNumber: number): Promise<PullRequestInfo>;
   // The PR for commons/<submissionId> from headOwner (default: owner), or null.
   // Prefers a merged PR, then an open one, then the newest.
   findPullRequest(owner: string, repo: string, submissionId: string, headOwner?: string): Promise<PullRequestInfo | null>;
@@ -268,7 +270,13 @@ export function createGitHub(opts: GitHubOptions = {}): GitHub {
       const info: GitHubErrorInfo = {};
       const accepted = res.headers.get("x-accepted-github-permissions");
       if (accepted !== null) info.acceptedPermissions = accepted.slice(0, 200);
-      if ((res.status === 403 || res.status === 429) && (res.headers.get("x-ratelimit-remaining") === "0" || res.headers.get("retry-after") !== null)) {
+      // A secondary rate limit may answer 403 with neither header, only its
+      // message ("You have exceeded a secondary rate limit ..."): still a
+      // limit to wait out, not a missing permission.
+      if (
+        (res.status === 403 || res.status === 429) &&
+        (res.headers.get("x-ratelimit-remaining") === "0" || res.headers.get("retry-after") !== null || /rate limit/i.test(errorText(data, text, parsed)))
+      ) {
         info.rateLimited = true;
       }
       throw new GitHubError(res.status, redact(`${method} ${path} -> ${res.status}: ${errorText(data, text, parsed)}`), info);
@@ -653,11 +661,18 @@ export function createGitHub(opts: GitHubOptions = {}): GitHub {
     await request("PATCH", `${rp}/pulls/${prNumber}`, { state: "closed" });
   }
 
+  async function getPullRequest(owner: string, repo: string, prNumber: number): Promise<PullRequestInfo> {
+    const rp = repoPath(owner, repo);
+    checkPrNumber(prNumber);
+    return pullInfo((await request("GET", `${rp}/pulls/${prNumber}`)).data);
+  }
+
   return {
     openPullRequest,
     getRepository,
     openBranchPullRequest,
     closePullRequest,
+    getPullRequest,
     findPullRequest,
     listChangedFiles,
     mergePullRequest,

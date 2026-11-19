@@ -335,7 +335,8 @@ test("verify refuses: a tip that is not the signed head, a missing branch, a hea
   const a = pushed(w, "s-tip");
   register(w, "s-tip");
   const other = commitOn(w, w.base, { "src/x.ts": "export const a = 9;\n" });
-  const tipped = await verify(w, submission(w, "s-tip", other), a.bound);
+  git(w.work, "push", "-q", "-f", w.fork, `${other}:refs/heads/${sourceBranch(AGENT, "s-tip")}`);
+  const tipped = await verify(w, submission(w, "s-tip", a.head), a.bound);
   assert.match((tipped as { error: string }).error, /the branch is at [0-9a-f]{40}, not the signed headCommit/);
 
   // Registered, never pushed.
@@ -350,20 +351,22 @@ test("verify refuses: a tip that is not the signed head, a missing branch, a hea
   const grand = git(w.work, "commit-tree", boundTree, "-p", child, "-m", "two commits");
   git(w.work, "push", "-q", w.fork, `${grand}:refs/heads/${sourceBranch(AGENT, "s-deep")}`);
   register(w, "s-deep");
-  const deep = await verify(w, submission(w, "s-deep", grand), a.bound);
+  // As headBinding "declared" binds it (an operator's own repository): the
+  // declared head is the bound head, and only the parent check stands.
+  const deep = await verify(w, submission(w, "s-deep", grand), grand);
   assert.match((deep as { error: string }).error, /parents are [0-9a-f]{40}; it must be one commit whose only parent is baseCommit/);
   assert.equal(spawnSync("git", ["rev-parse", "--verify", "--quiet", sourceRef("s-deep")], { cwd: w.clone }).status, 1, "a refused source keeps no ref");
   const orphan = git(w.work, "commit-tree", boundTree, "-m", "no parent");
   git(w.work, "push", "-q", w.fork, `${orphan}:refs/heads/${sourceBranch(AGENT, "s-orphan")}`);
   register(w, "s-orphan");
-  assert.match(((await verify(w, submission(w, "s-orphan", orphan), a.bound)) as { error: string }).error, /parents are \(none\)/);
+  assert.match(((await verify(w, submission(w, "s-orphan", orphan), orphan)) as { error: string }).error, /parents are \(none\)/);
 
-  // One commit on the base, but not the uploaded diff's change.
+  // One commit on the base, but not the uploaded diff's change: not the bound head.
   const wrong = commitOn(w, w.base, { "src/x.ts": "export const a = 1;\nexport const b = 4;\n" });
   git(w.work, "push", "-q", w.fork, `${wrong}:refs/heads/${sourceBranch(AGENT, "s-diff")}`);
   register(w, "s-diff");
   const diff = await verify(w, submission(w, "s-diff", wrong), a.bound);
-  assert.match((diff as { error: string }).error, /the commit's tree [0-9a-f]{40} is not the tree the uploaded patch makes/);
+  assert.match((diff as { error: string }).error, /is not the commons commit the uploaded patch makes on baseCommit/);
 
   // Not a fork of the target: refused before any git runs.
   const b = pushed(w, "s-stranger");
@@ -392,13 +395,13 @@ test("verify refuses: a tip that is not the signed head, a missing branch, a hea
   await assert.rejects(verify(w, submission(w, "s-scheme", b.head), b.bound, { fetch: { protocols: ["https"] } }), /cannot read/);
 });
 
-test("verify: an oversized fetch is cut off by the size limit (no ref, no leftover pack), a fork that stalls by the time limit", async () => {
+test("verify: an oversized fetch is cut off by the size limit (no ref, no leftover pack), a fork that stalls by the time limit (and is retried)", async () => {
   const w = world();
   const big = commitOn(w, w.base, { "src/big.txt": randomBytes(1_500_000).toString("base64") });
   git(w.work, "push", "-q", w.fork, `${big}:refs/heads/${sourceBranch(AGENT, "s-big")}`);
   register(w, "s-big");
-  const bound = pushed(w, "s-unused").bound;
-  const r = await verify(w, submission(w, "s-big", big), bound, { fetch: { protocols: ["file"], maxBytes: 64 * 1024 } });
+  // Declared as its own bound head, so the fetch is reached.
+  const r = await verify(w, submission(w, "s-big", big), big, { fetch: { protocols: ["file"], maxBytes: 64 * 1024 } });
   assert.match((r as { error: string }).error, /fetching would write more than 65536 bytes/);
   assert.equal(spawnSync("git", ["rev-parse", "--verify", "--quiet", sourceRef("s-big")], { cwd: w.clone }).status, 1);
   assert.deepEqual(fs.readdirSync(path.join(w.clone, ".git", "objects", "pack")).filter((n) => n.startsWith("tmp_")), []);
@@ -421,11 +424,14 @@ test("verify: an oversized fetch is cut off by the size limit (no ref, no leftov
   try {
     const port = (server.address() as AddressInfo).port;
     const started = Date.now();
-    const slow = await verify(w, submission(w, "s-slow", head), head, {
-      cloneUrl: () => `http://127.0.0.1:${port}/api/git`,
-      fetch: { protocols: ["http"], timeoutMs: 1500 },
-    });
-    assert.match((slow as { error: string }).error, /fetching took longer than 2 s/);
+    // GitHub or the network, never the author: retried, not held against them.
+    await assert.rejects(
+      verify(w, submission(w, "s-slow", head), head, {
+        cloneUrl: () => `http://127.0.0.1:${port}/api/git`,
+        fetch: { protocols: ["http"], timeoutMs: 1500 },
+      }),
+      (e: unknown) => e instanceof SourceUnavailable && /fetching .* took longer than 2 s; tried again next pass/.test(e.message),
+    );
     assert.ok(Date.now() - started < 10_000);
     assert.equal(spawnSync("git", ["rev-parse", "--verify", "--quiet", sourceRef("s-slow")], { cwd: w.clone }).status, 1);
   } finally {
@@ -469,6 +475,106 @@ test("verify: the fetch never carries a token or the clone's headers, and runs n
   assert.equal(fs.existsSync(path.join(w.clone, ".git", "hook-ran")), false);
 });
 
+test("verify: only the commons commit itself merges; a commit with the same tree but its own author and message is refused, even one already in the clone", async () => {
+  const w = world();
+  const { bound } = pushed(w, "s-spoof");
+  // The same tree on the same base, with an author and a message of the attacker's choosing.
+  const tree = git(w.clone, "rev-parse", `${bound}^{tree}`);
+  git(w.work, "fetch", "-q", w.clone, `${bound}:refs/tmp/bound`);
+  const spoof = execFileSync("git", ["commit-tree", tree, "-p", w.base, "-m", "Fixes #1, fixes #2"], {
+    cwd: w.work,
+    env: { ...process.env, GIT_AUTHOR_NAME: "Someone Famous", GIT_AUTHOR_EMAIL: "famous@example.com", GIT_COMMITTER_NAME: "Someone Famous", GIT_COMMITTER_EMAIL: "famous@example.com" },
+  })
+    .toString()
+    .trim();
+  git(w.work, "push", "-q", "-f", w.fork, `${spoof}:refs/heads/${sourceBranch(AGENT, "s-spoof")}`);
+  // As a refused fetch can leave it: the commit is already in the clone.
+  git(w.clone, "fetch", "-q", w.fork, `${spoof}:refs/tmp/leftover`);
+  register(w, "s-spoof");
+  const v = await verify(w, submission(w, "s-spoof", spoof), bound, {
+    cloneUrl: () => {
+      throw new Error("refused before any git runs");
+    },
+  });
+  assert.match((v as { error: string }).error, /the signed headCommit [0-9a-f]{40} is not the commons commit the uploaded patch makes on baseCommit \([0-9a-f]{40}\)/);
+});
+
+test("verify: a submission named \"sources\" (its bound head at refs/commons/sources) does not stop fork fetches; a ref the clone cannot write is the clone's error, not GitHub's", async () => {
+  const w = world();
+  // An ordinary submission with the id "sources", bound as every patch is.
+  const named = commonsCommit({ repoDir: w.work, baseCommit: w.base, patch: w.patch, submissionId: "sources" }).head;
+  fs.writeFileSync(patchFile(w.patchesDir, "sources"), w.patch);
+  const b = bindPatchLocal(w.clone, w.patchesDir, submission(w, "sources", named), "refs/heads/dev");
+  assert.ok(b !== null && !("error" in b), JSON.stringify(b));
+  assert.equal(git(w.clone, "rev-parse", "refs/commons/sources"), b.head);
+  const { head, bound } = pushed(w, "s-after");
+  register(w, "s-after");
+  assert.deepEqual(await verify(w, submission(w, "s-after", head), bound), { repo: FORK_URL, branch: sourceBranch(AGENT, "s-after"), head });
+  assert.equal(sourceRef("s-after"), "refs/commons-sources/s-after");
+  // And the other way round: with a source fetched, "sources" still binds.
+  const w2 = world();
+  const p2 = pushed(w2, "s-first");
+  register(w2, "s-first");
+  assert.ok(!("error" in ((await verify(w2, submission(w2, "s-first", p2.head), p2.bound)) ?? { error: "null" })));
+  fs.writeFileSync(patchFile(w2.patchesDir, "sources"), w2.patch);
+  const named2 = commonsCommit({ repoDir: w2.work, baseCommit: w2.base, patch: w2.patch, submissionId: "sources" }).head;
+  const b2 = bindPatchLocal(w2.clone, w2.patchesDir, submission(w2, "sources", named2), "refs/heads/dev");
+  assert.ok(b2 !== null && !("error" in b2), JSON.stringify(b2));
+
+  // A ref in the way of the source ref (a broken clone): a plain error naming the clone.
+  const w3 = world();
+  const p3 = pushed(w3, "s-blocked");
+  register(w3, "s-blocked");
+  git(w3.clone, "update-ref", "refs/commons-sources", w3.base);
+  await assert.rejects(verify(w3, submission(w3, "s-blocked", p3.head), p3.bound), (e: unknown) => {
+    assert.ok(e instanceof Error && !(e instanceof SourceUnavailable), String(e));
+    assert.match(e.message, /cannot write refs\/commons-sources\/s-blocked in the coordinator's clone/);
+    return true;
+  });
+});
+
+test("verify: a moved repository is read under GitHub's current name, a redirect git meets is refused, and a source that cannot be read is retried only so long", async () => {
+  // Renamed after registering: the check (by id) gives the current name, and git reads that.
+  const w = world();
+  const { head, bound } = pushed(w, "s-renamed");
+  register(w, "s-renamed");
+  const renamed = w.bare("alice", "agent-commons-renamed");
+  fs.renameSync(w.fork, renamed);
+  const v = await verify(w, submission(w, "s-renamed", head), bound, { classify: async () => ({ kind: "fork", fullName: "alice/agent-commons-renamed" }) });
+  assert.deepEqual(v, { repo: FORK_URL, branch: sourceBranch(AGENT, "s-renamed"), head });
+
+  // A redirect git does not follow (GitHub's answer to an old name): refused with what to do, not retried for ever.
+  const server = http.createServer((req, res) => {
+    res.writeHead(301, { Location: `https://github.com/alice/elsewhere${req.url ?? ""}` });
+    res.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const port = (server.address() as AddressInfo).port;
+    register(w, "s-moved");
+    const moved = await verify(w, submission(w, "s-moved", head), head, { cloneUrl: () => `http://127.0.0.1:${port}/alice/agent-commons.git`, fetch: { protocols: ["http"] } });
+    assert.match((moved as { error: string }).error, /has moved on GitHub; register its current name \(resubmit\)/);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+
+  // Cannot be read (nothing listens): retried, until both the attempts and the hours are spent.
+  register(w, "s-down");
+  let clock = 0;
+  const down = () =>
+    verify(w, submission(w, "s-down", head), head, {
+      cloneUrl: () => "http://127.0.0.1:1/alice/agent-commons.git",
+      fetch: { protocols: ["http"], timeoutMs: 5000 },
+      retry: { attempts: 2, hours: 1 },
+      now: () => clock,
+    });
+  await assert.rejects(down(), SourceUnavailable);
+  await assert.rejects(down(), SourceUnavailable, "two attempts, but not an hour yet");
+  clock += 2 * 3_600_000;
+  assert.match(((await down()) as { error: string }).error, /cannot read https:\/\/github\.com\/alice\/agent-commons now .*, still after 3 attempts over 2 h: refused \(resubmit\)/);
+});
+
 // ---------------------------------------------------------------------------
 // Is it a fork? GitHub REST through an injected fetch.
 // ---------------------------------------------------------------------------
@@ -506,17 +612,17 @@ test("fork check: by GitHub's repository id, following the target's move; forks 
   });
   let clock = 0;
   const check = forkChecker({ target: { owner: "kelemeno", name: "agent-commons" }, github: createGitHub({ token: "", anonymous: true, fetch: gh.fetch }), now: () => clock });
-  assert.deepEqual(await check("alice", "agent-commons"), { kind: "fork" });
+  assert.deepEqual(await check("alice", "agent-commons"), { kind: "fork", fullName: "alice/agent-commons" });
   assert.ok(gh.calls.every((c) => c.headers.Authorization === undefined && c.method === "GET"), "unauthenticated reads");
-  assert.deepEqual(await check("carol", "agent-commons"), { kind: "fork" }, "a fork of a fork: its network's root is the target");
-  assert.deepEqual(await check("Anthill-AI", "Agent-Commons"), { kind: "target" }, "the target by its current name");
-  assert.deepEqual(await check("kelemeno", "renamed-old"), { kind: "target" }, "the target by an old name GitHub redirects");
+  assert.deepEqual(await check("carol", "agent-commons"), { kind: "fork", fullName: "carol/agent-commons" }, "a fork of a fork: its network's root is the target");
+  assert.deepEqual(await check("Anthill-AI", "Agent-Commons"), { kind: "target", fullName: "anthill-ai/agent-commons" }, "the target by its current name");
+  assert.deepEqual(await check("kelemeno", "renamed-old"), { kind: "target", fullName: "anthill-ai/agent-commons" }, "the target by an old name GitHub redirects, with its current name for git");
   assert.match(JSON.stringify(await check("mallory", "agent-commons")), /is not a fork of anthill-ai\/agent-commons/);
   assert.match(JSON.stringify(await check("mallory", "copy")), /is not a fork/);
   assert.match(JSON.stringify(await check("nobody", "x")), /not a public repository/);
   await assert.rejects(check("evil", "redirect"), SourceUnavailable, "a redirect off the API host is not followed");
   const n = gh.calls.length;
-  assert.deepEqual(await check("alice", "agent-commons"), { kind: "fork" });
+  assert.deepEqual(await check("alice", "agent-commons"), { kind: "fork", fullName: "alice/agent-commons" });
   assert.equal(gh.calls.length, n, "cached");
   // An outage or the rate limit: thrown (retried next pass), never cached.
   limited = true;
@@ -524,7 +630,7 @@ test("fork check: by GitHub's repository id, following the target's move; forks 
   clock += 2 * 3_600_000;
   await assert.rejects(check("alice", "agent-commons"), /rate limit/);
   limited = false;
-  assert.deepEqual(await check("alice", "agent-commons"), { kind: "fork" });
+  assert.deepEqual(await check("alice", "agent-commons"), { kind: "fork", fullName: "alice/agent-commons" });
 });
 
 // ---------------------------------------------------------------------------
@@ -600,48 +706,107 @@ function prState(subs: SubmissionState[], extra: { proposalTitle?: string } = {}
   } as unknown as CommonsState;
 }
 
-test("pull requests: one per verified source from the fork's branch to dev, participant text fenced; merged and closed ones are commented once; a token without the permission is said once and stops only this", async () => {
-  const dir = tmp();
-  const head = "c".repeat(40);
-  const verified = (id: string, over: Partial<SubmissionState> = {}): SubmissionState => ({
+const PR_HEAD = "c".repeat(40);
+const MOVED = "e".repeat(40);
+const review = (p = 0.1) => ({ reviewer: "r1", commitment: "x", stake: 5, committedSeq: 9, verdict: { defectProbability: p, summary: "fine `x`", findingIds: [] }, revealedSeq: 10 });
+
+// A submission with a verified source that gates passed and its one assigned
+// reviewer accepted: what gets a pull request.
+function accepted(id: string, over: Partial<SubmissionState> = {}, repo = FORK_URL): SubmissionState {
+  return {
     id,
     author: AGENT,
     taskId: "t1",
     baseCommit: "b".repeat(40),
-    headCommit: head,
+    headCommit: PR_HEAD,
     changedFiles: ["src/x.ts"],
     linesChanged: 2,
     submittedSeq: 5,
     submittedAt: "2026-01-01T00:00:00.000Z",
-    gates: [{ gate: SOURCE_GATE, pass: true, details: sourceDetails({ repo: FORK_URL, branch: sourceBranch(AGENT, id), head }) }],
-    reviews: [],
+    gates: [
+      { gate: SOURCE_GATE, pass: true, details: sourceDetails({ repo, branch: sourceBranch(AGENT, id), head: PR_HEAD }) },
+      { gate: "size", pass: true, details: "ok" },
+    ],
+    assignment: { beacon: "b", entropy: "e", treeDigest: "t", reviewers: ["r1"], seq: 8 },
+    reviews: [review()],
     findingIds: [],
     ...over,
-  });
-  let deny = false;
+  } as SubmissionState;
+}
+
+// GitHub's pull requests, kept: POST opens one on `openHead()`, GET reads
+// it, PATCH closes it, comments are recorded.
+function fakePulls(opts: { openHead?: () => string; deny?: () => Reply | null } = {}) {
+  const pulls = new Map<number, { headSha: string; label: string; state: string; merged: boolean }>();
   let number = 40;
+  const view = (n: number) => {
+    const p = pulls.get(n) as { headSha: string; label: string; state: string; merged: boolean };
+    return { number: n, html_url: `https://github.com/anthill-ai/agent-commons/pull/${n}`, state: p.state, merged_at: p.merged ? "2026-01-03T00:00:00Z" : null, merge_commit_sha: null, head: { sha: p.headSha, label: p.label }, base: { ref: "dev" } };
+  };
   const gh = fakeGitHub((c): Reply => {
-    if (deny) return { status: 403, body: { message: "Resource not accessible by personal access token" }, headers: { "X-Accepted-GitHub-Permissions": "pull_requests=write" } };
+    const denied = opts.deny?.() ?? null;
+    if (denied !== null) return denied;
     if (c.method === "POST" && c.url.endsWith("/repos/anthill-ai/agent-commons/pulls")) {
       const b = JSON.parse(c.body ?? "{}") as { head: string };
       number++;
-      return {
-        status: 201,
-        body: { number, html_url: `https://github.com/anthill-ai/agent-commons/pull/${number}`, state: "open", merged_at: null, merge_commit_sha: null, head: { sha: head, label: b.head }, base: { ref: "dev" } },
-      };
+      pulls.set(number, { headSha: opts.openHead?.() ?? PR_HEAD, label: b.head.includes(":") ? b.head : `anthill-ai:${b.head}`, state: "open", merged: false });
+      return { status: 201, body: view(number) };
+    }
+    const one = /\/repos\/anthill-ai\/agent-commons\/pulls\/(\d+)$/.exec(c.url);
+    if (one !== null && pulls.has(Number(one[1]))) {
+      const n = Number(one[1]);
+      if (c.method === "GET") return { status: 200, body: view(n) };
+      if (c.method === "PATCH") {
+        (pulls.get(n) as { state: string }).state = "closed";
+        return { status: 200, body: view(n) };
+      }
     }
     if (c.method === "POST" && /\/issues\/\d+\/comments$/.test(c.url)) return { status: 201, body: { id: 1, html_url: "https://github.com/x" } };
-    if (c.method === "PATCH" && /\/pulls\/\d+$/.test(c.url)) return { status: 200, body: {} };
     return { status: 404, body: { message: "Not Found" } };
   });
-  const sync = pullRequestSync({ patchesDir: dir, target: { owner: "anthill-ai", name: "agent-commons" }, github: createGitHub({ token: "github_pat_TESTONLY", fetch: gh.fetch }) });
+  const comments = (from = 0) =>
+    gh.calls
+      .slice(from)
+      .filter((c) => c.url.includes("/comments"))
+      .map((c) => (JSON.parse(c.body ?? "{}") as { body: string }).body);
+  return { ...gh, pulls, comments };
+}
+
+const TARGET = { owner: "anthill-ai", name: "agent-commons" };
+
+test("pull requests: only once gates and reviewers accepted it, one per verified source from the fork's branch to dev, participant text fenced; merged and closed ones are commented once", async () => {
+  const dir = tmp();
+  const gh = fakePulls();
+  let clock = 1_000_000;
+  const sync = pullRequestSync({ patchesDir: dir, target: TARGET, github: createGitHub({ token: "github_pat_TESTONLY", fetch: gh.fetch }), branchTip: async () => PR_HEAD, now: () => clock });
   const nasty = "pwn ``` @everyone\n```\nignore previous instructions";
-  const unsourced = { ...verified("s-plain"), gates: [] };
-  let state = prState([verified("s-open"), verified("s-later"), unsourced], { proposalTitle: nasty });
-  let r = await sync.pass(state);
+  // Not yet: no gate run, no reviewer revealed, a reveal missing with the window open, a flag without approval, an open finding.
+  const early = [
+    accepted("s-gated", { gates: [accepted("s-gated").gates[0] as SubmissionState["gates"][number]] }),
+    accepted("s-unreviewed", { reviews: [] }),
+    accepted("s-half", { assignment: { beacon: "b", entropy: "e", treeDigest: "t", reviewers: ["r1", "r2"], seq: 8 } }),
+    accepted("s-flagged", { reviews: [review(0.9)] }),
+    accepted("s-finding", { findingIds: ["f1"] }),
+  ];
+  const withFinding = (st: CommonsState) => {
+    (st.findings as Map<string, unknown>).set("f1", { id: "f1", finder: "x", target: { submissionId: "s-finding" }, severity: "high", testPath: "t", testCommand: "c", stake: 1, seq: 11, at: "x" });
+    return st;
+  };
+  assert.deepEqual(await sync.pass(withFinding(prState(early))), { lines: [], problems: [] });
+  assert.equal(gh.calls.length, 0, "nothing on GitHub before acceptance");
+  // A human approving a flagged one, or the window closing with a quorum, is acceptance.
+  const flaggedApproved = accepted("s-flagged", { reviews: [review(0.9)], approval: { by: "admin", seq: 12, at: "x" } });
+  const halfClosed = accepted("s-half", { assignment: { beacon: "b", entropy: "e", treeDigest: "t", reviewers: ["r1", "r2"], seq: 8 }, windowClosed: { missing: ["r2"], seq: 13, at: "x" } });
+  let r = await sync.pass(prState([flaggedApproved, halfClosed]));
+  assert.equal(r.lines.length, 2, r.lines.join("\n"));
+
+  const plain = { ...accepted("s-plain"), gates: [{ gate: "size", pass: true, details: "ok" }] };
+  let state = prState([accepted("s-open"), accepted("s-later"), plain], { proposalTitle: nasty });
+  const before = gh.calls.length;
+  r = await sync.pass(state);
   assert.deepEqual(r.problems, []);
   assert.equal(r.lines.length, 2, r.lines.join("\n"));
-  const opened = gh.calls.filter((c) => c.method === "POST" && c.url.endsWith("/pulls"));
+  const opened = gh.calls.slice(before).filter((c) => c.method === "POST" && c.url.endsWith("/pulls"));
   assert.equal(opened.length, 2, "one per verified source, none for a submission without one");
   const body = JSON.parse(opened[0]?.body ?? "{}") as Record<string, string>;
   assert.equal(body.head, `alice:${sourceBranch(AGENT, "s-open")}`);
@@ -651,47 +816,134 @@ test("pull requests: one per verified source from the fork's branch to dev, part
   // The proposal's text sits inside a fence longer than any backtick run in it.
   assert.ok(body.body?.includes(`\`\`\`\`text\n${nasty}\n\`\`\`\``), body.body);
   assert.ok(!body.body?.replace(/````text\n[\s\S]*?\n````/g, "").includes("@everyone"));
-  assert.equal(readPullRequestRecord(dir, "s-open")?.number, 41);
-  // Nothing new: nothing written.
+  assert.equal(readPullRequestRecord(dir, "s-open")?.number, 43);
+  // Nothing new and within the recheck time: no request at all.
   const n = gh.calls.length;
   assert.deepEqual(await sync.pass(state), { lines: [], problems: [] });
   assert.equal(gh.calls.length, n);
+  // After it, each open one's head is read again (and still the verified one).
+  clock += 6 * 60_000;
+  assert.deepEqual(await sync.pass(state), { lines: [], problems: [] });
+  assert.ok(gh.calls.slice(n).every((c) => c.method === "GET"), "reads only");
+  assert.equal(gh.calls.length - n, 2, "one read per open pull request in the state");
 
-  // One merges, one dies: a comment each, the dead one closed, both once.
+  // One merges, one dies: each read again, then a comment each, the dead one closed, both once.
   state = prState([
-    verified("s-open", { merged: { commit: "d".repeat(40), seq: 30, at: "2026-01-02T00:00:00.000Z" }, reviews: [{ reviewer: "r1", commitment: "x", stake: 5, committedSeq: 9, verdict: { defectProbability: 0.1, summary: "fine `x`", findingIds: [] }, revealedSeq: 10 }] }),
-    verified("s-later", { gates: [...verified("s-later").gates, { gate: "size", pass: false, details: "too large: @someone" }] }),
+    accepted("s-open", { merged: { commit: "d".repeat(40), seq: 30, at: "2026-01-02T00:00:00.000Z" } }),
+    accepted("s-later", { gates: [...accepted("s-later").gates, { gate: "merge", pass: false, details: "conflicts: @someone" }] }),
   ]);
+  const m0 = gh.calls.length;
   r = await sync.pass(state);
   assert.deepEqual(r.problems, []);
-  const comments = gh.calls.slice(n).filter((c) => c.url.includes("/comments"));
-  assert.equal(comments.length, 2);
-  assert.match(JSON.parse(comments[0]?.body ?? "{}").body as string, /Merged by the commons into `dev` at `d{40}`/);
-  assert.match(JSON.parse(comments[1]?.body ?? "{}").body as string, /can no longer merge \(gate size failed\)[\s\S]*```text\nsize: too large: @someone\n```/);
-  assert.ok(gh.calls.slice(n).some((c) => c.method === "PATCH" && c.body === JSON.stringify({ state: "closed" })));
+  const said = gh.comments(m0);
+  assert.equal(said.length, 2);
+  assert.match(said[0] as string, /Merged by the commons into `dev` at `d{40}`.*this exact commit/);
+  assert.match(said[1] as string, /can no longer merge \(gate merge failed\)[\s\S]*```text\nmerge: conflicts: @someone\n```/);
+  assert.ok(gh.calls.slice(m0).some((c) => c.method === "PATCH" && c.body === JSON.stringify({ state: "closed" })));
   assert.equal(readPullRequestRecord(dir, "s-open")?.outcome, "merged");
   assert.equal(readPullRequestRecord(dir, "s-later")?.outcome, "closed");
   const m = gh.calls.length;
+  clock += 6 * 60_000;
   assert.deepEqual(await sync.pass(state), { lines: [], problems: [] });
   assert.equal(gh.calls.length, m, "commented once");
+});
 
-  // Without the permission: said once, with what GitHub wants; then off.
-  deny = true;
-  const denied = pullRequestSync({ patchesDir: tmp(), target: { owner: "anthill-ai", name: "agent-commons" }, github: createGitHub({ token: "github_pat_TESTONLY", fetch: gh.fetch }) });
-  const fresh = prState([verified("s-a"), verified("s-b")]);
-  r = await denied.pass(fresh);
+test("pull requests: a branch that moved off the verified commit gets none, or is closed (before or after the merge), never vouched for; a branch in the target itself only when allowed", async () => {
+  // The tip moved before opening: none, said once.
+  {
+    const gh = fakePulls();
+    let tip: string | null = MOVED;
+    const sync = pullRequestSync({ patchesDir: tmp(), target: TARGET, github: createGitHub({ token: "t0ken-TESTONLY", fetch: gh.fetch }), branchTip: async () => tip });
+    const st = prState([accepted("s-a")]);
+    const r = await sync.pass(st);
+    assert.match(r.problems.join(), /no pull request for s-a: .* is at e{40}, not the verified c{40}/);
+    assert.deepEqual((await sync.pass(st)).problems, [], "said once");
+    assert.equal(gh.calls.length, 0);
+    tip = null;
+    assert.match((await sync.pass(st)).problems.join(), /is at \(nothing\)/);
+    tip = PR_HEAD;
+    assert.equal((await sync.pass(st)).lines.length, 1, "opened once it is back");
+  }
+  // Moved between the check and the open: GitHub opened it on the new tip, so it is closed at once.
+  {
+    const dir = tmp();
+    const gh = fakePulls({ openHead: () => MOVED });
+    const sync = pullRequestSync({ patchesDir: dir, target: TARGET, github: createGitHub({ token: "t0ken-TESTONLY", fetch: gh.fetch }), branchTip: async () => PR_HEAD });
+    const r = await sync.pass(prState([accepted("s-race")]));
+    assert.equal(r.lines.length, 2, r.lines.join("\n"));
+    assert.equal(gh.pulls.get(41)?.state, "closed");
+    assert.match(gh.comments().join(), /this branch has moved to `e{40}` since the commons verified `c{40}`.*Do not merge it/);
+    assert.equal(readPullRequestRecord(dir, "s-race")?.outcome, "closed");
+  }
+  // Open, then force-pushed: closed on the next read. And one that moved before its merge is commented on as such, never "this exact commit".
+  {
+    const dir = tmp();
+    const gh = fakePulls();
+    let clock = 0;
+    const sync = pullRequestSync({ patchesDir: dir, target: TARGET, github: createGitHub({ token: "t0ken-TESTONLY", fetch: gh.fetch }), branchTip: async () => PR_HEAD, now: () => clock });
+    await sync.pass(prState([accepted("s-push"), accepted("s-merged")]));
+    assert.equal(gh.pulls.size, 2);
+    (gh.pulls.get(41) as { headSha: string }).headSha = MOVED;
+    (gh.pulls.get(42) as { headSha: string }).headSha = MOVED;
+    clock += 6 * 60_000;
+    const merged = accepted("s-merged", { merged: { commit: "d".repeat(40), seq: 30, at: "x" } });
+    const r = await sync.pass(prState([accepted("s-push"), merged]));
+    assert.equal(r.lines.length, 2, r.lines.join("\n"));
+    assert.deepEqual([gh.pulls.get(41)?.state, gh.pulls.get(42)?.state], ["closed", "closed"]);
+    const said = gh.comments();
+    assert.equal(said.length, 2);
+    assert.match(said[0] as string, /^Closed by the commons: this branch has moved to `e{40}`/);
+    assert.match(said[1] as string, /The commons merged the verified commit `c{40}` into `dev` at `d{40}`\. Closed by the commons: this branch has moved/);
+    assert.ok(!said.join().includes("this exact commit"));
+    assert.deepEqual([readPullRequestRecord(dir, "s-push")?.outcome, readPullRequestRecord(dir, "s-merged")?.outcome], ["closed", "closed"]);
+  }
+  // A branch in the target itself: none unless the operator allows it.
+  {
+    const gh = fakePulls();
+    const tipped: string[] = [];
+    const st = prState([accepted("s-own", {}, TARGET_URL)]);
+    const off = pullRequestSync({ patchesDir: tmp(), target: TARGET, github: createGitHub({ token: "t0ken-TESTONLY", fetch: gh.fetch }), branchTip: async (src) => (tipped.push(src.repo), PR_HEAD) });
+    assert.match((await off.pass(st)).problems.join(), /its branch is in anthill-ai\/agent-commons itself.*--same-repo-pull-requests/);
+    assert.deepEqual([gh.calls.length, tipped.length], [0, 0]);
+    const on = pullRequestSync({ patchesDir: tmp(), target: TARGET, github: createGitHub({ token: "t0ken-TESTONLY", fetch: gh.fetch }), branchTip: async () => PR_HEAD, allowSameRepoHead: true });
+    assert.equal((await on.pass(st)).lines.length, 1);
+    assert.equal((JSON.parse(gh.calls[0]?.body ?? "{}") as { head: string }).head, sourceBranch(AGENT, "s-own"));
+  }
+});
+
+test("pull requests: a token without the permission is said once and turns them off for an hour, not for good; a secondary rate limit (no headers) is waited out; a refusal of one is retried", async () => {
+  let deny: Reply | null = { status: 403, body: { message: "Resource not accessible by personal access token" }, headers: { "X-Accepted-GitHub-Permissions": "pull_requests=write" } };
+  const gh = fakePulls({ deny: () => deny });
+  let clock = 0;
+  const sync = pullRequestSync({ patchesDir: tmp(), target: TARGET, github: createGitHub({ token: "github_pat_TESTONLY", fetch: gh.fetch }), branchTip: async () => PR_HEAD, now: () => clock });
+  const fresh = prState([accepted("s-a"), accepted("s-b")]);
+  let r = await sync.pass(fresh);
   assert.equal(r.problems.length, 1);
-  assert.match(r.problems[0] as string, /the token needs Pull requests read and write there \(GitHub wants: pull_requests=write\); pull requests are off until restart, everything else goes on/);
+  assert.match(r.problems[0] as string, /the token needs Pull requests read and write there \(GitHub wants: pull_requests=write\); pull requests are off for 60 min, everything else goes on/);
   assert.ok(!r.problems[0]?.includes("TESTONLY"));
   const k = gh.calls.length;
-  assert.deepEqual(await denied.pass(fresh), { lines: [], problems: [] });
-  assert.equal(gh.calls.length, k, "no more requests");
+  assert.deepEqual(await sync.pass(fresh), { lines: [], problems: [] });
+  assert.equal(gh.calls.length, k, "no more requests for now");
+  // An hour on, the permission granted: it opens them.
+  clock += 61 * 60_000;
+  deny = null;
+  assert.equal((await sync.pass(fresh)).lines.length, 2);
+
+  // A secondary rate limit: 403 with neither rate-limit header, only its message.
+  deny = { status: 403, body: { message: "You have exceeded a secondary rate limit. Please wait a few minutes before you try again." } };
+  const limited = pullRequestSync({ patchesDir: tmp(), target: TARGET, github: createGitHub({ token: "github_pat_TESTONLY", fetch: gh.fetch }), branchTip: async () => PR_HEAD, now: () => clock });
+  r = await limited.pass(prState([accepted("s-c")]));
+  assert.deepEqual(r.problems, ["GitHub's rate limit stops pull requests for now; tried again next pass"]);
+  const j = gh.calls.length;
+  await limited.pass(prState([accepted("s-c")]));
+  assert.equal(gh.calls.length, j + 1, "tried again the next pass, not turned off");
+  deny = null;
+  assert.equal((await limited.pass(prState([accepted("s-c")]))).lines.length, 1);
 
   // GitHub refusing one (422: no dev there yet) is said once and retried.
-  deny = false;
   const noDev = fakeGitHub(() => ({ status: 422, body: { message: "Validation Failed", errors: [{ field: "base", code: "invalid" }] } }));
-  const retry = pullRequestSync({ patchesDir: tmp(), target: { owner: "anthill-ai", name: "agent-commons" }, github: createGitHub({ token: "t0ken-TESTONLY", fetch: noDev.fetch }) });
-  const one = prState([verified("s-a")]);
+  const retry = pullRequestSync({ patchesDir: tmp(), target: TARGET, github: createGitHub({ token: "t0ken-TESTONLY", fetch: noDev.fetch }), branchTip: async () => PR_HEAD });
+  const one = prState([accepted("s-a")]);
   assert.equal((await retry.pass(one)).problems.length, 1);
   assert.deepEqual((await retry.pass(one)).problems, [], "said once");
   assert.ok(noDev.calls.filter((c) => c.method === "POST").length >= 2, "tried again");
