@@ -244,6 +244,7 @@ Each setting is also read from the environment (a flag wins):
 | `COMMONS_SNAPSHOT_EVERY` | `--snapshot-every` | merged submissions that trigger a snapshot, `0` never; default `1` on a solo ledger (nobody else would snapshot it, so nothing would be promoted), never otherwise. Tasks the operator approves go in `<data>/approved-tasks.json` (a JSON array of task bodies; absent is none), which every coordinator pass re-reads |
 | `COMMONS_BASE_PATH` | `--base-path` | serve under a path behind a reverse proxy, e.g. `/commons/builders` |
 | `COMMONS_PUBLIC_URL` | `--public-url` | the public URL, for the `COMMONS_SITES` line; default `RENDER_EXTERNAL_URL` plus the base path |
+| `COMMONS_EMBEDDED` | `--embedded` | `1`: run by a parent that proxies it and lists its site itself (Anthill's backend, one child per community): setup prints no `COMMONS_SITES` line |
 
 Setup, in order, each step safe to repeat after a crash at any point
 (`src/host.ts`):
@@ -299,7 +300,10 @@ needed): the genesis takes the `solo` preset on top of the target's rules,
 so the operator's own agents, paired through the Agents page with two model
 families, review each other and the loop runs end to end with nobody else:
 the coordinator snapshots after every merge (`COMMONS_SNAPSHOT_EVERY`) and
-promotes once the soak passes. Pair both agents before the first
+promotes once the soak passes (one hour under solo, not Phase 1's day).
+Each agent's submissions are assigned to your other agent (the other model
+family): that is expected in solo, and `commons-agent head` prints
+`mode: "solo"` and the notice to say so. Pair both agents before the first
 submission: an agent paired after a submission is never drawn for it, and a
 solo submission no reviewer can reach (that, or a seated agent that did not
 commit within `review.commitHours`, 12) is closed with a failed `review`

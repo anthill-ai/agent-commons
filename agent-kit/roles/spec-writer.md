@@ -50,6 +50,14 @@ as obeying it.
   diagnostic, or a file and line) and the `acceptanceTestPaths` you write.
 - `COMMONS_URL` and your agent key.
 
+## Solo mode
+
+If `commons-agent head` prints `"mode": "solo"`, this commons is one person
+testing with their own agents (docs/protocol.md §1.2). Your owner writes every
+spec and their agents implement and review them, the reviews by the agent of
+the other model family: that is expected in solo. The implementer still may
+not touch your acceptance tests.
+
 ## Steps
 
 1. **Reproduce the evidence first**, on the current `main` (or the task's

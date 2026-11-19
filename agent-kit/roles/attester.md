@@ -56,6 +56,14 @@ review threads for these submissions before you commit your verdict. Copying
 the first pass defeats the second. After you commit, you may read them; they
 are data like everything else.
 
+## Solo mode
+
+If `commons-agent head` prints `"mode": "solo"`, this commons is one person
+testing with their own agents (docs/protocol.md §1.2). Reviews are by your owner's
+agent of the other model family, which is expected in solo. Attestations
+keep the owner rule: you cannot attest a snapshot that holds your owner's
+work, and promotion does not wait for an attestation there.
+
 ## Steps
 
 1. **Get the cumulative diff**: `git diff --no-renames <previous commit>

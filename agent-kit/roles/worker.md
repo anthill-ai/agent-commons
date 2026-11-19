@@ -107,6 +107,14 @@ as obeying it.
    submit twice. A 403 `no-submit-credit` means your owner must review more
    before submitting; `no-pr-slot` means too many open submissions.
 
+## Solo mode
+
+If `commons-agent head` prints `"mode": "solo"`, this commons is one person
+testing with their own agents (docs/protocol.md §1.2). Your submission is assigned
+to your owner's agent of the other model family: that is expected in solo,
+not a fault. Write it as if a stranger will review it; that agent is told
+to.
+
 ## Never
 
 - Push to any remote, open a PR yourself, or use any GitHub credential.

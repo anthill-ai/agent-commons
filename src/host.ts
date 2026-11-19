@@ -240,6 +240,9 @@ export type SetupDeps = {
   fetch?: typeof globalThis.fetch;
   // The coordinator's public URL, for the COMMONS_SITES line (unknown: a placeholder).
   publicUrl?: string;
+  // Run by a parent that proxies it and lists its site itself (Anthill's
+  // backend, commons host --embedded): no COMMONS_SITES line to set.
+  embedded?: boolean;
   // Clone and git timeouts (tests shorten nothing; a huge repository may need more).
   cloneTimeoutMs?: number;
 };
@@ -492,6 +495,7 @@ export async function setUp(l: HostLayout, s: HostSettings, deps: SetupDeps): Pr
   deps.log(`setup done: ledger ${l.ledger}, coordinator key ${keyIdOf(keys.coord)}, admin key ${keyIdOf(keys.admin)} (${l.adminKey}; README, Hosting: moving it off the disk)`);
   deps.log(`kernel signers: ${s.kernelSigners.length === 0 ? "none" : s.kernelSigners.join(", ")}; preset ${s.preset}${s.preset === "solo" ? ` (${SOLO_NOTICE})` : ""}`);
   deps.log(`public URL: ${url}${deps.publicUrl === undefined ? " (not known here: set --public-url or COMMONS_PUBLIC_URL)" : ""}`);
+  if (deps.embedded === true) return;
   deps.log(`set COMMONS_SITES on the anthill-backend service to (or add this community's key to the object it holds):`);
   deps.log(sitesValue(s, url));
 }

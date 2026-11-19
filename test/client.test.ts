@@ -74,6 +74,7 @@ class FakeCoordinator {
   minute = 1;
   conflictsLeft = 0;
   headGets = 0;
+  headExtra: Record<string, unknown> = {}; // what a solo coordinator adds to GET /api/head
   posts = 0;
   conflicts409 = 0;
   failUploads = 0; // answer 500 to the next N uploads
@@ -137,7 +138,7 @@ class FakeCoordinator {
     const url = new URL(req.url ?? "/", "http://x");
     if (req.method === "GET" && url.pathname === "/api/head") {
       this.headGets++;
-      return send(200, this.head());
+      return send(200, { ...this.head(), ...this.headExtra });
     }
     if (req.method === "GET" && url.pathname === "/api/entries") {
       const since = Number(url.searchParams.get("since") ?? 0);
@@ -1016,6 +1017,26 @@ test("commons-agent CLI: keygen writes 0600 and never prints the private key; re
     assert.equal(await agentMain(["reveal-review", "s-bob"], env, io), 0);
     assert.deepEqual(f.state.submissions.get("s-bob")?.reviews[0]?.verdict, verdict);
     assert.equal(await agentMain(["bogus"], env, io), 2);
+  });
+});
+
+test("commons-agent CLI: head prints the mode and notice of a solo ledger, and nothing more elsewhere", async () => {
+  await withFake(async (f) => {
+    const dir = tmpDir();
+    fs.writeFileSync(path.join(dir, "alice.json"), JSON.stringify(f.aliceAgent));
+    const env = { COMMONS_URL: f.baseUrl, COMMONS_KEY_FILE: path.join(dir, "alice.json"), COMMONS_SALT_DIR: path.join(dir, "salts") };
+    const outs: string[] = [];
+    const io = { out: (s: string) => void outs.push(s), err: () => {}, stdin: () => "" };
+    assert.equal(await agentMain(["head"], env, io), 0);
+    assert.deepEqual(Object.keys(JSON.parse(outs.pop() ?? "{}")).sort(), ["at", "hash", "nextSeq", "seq"]);
+    f.headExtra = { mode: "solo", notice: "solo test: your own agents review each other" };
+    assert.equal(await agentMain(["head"], env, io), 0);
+    const solo = JSON.parse(outs.pop() ?? "{}") as Record<string, unknown>;
+    assert.equal(solo.mode, "solo");
+    assert.equal(solo.notice, "solo test: your own agents review each other");
+    assert.equal(solo.seq, f.head().seq);
+    // CommonsClient.head() carries them too.
+    assert.equal((await new CommonsClient({ baseUrl: f.baseUrl, agentKey: f.aliceAgent }).head()).mode, "solo");
   });
 });
 

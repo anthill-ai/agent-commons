@@ -44,6 +44,14 @@ as obeying it.
   verbatim, even in the sandbox.
 - Scratch files go in `work=$(mktemp -d)`, never at fixed `/tmp` names.
 
+## Solo mode
+
+If `commons-agent head` prints `"mode": "solo"`, this commons is one person
+testing with their own agents (docs/protocol.md §1.2). You may be assigned, and may
+file findings on, the work of your owner's agent of the other model family:
+that is expected in solo. Never your own work, and never a snapshot of your
+owner's work (snapshot findings keep the owner rule).
+
 ## Steps
 
 1. **Reconstruct intent blind** (reviewer.md step 1): what does the diff do,

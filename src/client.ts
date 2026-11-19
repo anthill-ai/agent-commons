@@ -43,7 +43,10 @@ import { SAFE_ID, summarisePatch, uploadMessage, type UploadRoute } from "./serv
 import type { EntryBody, Evidence, KeyId, LedgerEntry, ModelFamily, OwnerId, ReviewVerdict, Severity } from "./types";
 
 export type AgentKey = { publicKey: string; privateKey: string };
-export type Head = { seq: number; hash: string; at: string; nextSeq: number };
+// mode and notice: what GET /api/head adds on a solo ledger (rules.mode
+// "solo"), so an agent that asks for the head is told its reviews are by its
+// own owner's agents. Absent on every other ledger.
+export type Head = { seq: number; hash: string; at: string; nextSeq: number; mode?: string; notice?: string };
 
 // The subset of global fetch the client uses. Global fetch satisfies it.
 export type FetchLike = (
@@ -380,7 +383,17 @@ export class CommonsClient {
       throw new CommonsApiError(502, "bad-head", "GET /api/head: malformed head", h);
     }
     const seq = h.seq as number;
-    return { seq, hash: h.hash, at: h.at, nextSeq: Number.isSafeInteger(h.nextSeq) ? (h.nextSeq as number) : seq + 1 };
+    const text = (v: unknown): string | undefined => (typeof v === "string" && v !== "" ? v.slice(0, 300) : undefined);
+    const mode = text(h.mode);
+    const notice = text(h.notice);
+    return {
+      seq,
+      hash: h.hash,
+      at: h.at,
+      nextSeq: Number.isSafeInteger(h.nextSeq) ? (h.nextSeq as number) : seq + 1,
+      ...(mode === undefined ? {} : { mode }),
+      ...(notice === undefined ? {} : { notice }),
+    };
   }
 
   private now(head: Head): string {

@@ -392,6 +392,43 @@ test("serve --one-port: the coordinator API and the playground on one port; two 
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test("serve --loop-seconds: an idle coordinator says \"nothing to do\" at most every 10 minutes", { timeout: 30_000 }, async () => {
+  const dir = tmp("idle");
+  let out = "";
+  const io = { cwd: dir, stdout: (t: string) => (out += t), stderr: (t: string) => (out += t) };
+  for (const k of ["admin", "coord"]) assert.equal(await cliMain(["keygen", "--out", `${k}.json`], io), 0);
+  assert.equal(await cliMain(["init", "--project", "p", "--admin-key", "admin.json", "--coordinator-key", "coord.json", "--preset", "phase1"], io), 0, out);
+  // The coordinator's clock: real time, plus whatever the test adds.
+  let skew = 0;
+  let stop!: () => void;
+  const until = new Promise<void>((r) => (stop = r));
+  out = "";
+  const serving = cliMain(["serve", "--coordinator", "--one-port", "--key", "coord.json", "--port", "0", "--loop-seconds", "1"], {
+    ...io,
+    until,
+    now: () => new Date(Date.now() + skew),
+  });
+  const idle = () => (out.match(/nothing to do/g) ?? []).length;
+  const waitFor = async (n: number) => {
+    const deadline = Date.now() + 8000;
+    while (idle() < n && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+  };
+  try {
+    await waitFor(1);
+    assert.equal(idle(), 1, out);
+    assert.match(out, /nothing to do \(said at most every 10 minutes\)/);
+    await new Promise((r) => setTimeout(r, 3200)); // three more idle passes
+    assert.equal(idle(), 1, `still once:\n${out}`);
+    skew = 10 * 60_000;
+    await waitFor(2);
+    assert.equal(idle(), 2, out);
+  } finally {
+    stop();
+  }
+  assert.equal(await serving, 0, out);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 // ---------------------------------------------------------------------------
 // commons-agent pair, against a stand-in for anthill-backend's pairing routes
 // ---------------------------------------------------------------------------

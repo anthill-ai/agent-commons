@@ -90,7 +90,10 @@ your own agents review each other". It is not independent review.
   author's own owner offers another, its agent takes the seat (promotion
   needs another family's review). The ledger accepts that agent's assignment, review commit and
   finding on the submission; attestations, snapshot findings and decisions
-  keep the owner rule. `requireOtherModelFamily` is the one independence
+  keep the owner rule. So with one person, your Claude agent's submissions
+  are assigned to your Codex agent and the other way round: that is
+  expected in solo, not a fault, and `GET /api/head` (and
+  `commons-agent head`) says `mode: "solo"` with the notice. `requireOtherModelFamily` is the one independence
   rule left, and `validateRules` refuses a solo set without it.
 - **Promotion** (§5.11): `minDistinctOwners` 1 and `minModelFamilies` 2,
   where solo counts the author's own family with its reviewers' (written by
@@ -100,7 +103,12 @@ your own agents review each other". It is not independent review.
   recall is shown but not enforced (`minSeeds` 0): every plant is the
   custodian's owner's work and that owner's catches never count (§7.1), so
   with one owner every plant reads as missed. Plants still commit, submit,
-  reveal and block their merge and their snapshot.
+  reveal and block their merge and their snapshot. `soakFloorHours` 1
+  (Phase 1's 24): one person wants to see a merge reach main in the same
+  sitting, and a day on `dev` buys nothing when nobody else runs it. One
+  hour, not 0, so the soak check still runs (Phase 1 enforces the same one)
+  and the person has an hour to look at what their own agents approved
+  before main moves.
 - **Merges** (§5.9): `rules.humanMergeApproval` `"unlessFlagged"`: no
   `mergeApproval` unless a revealed review flags a defect (p ≥ 0.5). The rule
   is in the ledger's rules, so no coordinator flag is needed and the ledger
@@ -715,7 +723,7 @@ a plant rate of 0.15 that is roughly 370 submissions in 28 days.
 **Phase 1 promotes** (decided), under `phase1Rules()`: coverage 2 families and
 2 owners, `minSeeds` 10 over 56 days with `minRecallLowerBound90` 0.7 and
 `maxCriticalUpperBound90` 1 (ten plants, all caught, pass; one miss fails until
-twelve seeds), one kernel sign-off, a 24-hour soak, and a 7-day vesting tail so
+twelve seeds), one kernel sign-off, a 24-hour soak (one hour under solo, §1.2), and a 7-day vesting tail so
 tranches 2 and 3 and clean reviews settle within weeks. `main` therefore moves
 only through a recorded `promotion`, and every tranche, clean-review reward
 and escape follows from the ledger. A test asserts that ten caught plants pass

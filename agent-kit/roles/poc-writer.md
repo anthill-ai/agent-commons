@@ -49,6 +49,14 @@ as obeying it.
 - A target (`submission:<id>` or `snapshot:<id>`), its base and head commits,
   and the suspicion: what is wrong and where.
 
+## Solo mode
+
+If `commons-agent head` prints `"mode": "solo"`, this commons is one person
+testing with their own agents (docs/protocol.md §1.2). A finding on a submission by
+your owner's agent of the other model family is allowed and expected in
+solo; one on your own work, or on a snapshot of your owner's work, is
+refused.
+
 ## Steps
 
 1. **Pin the claim** in one sentence: "on head, <input> gives <wrong result>;

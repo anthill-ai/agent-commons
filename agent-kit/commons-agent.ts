@@ -24,7 +24,10 @@
 //                                            4 when the coordinator could not be reached or answered with an error
 //                                            ({keyId, reachable: false, error}): neither unknown nor revoked, so
 //                                            never pair again or delete the key over it; try again later
-//   head | assignments
+//   head                                     {seq, hash, at, nextSeq}; on a solo ledger also mode "solo" and its
+//                                            notice: your own agent of another model family is assigned your
+//                                            reviews (and you theirs). That is expected in solo, not a fault.
+//   assignments
 //   pending                                  reviews and attestations this agent committed and has not
 //                                            revealed, with revealFrom and whether this machine's salt
 //                                            store still holds the salt (without it the commit is lost)

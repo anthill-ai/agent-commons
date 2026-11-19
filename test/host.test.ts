@@ -414,12 +414,12 @@ test("host: preset solo sets up with no kernel signer and snapshots by default; 
     const target = bareTarget(dir);
     const data = path.join(dir, "data");
     const ledgerFile = path.join(data, "commons-ledger.jsonl");
-    const start = async (env: NodeJS.ProcessEnv) => {
+    const start = async (env: NodeJS.ProcessEnv, extra: string[] = []) => {
       const port = await freePort();
       let stopNow = () => {};
       const until = new Promise<void>((r) => (stopNow = r));
       let err = "";
-      const done = main(["host", "--data", data, "--port", String(port), "--anthill-url", anthill.url, "--target-repo", target, "--test-allow-file-target", "--setup-retry-seconds", "1"], {
+      const done = main(["host", "--data", data, "--port", String(port), "--anthill-url", anthill.url, "--target-repo", target, "--test-allow-file-target", "--setup-retry-seconds", "1", ...extra], {
         cwd: data,
         until,
         env,
@@ -433,7 +433,10 @@ test("host: preset solo sets up with no kernel signer and snapshots by default; 
     };
     const lines = () => fs.readFileSync(ledgerFile, "utf8").trim().split("\n").map((l) => JSON.parse(l) as { body: { kind: string; rules?: Rules } });
 
-    const first = await start({ COMMONS_PRESET: "solo" });
+    // Embedded (Anthill's backend runs it and lists its site): no COMMONS_SITES line to set.
+    const first = await start({ COMMONS_PRESET: "solo" }, ["--embedded"]);
+    assert.match(first.err, /setup done/);
+    assert.doesNotMatch(first.err, /COMMONS_SITES/);
     assert.equal(first.head.mode, "solo");
     assert.equal(first.head.notice, "solo test: your own agents review each other");
     assert.match(first.err, /kernel signers: none; preset solo \(solo test/);

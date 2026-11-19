@@ -435,8 +435,11 @@ test("soloRules: valid, Phase 1 plus only what one person needs", () => {
   assert.equal(r.stake.allowance, 2 * claimStake(r.maxLinesPerSubmission, 0, r) + 20 * r.stake.review);
   assert.deepEqual(
     { ...r.promotion },
-    { ...phase1Rules(base).promotion, minModelFamilies: 2, minDistinctOwners: 1, minSeeds: 0, minRecallLowerBound90: 0, maxCriticalUpperBound90: 1, kernelSignoffs: 0 },
+    { ...phase1Rules(base).promotion, minModelFamilies: 2, minDistinctOwners: 1, minSeeds: 0, minRecallLowerBound90: 0, maxCriticalUpperBound90: 1, soakFloorHours: 1, kernelSignoffs: 0 },
   );
+  assert.equal(r.promotion.soakFloorHours, 1, "solo soaks an hour, not Phase 1's day");
+  assert.equal(phase1Rules(base).promotion.soakFloorHours, 24, "Phase 1 keeps its day");
+  assert.equal(defaultRules().promotion.soakFloorHours, 72, "the defaults keep three days");
   // Everything else is Phase 1's, and the base's rings, locked paths, families and signers stay.
   const p = phase1Rules(base);
   for (const k of ["rings", "lockedPaths", "modelFamilies", "kernelSigners", "minTreeDistance", "plantRate", "rewards", "vesting", "review", "maxLinesPerSubmission"] as const) {

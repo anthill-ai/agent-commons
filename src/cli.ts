@@ -1669,7 +1669,13 @@ function patchesDir(ctx: Ctx): string {
   return p === undefined ? path.join(path.dirname(ledgerPath(ctx)), "patches") : resolvePath(ctx, p);
 }
 
-async function coordinatorPass(ctx: Ctx, store: LedgerStore): Promise<number> {
+// How often a looping coordinator (serve --loop-seconds) says "nothing to do":
+// every 30 seconds it would fill the log with the line.
+const IDLE_LINE_EVERY_MS = 10 * 60_000;
+
+// idleLine: what a pass that did nothing prints, null for nothing (run-once
+// always says "nothing to do").
+async function coordinatorPass(ctx: Ctx, store: LedgerStore, idleLine: () => string | null = () => "nothing to do"): Promise<number> {
   const f = ctx.flags;
   const anthillUrl = str(f, "anthill-url");
   if (anthillUrl !== undefined) {
@@ -1728,7 +1734,10 @@ async function coordinatorPass(ctx: Ctx, store: LedgerStore): Promise<number> {
     ctx.out(`${l.ok ? "ok  " : "FAIL"} ${l.action.kind}${subject}: ${l.detail}${l.seqs.length ? ` [#${l.seqs.join(", #")}]` : ""}`);
     if (!l.ok) failed++;
   }
-  if (log.length === 0) ctx.out("nothing to do");
+  if (log.length === 0) {
+    const line = idleLine();
+    if (line !== null) ctx.out(line);
+  }
   return failed === 0 ? 0 : 1;
 }
 
@@ -2929,10 +2938,18 @@ const COMMANDS: Record<string, Command> = {
         const every = int(f, "loop-seconds", { min: 1 });
         if (every !== undefined) {
           let running = false;
+          // "nothing to do" at most every IDLE_LINE_EVERY_MS (by the io clock).
+          let idleSaidAt = Number.NEGATIVE_INFINITY;
+          const idleLine = () => {
+            const t = ctx.io.now().getTime();
+            if (t - idleSaidAt < IDLE_LINE_EVERY_MS) return null;
+            idleSaidAt = t;
+            return `nothing to do (said at most every ${IDLE_LINE_EVERY_MS / 60_000} minutes)`;
+          };
           timer = setInterval(() => {
             if (running) return;
             running = true;
-            coordinatorPass(ctx, store)
+            coordinatorPass(ctx, store, idleLine)
               .catch((e: unknown) => ctx.io.stderr(`coordinator pass: ${(e as Error).message}\n`))
               .finally(() => (running = false));
           }, every * 1000);
@@ -2971,6 +2988,7 @@ const COMMANDS: Record<string, Command> = {
       "base-path": { type: "string", help: "serve under this path behind a reverse proxy, e.g. /commons/builders (env COMMONS_BASE_PATH)" },
       "public-url": { type: "string", help: "the coordinator's public URL, for the COMMONS_SITES line setup prints (env COMMONS_PUBLIC_URL; default RENDER_EXTERNAL_URL + base path)" },
       "trusted-proxy": { type: "list", help: "as serve --trusted-proxy (loopback for a parent process proxying on this machine)" },
+      embedded: { type: "boolean", help: "run by a parent that proxies it and lists its site itself (Anthill's backend): setup prints no COMMONS_SITES line (env COMMONS_EMBEDDED=1)" },
       "loop-seconds": { type: "string", help: "a coordinator pass this often (default 30)" },
       "setup-retry-seconds": { type: "string", help: "first wait before retrying a setup step that may succeed later (network, Anthill, git host); doubles up to 600 (default 60)" },
       "hold-on-failure": { type: "boolean", help: "if setup or serve cannot start, keep answering 503 on the port instead of exiting (a service with no other way in than its shell)" },
@@ -3068,6 +3086,7 @@ const COMMANDS: Record<string, Command> = {
               init: (argv) => main(argv, { ...ctx.io, stdout: (t) => ctx.io.stderr(t) }),
               ...(ctx.io.fetch ? { fetch: ctx.io.fetch } : {}),
               ...(publicUrl ? { publicUrl } : {}),
+              embedded: bool(f, "embedded") || env.COMMONS_EMBEDDED === "1",
             });
             break;
           } catch (e) {

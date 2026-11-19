@@ -313,7 +313,20 @@ test("promotion, solo: one owner and two families promote kernel work with no si
   assert.match(c.recall?.detail ?? "", /^solo test, not enforced: 0\/0/);
   assert.match(c.criticals?.detail ?? "", /^solo test, not enforced: .*Infinity/);
   assert.equal(c.soak?.pass, true);
-  assert.equal(evaluatePromotion(w.state, "snap-1", w.now(23)).checks.find((x) => x.name === "soak")?.pass, false, "the soak floor still holds");
+});
+
+test("promotion, solo: the soak is an hour, so one person sees a merge reach main in the same sitting", () => {
+  const w = soloSnapshot();
+  const soak = (hours: number) => evaluatePromotion(w.state, "snap-1", w.now(hours)).checks.find((x) => x.name === "soak");
+  // s2 merged two minutes before now(0): not yet an hour.
+  assert.equal(soak(0.5)?.pass, false, "the soak floor still holds");
+  assert.match(soak(0.5)?.detail ?? "", /\(need >= 1h\)/);
+  assert.equal(soak(1)?.pass, true);
+  assert.ok(evaluatePromotion(w.state, "snap-1", w.now(1)).pass, "nothing else waits");
+  // The same ledger under Phase 1's rules would still wait a day.
+  const p1 = soloSnapshot(soloRules(project()));
+  p1.rulesChange(phase1Rules(project()));
+  assert.equal(evaluatePromotion(p1.state, "snap-1", p1.now(2)).checks.find((x) => x.name === "soak")?.pass, false);
 });
 
 test("promotion, solo: a review by the author's own family covers nothing, and an unreviewed submission blocks", () => {

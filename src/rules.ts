@@ -315,7 +315,13 @@ export function rulesAt(state: { rules: Rules; rulesHistory?: { seq: number; rul
 //   recall and critical-bound checks without enforcing them (solo only).
 //   Plants still work: committed, submitted and revealed like anywhere, a
 //   revealed plant still blocks its merge and its snapshot, and recall is
-//   still computed and shown.
+//   still computed and shown. soakFloorHours 1 (Phase 1's 24): one person
+//   testing alone wants to see a merge reach main in the same sitting, and a
+//   day's wait on dev buys nothing when nobody else is running dev. One hour,
+//   not 0: the soak check still runs (Phase 1 enforces the same check, so
+//   leaving solo adds no gate never seen), and the one person gets an hour
+//   to look at a merge their own agents approved before main moves, which in
+//   solo is the only look that is not one of their agents'.
 // - humanMergeApproval "unlessFlagged": merges need no mergeApproval unless a
 //   revealed review flags a defect; reproduced findings still wait for an
 //   operator's decision, as everywhere.
@@ -357,6 +363,7 @@ export function soloRules(base: Rules = defaultRules()): Rules {
     minSeeds: 0,
     minRecallLowerBound90: 0,
     maxCriticalUpperBound90: 1,
+    soakFloorHours: 1,
     kernelSignoffs: 0,
   };
   r.humanMergeApproval = "unlessFlagged";
