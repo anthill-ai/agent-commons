@@ -73,10 +73,13 @@ Principles every module follows:
   owner reviews through agents of another family, never the author; promotion
   counts the author's family; recall shown, not enforced), `assignedReviewers`
   1, `minDistinctOwners` 1, `minModelFamilies` 2, `kernelSignoffs` 0,
-  `humanMergeApproval: "unlessFlagged"`, `freeSubmitCredits` 10, allowance 740.
+  `humanMergeApproval: "unlessFlagged"`, `freeSubmitCredits` 10, `basePrSlots`
+  2, allowance 740.
   `PRESETS` names both for `init --preset`, `rules set --preset` and `commons
   host`; `SOLO_NOTICE` is what the playground and `GET /api/head` show.
-- Optional `Rules` fields `mode`, `humanMergeApproval`, `freeSubmitCredits`:
+- `rulesAt(state, seq)` — the rules in force when entry `seq` was appended
+  (from `rulesHistory`).
+- Optional `Rules` fields `mode`, `humanMergeApproval`, `freeSubmitCredits`, `basePrSlots`:
   absent means what every ledger made before them did; `validateRules` checks
   them apart from the template and refuses a solo set without
   `requireOtherModelFamily`, `minModelFamilies` >= 2 and `minDistinctOwners` >= 1.
@@ -325,9 +328,10 @@ review and incentives import it).
   content first reached main (its own or a descendant's promotion).
 
 ### `src/incentives.ts` (pure; returns settlement bodies, the coordinator appends them)
-- `claimStake` (re-exported from rules), `prSlots(reputation)` = 1 + floor(log2(1 + reputation))
-  (the server passes commons reputation, `reputationDelta` floored at 0),
-  `submitCredits(state, owner)`, `duplicateShares(n, decay)`, `apportion(total, weights)`.
+- `claimStake` (re-exported from rules), `prSlots(reputation, base = 1)` = base + floor(log2(1 + reputation))
+  (the server passes commons reputation, `reputationDelta` floored at 0, and `rules.basePrSlots`),
+  `submitCredits(state, owner)` (a rulesChange that lowers `freeSubmitCredits`
+  leaves each owner at most the new allowance, never in debt), `duplicateShares(n, decay)`, `apportion(total, weights)`.
 - `settleFinding(state, findingId, stage: "dev" | "release" | "main", nowIso?)`,
   `settleMerge(state, submissionId, tranche: 1 | 2 | 3, nowIso)`,
   `settleCleanReviews(state, snapshotId, nowIso)`, `settleMissedPlant(state, submissionId)`,
@@ -348,7 +352,8 @@ review and incentives import it).
   leader's decision); a dismissed one costs its finder (`settleFalseFinding`).
   `settleMerge` and `settleCleanReviews` pay nothing for a taskless
   submission, and clean reviews pay only owners farther than
-  `minTreeDistance` from the author's. `settleMissedPlant`
+  `minTreeDistance` from the author's. A merge under solo rules (`rulesAt`
+  its seq) vests only with a review revealed before it by such an owner. `settleMissedPlant`
   does not charge an assigned seat that someone else's reproduction shut out
   before its commit deadline. `settleExpiredClaims` judges every entry in
   `claimHistory`; a submission anywhere in the holder's unbroken run (from
@@ -394,7 +399,8 @@ review and incentives import it).
   BYTES_PER_LINE` (200) added bytes, and on any binary file that is not a known
   asset type.
 - `specSeparation.ts`: `checkSpecSeparation(state, submissionId, repoDir?): GateReport`
-  — the implementer's owner differs from `task.specAuthor`; the submission
+  — the implementer's owner differs from `task.specAuthor` (waived under solo
+  rules, where one owner writes every spec, and said so); the submission
   touches neither the acceptance tests nor test-runner config, mocks or
   snapshots; with `repoDir`, nor any helper the acceptance tests import.
 - `index.ts`: `checkTaskRing(state, submissionId): GateReport | null` (a
@@ -450,7 +456,10 @@ review and incentives import it).
   nobody is slashed), patch binding, gates, reviewer assignment,
   `closeReviewWindow` (a `reviewWindowClosed` entry when the window's time ran
   out with a quorum), merges (a bridge `MergeConflictError` is recorded as a
-  failed `MERGE_GATE` "merge" gateResult, so the submission is dead),
+  failed `MERGE_GATE` "merge" gateResult, so the submission is dead), and,
+  under solo rules only, a failed `REVIEW_GATE` "review" gateResult for a
+  submission no review can reach (`soloUnreviewable`: no eligible reviewer at
+  the draw, or the commit phase ended below quorum),
   snapshots over the clean prefix of merges,
   promotions (`promotion.evaluatePromotion` alone). Injected module APIs
   (`IncentivesApi`, `PromotionApi`, `SelectionApi` = `{ drawAssignment }`)
@@ -495,7 +504,7 @@ review and incentives import it).
   concurrency cap (IPv6 counted per /64, `addressGroup`), a minimum body rate
   enforced all along after `bodyGraceMs`, bounded rate buckets, and the
   client address from X-Forwarded-For only behind a trusted proxy.
-- Policy: submit credits, PR slots `prSlots(max(0, reputationDelta))`
+- Policy: submit credits, PR slots `prSlots(max(0, reputationDelta), rules.basePrSlots ?? 1)`
   (commons reputation, so a newcomer has the base slot), and stakes backed by
   `availableReputation(state, owner)` = `rules.stake.allowance` +
   `reputationDelta` − `lockedStake`.

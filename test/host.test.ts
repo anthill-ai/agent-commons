@@ -6,12 +6,15 @@ import * as http from "node:http";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { treeMessage, type AnthillTreeSnapshot } from "../src/anthill";
+import { ownerMessage, treeMessage, type AnthillTreeSnapshot } from "../src/anthill";
 import { normaliseBasePath } from "../src/basePath";
 import { main } from "../src/cli";
-import { generateKeyPair, sign } from "../src/crypto";
+import { generateKeyPair, keyIdOf, sign } from "../src/crypto";
 import { ringOf } from "../src/gates/rings";
 import { readHostSettings, targetRepoProblems } from "../src/host";
+import { Ledger } from "../src/ledger";
+import { commitmentFor } from "../src/review";
+import { assignmentBody } from "../src/selection";
 import { validateRules } from "../src/rules";
 import { startPlayground } from "../src/playground";
 import { proxyMatcher } from "../src/server";
@@ -23,6 +26,7 @@ import type { Rules } from "../src/types";
 const ROOT = path.resolve(__dirname, "..");
 const SIGNER = `0x${"a1".repeat(20)}`;
 const SIGNER2 = `0x${"b2".repeat(20)}`;
+const SIGNER3 = `0x${"c3".repeat(20)}`;
 const FOUNDER = `0x${"0f".repeat(20)}`;
 const tmp = () => fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "host-"));
 
@@ -146,7 +150,7 @@ function bareTarget(dir: string, rules?: Rules): string {
   return `file://${bare}`;
 }
 
-type FakeAnthill = { url: string; close: () => Promise<void> };
+type FakeAnthill = { url: string; key: { publicKey: string; privateKey: string }; close: () => Promise<void> };
 
 async function fakeAnthill(): Promise<FakeAnthill> {
   const key = generateKeyPair();
@@ -168,7 +172,7 @@ async function fakeAnthill(): Promise<FakeAnthill> {
     json(404, { error: "not found" });
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
-  return { url: `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`, close: () => new Promise((r) => server.close(() => r())) };
+  return { url: `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`, key, close: () => new Promise((r) => server.close(() => r())) };
 }
 
 const freePort = () =>
@@ -214,6 +218,31 @@ async function get(port: number, p: string, timeoutMs = 20_000): Promise<{ statu
       await new Promise((r) => setTimeout(r, 50));
     }
   }
+}
+
+// On a commons host's (Anthill-linked) solo ledger: an owner with a Claude
+// and a Codex agent, and s1 by one, reviewed by the other and merged, but in
+// no promoted snapshot.
+function strandSoloWork(ledgerFile: string, data: string, anthillKey: { privateKey: string }): void {
+  const ledger = Ledger.open(ledgerFile);
+  const coord = JSON.parse(fs.readFileSync(path.join(data, "keys", "coord.json"), "utf8")) as { publicKey: string; privateKey: string };
+  const owner = generateKeyPair();
+  const cc = generateKeyPair();
+  const cx = generateKeyPair();
+  let t = Math.max(Date.now(), Date.parse(ledger.entries().at(-1)?.at ?? "")) + 1000;
+  const at = () => new Date((t += 1000)).toISOString();
+  const attestation = { community: "builders", user: SIGNER, publicKey: owner.publicKey, at: new Date(t).toISOString() };
+  ledger.append({ kind: "anthillOwner", attestation, signature: sign(anthillKey.privateKey, ownerMessage(attestation)) }, coord, at());
+  ledger.append({ kind: "agentRegistered", owner: SIGNER, publicKey: cc.publicKey, modelFamily: "claude", harness: "claude-code" }, owner, at());
+  ledger.append({ kind: "agentRegistered", owner: SIGNER, publicKey: cx.publicKey, modelFamily: "gpt", harness: "codex" }, owner, at());
+  const sha = (c: string) => c.repeat(40);
+  ledger.append({ kind: "submission", id: "s1", taskId: null, baseCommit: sha("a"), headCommit: sha("b"), changedFiles: ["docs/x.md"], linesChanged: 3 }, cc, at());
+  ledger.append({ kind: "gateResult", submissionId: "s1", gate: "size", pass: true, details: "ok" }, coord, at());
+  ledger.append(assignmentBody(ledger.state(), "s1", [keyIdOf(cx.publicKey)], "e"), coord, at());
+  const verdict = { defectProbability: 0.05, summary: "looked", findingIds: [] };
+  ledger.append({ kind: "reviewCommit", submissionId: "s1", commitment: commitmentFor(verdict, "salt", keyIdOf(cx.publicKey), { submissionId: "s1" }), stake: 5 }, cx, at());
+  ledger.append({ kind: "reviewReveal", submissionId: "s1", verdict, salt: "salt" }, cx, at());
+  ledger.append({ kind: "merge", submissionId: "s1", commit: sha("c") }, coord, at());
 }
 
 async function until200(port: number, p: string, err: () => string, timeoutMs = 30_000) {
@@ -378,7 +407,7 @@ test("host settings: preset solo needs no kernel signer, and says what it is", (
   assert.deepEqual(readHostSettings({ anthillUrl: "https://a.example", targetRepo: "https://github.com/o/r" }).missing, ["COMMONS_KERNEL_SIGNERS (--kernel-signer)"]);
 });
 
-test("host: preset solo sets up with no kernel signer; COMMONS_RULES_PRESET phase1 leaves solo on the next start, once", { timeout: 90_000 }, async () => {
+test("host: preset solo sets up with no kernel signer and snapshots by default; COMMONS_RULES_PRESET phase1 leaves solo once per value, never over stranded work unless forced, never over an admin's later change", { timeout: 90_000 }, async () => {
   const dir = tmp();
   const anthill = await fakeAnthill();
   try {
@@ -408,6 +437,8 @@ test("host: preset solo sets up with no kernel signer; COMMONS_RULES_PRESET phas
     assert.equal(first.head.mode, "solo");
     assert.equal(first.head.notice, "solo test: your own agents review each other");
     assert.match(first.err, /kernel signers: none; preset solo \(solo test/);
+    // Nothing else would snapshot a hosted solo commons, so nothing would be promoted.
+    assert.match(first.err, /snapshots: every 1 merged submission; approved tasks: .*approved-tasks\.json \(absent: none\)/);
     const genesis = lines()[0]?.body.rules as Rules;
     assert.equal(genesis.mode, "solo");
     assert.deepEqual(genesis.kernelSigners, []);
@@ -419,18 +450,45 @@ test("host: preset solo sets up with no kernel signer; COMMONS_RULES_PRESET phas
     assert.equal(noted.head.mode, "solo");
     assert.ok(!lines().some((l) => l.body.kind === "rulesChange"));
 
-    const switched = await start({ COMMONS_RULES_PRESET: "phase1", COMMONS_KERNEL_SIGNERS: `${SIGNER},${SIGNER2}` });
+    // Solo work merged but not on main: leaving solo would strand it, so the
+    // switch is refused, the commons serves as it is, and the next start tries again.
+    strandSoloWork(ledgerFile, data, anthill.key);
+    const leave = { COMMONS_RULES_PRESET: "phase1", COMMONS_KERNEL_SIGNERS: `${SIGNER},${SIGNER2}` };
+    const refused = await start(leave);
+    assert.equal(refused.head.mode, "solo");
+    assert.match(refused.err, /s1: merged, reviewed only by its author's own agents, not on main/);
+    assert.match(refused.err, /rules NOT switched to phase1 .* Set COMMONS_RULES_FORCE \(--rules-force\) to 1/);
+    assert.ok(!lines().some((l) => l.body.kind === "rulesChange"));
+    assert.ok(!fs.existsSync(path.join(data, "rules-preset.json")));
+
+    const switched = await start({ ...leave, COMMONS_RULES_FORCE: "1" });
     assert.equal(switched.head.mode, undefined);
+    assert.match(switched.err, /warning: leaving solo with --force strands:/);
     assert.match(switched.err, /rulesChange .* rules v1 -> v2 \(solo -> independent review\)/);
+    assert.match(switched.err, /snapshots: never/, "no longer solo: no default snapshots");
     const changes = lines().filter((l) => l.body.kind === "rulesChange");
     assert.equal(changes.length, 1);
     assert.equal(changes[0]?.body.rules?.mode, undefined);
     assert.deepEqual(changes[0]?.body.rules?.kernelSigners, [SIGNER, SIGNER2]);
     assert.equal(changes[0]?.body.rules?.promotion.kernelSignoffs, 1);
 
-    const again = await start({ COMMONS_RULES_PRESET: "phase1", COMMONS_KERNEL_SIGNERS: `${SIGNER},${SIGNER2}` });
-    assert.match(again.err, /rules unchanged/);
+    const again = await start(leave);
+    assert.match(again.err, /COMMONS_RULES_PRESET \(--rules-preset\) phase1 was applied at entry #\d+; nothing to do\n/);
     assert.equal(lines().filter((l) => l.body.kind === "rulesChange").length, 1);
+
+    // Once per value: an admin's later rulesChange survives restarts with the variable still set.
+    let shell = "";
+    const io = { cwd: data, stdout: (t: string) => (shell += t), stderr: (t: string) => (shell += t) };
+    assert.equal(await main(["rules", "set", "--data", data, "--preset", "phase1", "--kernel-signer", SIGNER, "--kernel-signer", SIGNER2, "--kernel-signer", SIGNER3], io), 0, shell);
+    const kept = await start(leave);
+    assert.match(kept.err, /The rules changed since \(rulesChange #\d+\), and those changes are kept/);
+    assert.equal(lines().filter((l) => l.body.kind === "rulesChange").length, 2);
+    assert.deepEqual(lines().filter((l) => l.body.kind === "rulesChange").at(-1)?.body.rules?.kernelSigners, [SIGNER, SIGNER2, SIGNER3]);
+    assert.equal(await main(["rules", "set", "--data", data, "--preset", "solo"], io), 0, shell);
+    const stillSolo = await start(leave);
+    assert.equal(stillSolo.head.mode, "solo", "a restart does not take the ledger out of the solo an admin put it back in");
+    assert.equal(lines().filter((l) => l.body.kind === "rulesChange").length, 3);
+    assert.match(stillSolo.err, /snapshots: every 1 merged submission;/, "solo: snapshots by default");
 
     // Without the admin key on the disk the switch cannot be signed: it stops instead of serving as solo.
     const keyFile = path.join(data, "keys", "admin.json");
@@ -438,12 +496,12 @@ test("host: preset solo sets up with no kernel signer; COMMONS_RULES_PRESET phas
     let err = "";
     const code = await main(["host", "--data", data, "--port", String(await freePort()), "--anthill-url", anthill.url], {
       cwd: data,
-      env: { COMMONS_RULES_PRESET: "solo" },
+      env: { COMMONS_RULES_PRESET: "phase1", COMMONS_KERNEL_SIGNERS: SIGNER, COMMONS_RULES_FORCE: "1" },
       stdout: () => {},
       stderr: (t) => (err += t),
     });
     assert.equal(code, 2);
-    assert.match(err, /cannot switch the rules to solo/);
+    assert.match(err, /cannot switch the rules to phase1/);
   } finally {
     await anthill.close();
   }

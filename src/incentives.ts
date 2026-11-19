@@ -26,7 +26,7 @@ import { memberTree } from "./members";
 import { commitDeadlineMs, instantMs, plantCaughtBy, revealDeadlineMs, reviewWindowCloseSeq } from "./plants";
 import { coveredSubmissionIds } from "./promotion";
 import { isFalseFinding } from "./review";
-import { claimStake } from "./rules";
+import { claimStake, isSolo, rulesAt } from "./rules";
 import type {
   CommonsState,
   EntryBody,
@@ -34,6 +34,7 @@ import type {
   KeyId,
   OwnerId,
   ReviewState,
+  Rules,
   SettlementReason,
   Severity,
   SnapshotState,
@@ -60,15 +61,18 @@ const DAY_MS = 24 * 3_600_000;
 // Volume limits and shares
 // ---------------------------------------------------------------------------
 
-// Open-submission slots for an owner: 1 + floor(log2(1 + reputation)), log
+// Open-submission slots for an owner: base + floor(log2(1 + reputation)), log
 // base 2, where reputation is the owner's commons reputation
-// (OwnerState.reputationDelta). One slot at 0 reputation, two at 1, three at
-// 3, four at 7, and so on: volume grows with standing, but slowly. Negative or
-// non-finite reputation counts as 0, so a newcomer, or an owner slashed below
-// zero, still has the base slot.
-export function prSlots(reputation: number): number {
+// (OwnerState.reputationDelta) and base is rules.basePrSlots (1 when absent,
+// as on every ledger before the field; solo sets 2, so one person's two
+// agents can each have a submission open). At base 1: one slot at 0
+// reputation, two at 1, three at 3, four at 7, and so on: volume grows with
+// standing, but slowly. Negative or non-finite reputation counts as 0, so a
+// newcomer, or an owner slashed below zero, still has the base slots.
+export function prSlots(reputation: number, base = 1): number {
   const r = Number.isFinite(reputation) && reputation > 0 ? reputation : 0;
-  return 1 + Math.floor(Math.log2(1 + r));
+  const b = Number.isInteger(base) && base >= 1 ? base : 1;
+  return b + Math.floor(Math.log2(1 + r));
 }
 
 // Submit credits left for an owner. Each revealed review by any of the owner's
@@ -80,16 +84,43 @@ export function prSlots(reputation: number): number {
 // any of the owner's agents spends one. Attestations do not earn credits. The
 // result can be negative if the ledger holds submissions the server would have
 // refused. Callers allow a submission only at >= 1.
+//
+// A rulesChange that lowers freeSubmitCredits (leaving solo: 10 to 1) does
+// not turn the headroom an owner already spent into debt: right after it,
+// the owner holds what the new rules give, but never less than the smaller
+// of what it held just before and the new free allowance. So leaving solo
+// returns every owner to at most the new starter credits, and nobody owes
+// for submissions the old rules allowed. (A rulesChange that raises it gives
+// the larger allowance from then on, with no carried-over adjustment.)
 export function submitCredits(state: CommonsState, owner: OwnerId): number {
-  let reviews = 0;
-  let submissions = 0;
-  for (const s of state.submissions.values()) {
-    if (ownerOf(state, s.author) === owner) submissions += 1;
-    for (const r of s.reviews) {
-      if (revealedInTime(r, s.merged?.seq) && ownerOf(state, r.reviewer) === owner) reviews += 1;
+  const count = (beforeSeq: number) => {
+    let reviews = 0;
+    let submissions = 0;
+    for (const s of state.submissions.values()) {
+      if (s.submittedSeq < beforeSeq && ownerOf(state, s.author) === owner) submissions += 1;
+      for (const r of s.reviews) {
+        if (revealedInTime(r, s.merged?.seq) && (r.revealedSeq ?? -1) < beforeSeq && ownerOf(state, r.reviewer) === owner) reviews += 1;
+      }
     }
+    return { reviews, submissions };
+  };
+  const balance = (rules: Rules, c: { reviews: number; submissions: number }) =>
+    Math.floor(c.reviews / rules.reviewsPerSubmitCredit) + (rules.freeSubmitCredits ?? 1) - c.submissions;
+  // The carried adjustment, replayed over the rulesChanges in order.
+  let adjust = 0;
+  const history = state.rulesHistory ?? [];
+  for (let i = 1; i < history.length; i++) {
+    const prev = (history[i - 1] as { rules: Rules }).rules;
+    const { seq, rules } = history[i] as { seq: number; rules: Rules };
+    const before = prev.freeSubmitCredits ?? 1;
+    const after = rules.freeSubmitCredits ?? 1;
+    if (after > before) adjust = 0;
+    if (after >= before) continue;
+    const c = count(seq);
+    const held = balance(prev, c) + adjust;
+    adjust = Math.max(0, Math.min(held, after) - balance(rules, c));
   }
-  return Math.floor(reviews / state.rules.reviewsPerSubmitCredit) + (state.rules.freeSubmitCredits ?? 1) - submissions;
+  return balance(state.rules, count(Number.POSITIVE_INFINITY)) + adjust;
 }
 
 // How a bounty is split among n duplicate findings, in filing order. Weights
@@ -396,6 +427,16 @@ function farEnough(tree: TreeView, finder: OwnerId, authors: OwnerId[], minDista
 // A revealed plant vests nothing, even if it merged before its reveal. A paid
 // tranche cannot be clawed back here.
 //
+// Solo (rules.mode "solo" when the submission merged, from rulesHistory, so
+// later rulesChanges never re-judge it): a merge vests only if a review
+// revealed before it came from an owner farther than minTreeDistance from the
+// author's owner, as settleCleanReviews asks of the reviewers it pays. Solo
+// merges reviewed only by the author's own agents vest nothing: that
+// reputation would feed stake capacity and PR slots without anyone else
+// having looked, and would carry into Phase 1 when the ledger leaves solo.
+// Every other ledger never takes an own-owner review, so this changes nothing
+// there.
+//
 // Forfeiture. A reproduced finding that targets the submission directly voids
 // its unpaid tranches 2 and 3 (while undecided they wait; a dismissal releases
 // them). A finding with no result yet makes them wait too: undecided is not
@@ -433,6 +474,21 @@ export function settleMerge(
   }
   const author = ownerOf(state, s.author);
   if (author === undefined) return [];
+  const mergeRules = rulesAt(state, s.merged.seq);
+  if (isSolo(mergeRules)) {
+    const tree = memberTree(state);
+    const merged = s.merged;
+    const independent = s.reviews.some((r) => {
+      const owner = ownerOf(state, r.reviewer);
+      return (
+        owner !== undefined &&
+        owner !== author &&
+        revealedInTime(r, merged.seq) &&
+        farEnough(tree, owner, [author], mergeRules.minTreeDistance, state.anthill !== undefined)
+      );
+    });
+    if (!independent) return [];
+  }
   const amount = Math.round(state.rules.rewards.merge / 3);
   const proposer = proposerOf(state, s);
   const cut = proposer !== undefined && proposer !== author ? Math.round(amount * state.rules.rewards.proposerCutFraction) : 0;

@@ -83,7 +83,19 @@ import { HARNESS_DIR_PREFIX, minimalEnv, reproduceFinding } from "./findings";
 import { normaliseBasePath } from "./basePath";
 import { HOST_SETTINGS, hostLayout, missingForServe, readHostSettings, settingName, SetupError, setUp } from "./host";
 import { applyUnifiedDiff, checkRepoPath, FULL_SHA, parsePatch } from "./github";
-import { DEFAULT_MAX_SKEW_MS, isCanonicalPath, isRefSafeId, Ledger, LedgerError, type LedgerState, type Signer, citedFindingProblems, verdictProblems } from "./ledger";
+import {
+  DEFAULT_MAX_SKEW_MS,
+  isCanonicalPath,
+  isRefSafeId,
+  Ledger,
+  LedgerError,
+  type LedgerState,
+  type Signer,
+  citedFindingProblems,
+  shippedSnapshotIds,
+  submissionDead,
+  verdictProblems,
+} from "./ledger";
 import { plantCommitment, reviewWindowClosed } from "./plants";
 import { commitmentFor } from "./review";
 import { ringOf } from "./gates/rings";
@@ -94,6 +106,7 @@ import type {
   EntryBody,
   Evidence,
   GateReport,
+  KeyId,
   LedgerEntry,
   Ring,
   ReviewVerdict,
@@ -169,7 +182,7 @@ export type Io = {
 // exitCode 1 = refused or failed check, 2 = usage or harness error.
 export class CliError extends Error {
   constructor(
-    readonly exitCode: 1 | 2,
+    readonly exitCode: 1 | 2 | 3,
     message: string,
   ) {
     super(message);
@@ -1777,6 +1790,38 @@ function evidenceFrom(ctx: Ctx): Evidence[] {
   return out;
 }
 
+// `rules set` exits with this when it refuses to leave solo (soloWorkStrandedByLeaving):
+// commons host then serves under the rules as they are and retries at the next start.
+export const RULES_BLOCKED_EXIT = 3;
+
+// What leaving solo would strand, one line each (rules set refuses unless
+// --force). Promotion is judged under the rules in force, and Phase 1 counts
+// no review by the author's own agents; nobody can add a review to merged
+// work, and every later snapshot holds it (lineage), so solo-reviewed merged
+// work not on main freezes main. And an open submission whose assigned seat
+// is the author's own agent, not yet committed, can never fill it: the
+// ledger refuses that commit once solo ends and takes no second assignment.
+export function soloWorkStrandedByLeaving(st: CommonsState): string[] {
+  const onMain = new Set<string>();
+  for (const id of shippedSnapshotIds(st)) for (const sid of st.snapshots.get(id)?.submissionIds ?? []) onMain.add(sid);
+  const ownerOf = (k: KeyId) => st.agents.get(k)?.owner;
+  const out: string[] = [];
+  for (const s of st.submissions.values()) {
+    const author = ownerOf(s.author);
+    if (s.merged) {
+      if (s.planted || onMain.has(s.id)) continue;
+      const independent = s.reviews.some((r) => r.verdict !== undefined && ownerOf(r.reviewer) !== author);
+      if (independent) continue;
+      const snap = [...st.snapshots.values()].find((x) => x.submissionIds.includes(s.id));
+      out.push(`${s.id}: merged, reviewed only by its author's own agents, not on main (${snap === undefined ? "in no snapshot yet" : `in unpromoted snapshot ${snap.id}`})`);
+    } else if (s.assignment && !submissionDead(st, s.id)) {
+      const seats = s.assignment.reviewers.filter((r) => ownerOf(r) === author && !s.reviews.some((v) => v.reviewer === r));
+      if (seats.length > 0) out.push(`${s.id}: open, its seat ${seats.join(", ")} is the author's own agent and has not committed (it never can after solo; resubmit it)`);
+    }
+  }
+  return out;
+}
+
 const COMMANDS: Record<string, Command> = {
   keygen: command(
     "write a new ed25519 key pair (0600) and print its key id",
@@ -1871,6 +1916,10 @@ const COMMANDS: Record<string, Command> = {
       "admin-key": { type: "string", help: "a genesis admin's key file, which signs the rulesChange (or --key; with --data default <data>/keys/admin.json)" },
       data: { type: "string", help: "a commons host data directory: its ledger and, unless --admin-key, its keys/admin.json (instead of --ledger)" },
       "poll-id": { type: "string", help: "the rulesChange's pollId (default rules-v<new version>)" },
+      force: {
+        type: "boolean",
+        help: "leave solo although solo-reviewed work is merged but not on main (main then freezes until solo is re-entered and that work promoted) or a submission waits on a seat only the author's own agent could fill (it must be resubmitted)",
+      },
     },
     (ctx) => {
       const f = ctx.flags;
@@ -1899,6 +1948,21 @@ const COMMANDS: Record<string, Command> = {
       next = { ...next, version: Math.max(next.version, current.version + 1) };
       const problems = validateRules(next);
       if (problems.length > 0) usage(`the new rules are invalid:\n  ${problems.join("\n  ")}`);
+      if (isSolo(current) && !isSolo(next)) {
+        const stranded = soloWorkStrandedByLeaving(st);
+        if (stranded.length > 0) {
+          const list = stranded.map((x) => `\n  ${x}`).join("");
+          if (!bool(f, "force")) {
+            throw new CliError(
+              RULES_BLOCKED_EXIT,
+              `leaving solo now strands solo-reviewed work:${list}\n` +
+                "Promote merged work to main first while still solo (it can never be covered after: nobody can add a review to merged work, every later snapshot holds it, and main freezes), and let open submissions merge or close; or pass --force",
+            );
+          }
+          ctx.out("warning: leaving solo with --force strands:");
+          for (const x of stranded) ctx.out(`  ${x}`);
+        }
+      }
       const pollId = str(f, "poll-id") ?? `rules-v${next.version}`;
       const signer = readKey(ctx, resolvePath(ctx, keyFile));
       if (!st.adminKeys.includes(keyIdOf(signer.publicKey))) usage(`${keyFile} is not a genesis admin key of this ledger; only an admin signs a rulesChange`);
@@ -2895,7 +2959,14 @@ const COMMANDS: Record<string, Command> = {
       preset: { type: "string", help: "setup: phase1, solo (one person testing with their own agents) or none (env COMMONS_PRESET; default phase1)" },
       "rules-preset": {
         type: "string",
-        help: "on every start over an existing ledger: switch its rules to this preset (phase1 or solo) unless they already are it, an admin-signed rulesChange with keys/admin.json; with --kernel-signer (or its env) those become the kernel signers (env COMMONS_RULES_PRESET)",
+        help:
+          "once per value, over an existing ledger: switch its rules to this preset (phase1 or solo) unless they already are it, an admin-signed rulesChange with keys/admin.json; " +
+          "with --kernel-signer (or its env) those become the kernel signers. <data>/rules-preset.json records it, so later starts leave later rule changes alone (env COMMONS_RULES_PRESET)",
+      },
+      "rules-force": { type: "boolean", help: "with --rules-preset: rules set --force, leaving solo although solo work is stranded (env COMMONS_RULES_FORCE=1)" },
+      "snapshot-every": {
+        type: "string",
+        help: "merged submissions that trigger a snapshot, 0 = never (env COMMONS_SNAPSHOT_EVERY; default 1 on a solo ledger, never otherwise)",
       },
       "base-path": { type: "string", help: "serve under this path behind a reverse proxy, e.g. /commons/builders (env COMMONS_BASE_PATH)" },
       "public-url": { type: "string", help: "the coordinator's public URL, for the COMMONS_SITES line setup prints (env COMMONS_PUBLIC_URL; default RENDER_EXTERNAL_URL + base path)" },
@@ -3026,21 +3097,48 @@ const COMMANDS: Record<string, Command> = {
 
       // The rules preset: switch an existing ledger's rules (leaving solo, say)
       // with the one command an operator with no shell can run: set the
-      // variable and restart. `rules set` appends nothing if they already are it.
+      // variable and restart. Once per value: <data>/rules-preset.json records
+      // the value and the rules it left, and a start that finds the same value
+      // there does nothing, so an admin's later rulesChange (leaving solo from
+      // a shell, a second kernel signer) is never reverted by a restart.
       const rulesPreset = pick("rulesPreset")?.trim();
       if (rulesPreset !== undefined && rulesPreset !== "") {
         const signerIds = (signerFlags.length > 0 ? signerFlags : envSigners === undefined ? [] : [envSigners])
           .flatMap((x) => x.split(","))
           .map((x) => x.trim().toLowerCase())
           .filter((x) => x !== "");
-        say(`rules: switching to the ${rulesPreset} preset if they are not already (${settingName("rulesPreset")})`);
-        const code = await main(
-          ["rules", "set", "--data", layout.data, "--preset", rulesPreset, ...signerIds.flatMap((id) => ["--kernel-signer", id])],
-          { ...ctx.io, stdout: (t) => ctx.io.stderr(`commons host: ${t}`) },
-        );
-        if (code !== 0) {
-          say(`cannot switch the rules to ${rulesPreset} (exit ${code}; its error is above): unset ${settingName("rulesPreset")} to serve as they are`);
-          return fail("This commons cannot start; the operator has the details in the logs.");
+        const marker = readRulesPresetMarker(layout.rulesPresetMarker);
+        const sameValue = marker !== null && marker.preset === rulesPreset && sameIds(marker.kernelSigners, signerIds);
+        if (sameValue) {
+          let later: number[] = [];
+          try {
+            later = (Ledger.open(layout.ledger).state().rulesHistory ?? []).map((r) => r.seq).filter((seq) => seq > marker.seq);
+          } catch {
+            // serve reports a ledger it cannot read
+          }
+          say(
+            `rules: ${settingName("rulesPreset")} ${rulesPreset} was applied at entry #${marker.seq}; nothing to do` +
+              (later.length === 0 ? "" : `. The rules changed since (rulesChange #${later.join(", #")}), and those changes are kept: unset it, or change it to apply a preset again`),
+          );
+        } else {
+          say(`rules: switching to the ${rulesPreset} preset if they are not already (${settingName("rulesPreset")})`);
+          const force = bool(f, "rules-force") || env[HOST_SETTINGS.rulesForce.env] === "1";
+          const code = await main(
+            ["rules", "set", "--data", layout.data, "--preset", rulesPreset, ...signerIds.flatMap((id) => ["--kernel-signer", id]), ...(force ? ["--force"] : [])],
+            { ...ctx.io, stdout: (t) => ctx.io.stderr(`commons host: ${t}`) },
+          );
+          if (code === RULES_BLOCKED_EXIT) {
+            // Serve as they are: the coordinator keeps promoting, and the next
+            // start tries again (no marker was written).
+            say(`rules NOT switched to ${rulesPreset} (its reason is above); serving under the rules as they are, and the next start tries again. Set ${settingName("rulesForce")} to 1 to switch anyway`);
+          } else if (code !== 0) {
+            say(`cannot switch the rules to ${rulesPreset} (exit ${code}; its error is above): unset ${settingName("rulesPreset")} to serve as they are`);
+            return fail("This commons cannot start; the operator has the details in the logs.");
+          } else {
+            const ledger = Ledger.open(layout.ledger);
+            const seq = (ledger.state().rulesHistory ?? []).at(-1)?.seq ?? 0;
+            writeRulesPresetMarker(layout.rulesPresetMarker, { preset: rulesPreset, kernelSigners: signerIds, seq, hash: ledger.entries()[seq]?.hash ?? "" });
+          }
         }
       } else if (!fresh && pick("preset") !== undefined) {
         // COMMONS_PRESET is read at setup only: say so when it no longer matches.
@@ -3060,6 +3158,25 @@ const COMMANDS: Record<string, Command> = {
         say(`cannot serve: ${settingName("anthillUrl")} is not set`);
         return fail("This commons cannot start; the operator has the details in the logs.");
       }
+      // Snapshots: without --snapshot-every nothing is snapshotted, so nothing
+      // is promoted and main never moves. A solo ledger has nobody with a
+      // shell to snapshot it by hand, so it defaults to 1.
+      const snapshotSetting = pick("snapshotEvery")?.trim();
+      let snapshotEvery: number | null = null;
+      if (snapshotSetting !== undefined && snapshotSetting !== "") {
+        if (!/^\d{1,6}$/.test(snapshotSetting)) {
+          say(`cannot serve: ${settingName("snapshotEvery")} must be a whole number (0 = never), not ${JSON.stringify(snapshotSetting)}`);
+          return fail("This commons cannot start; the operator has the details in the logs.");
+        }
+        snapshotEvery = Number(snapshotSetting) === 0 ? null : Number(snapshotSetting);
+      } else {
+        try {
+          if (isSolo(Ledger.open(layout.ledger).state().rules)) snapshotEvery = 1;
+        } catch {
+          // serve reports a ledger it cannot read
+        }
+      }
+      say(`snapshots: ${snapshotEvery === null ? "never (nothing is promoted; set " + settingName("snapshotEvery") + ")" : `every ${snapshotEvery} merged submission${snapshotEvery === 1 ? "" : "s"}`}; approved tasks: ${layout.approvedTasks}${fs.existsSync(layout.approvedTasks) ? "" : " (absent: none)"}`);
       const serveArgv = [
         "serve",
         "--ledger", layout.ledger,
@@ -3071,6 +3188,8 @@ const COMMANDS: Record<string, Command> = {
         "--anthill-url", anthillUrl,
         "--repo", layout.target,
         "--patches", layout.patches,
+        "--approved-tasks", layout.approvedTasks,
+        ...(snapshotEvery === null ? [] : ["--snapshot-every", String(snapshotEvery)]),
         ...(basePath === "" ? [] : ["--base-path", basePath]),
         ...list(f, "trusted-proxy").flatMap((p) => ["--trusted-proxy", p]),
       ];
@@ -3092,6 +3211,30 @@ const COMMANDS: Record<string, Command> = {
     },
   ),
 };
+
+// <data>/rules-preset.json: the COMMONS_RULES_PRESET value commons host last
+// applied (or found already in force), its kernel signers, and the last
+// rulesChange (or genesis) after it. Unreadable counts as absent: the preset
+// is applied again, which appends nothing if the rules already are it.
+type RulesPresetMarker = { preset: string; kernelSigners: string[]; seq: number; hash: string };
+
+function readRulesPresetMarker(file: string): RulesPresetMarker | null {
+  try {
+    const j = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<RulesPresetMarker>;
+    if (typeof j.preset !== "string" || !Array.isArray(j.kernelSigners) || !Number.isInteger(j.seq)) return null;
+    return { preset: j.preset, kernelSigners: j.kernelSigners.map(String), seq: j.seq as number, hash: String(j.hash ?? "") };
+  } catch {
+    return null;
+  }
+}
+
+function writeRulesPresetMarker(file: string, m: RulesPresetMarker): void {
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(m, null, 2)}\n`);
+  fs.renameSync(tmp, file);
+}
+
+const sameIds = (a: readonly string[], b: readonly string[]) => canonical([...a].sort()) === canonical([...b].sort());
 
 // The coordinator's single writer; refuses a key that is not the genesis coordinator.
 function openStore(ctx: Ctx, clock: () => string): LedgerStore {

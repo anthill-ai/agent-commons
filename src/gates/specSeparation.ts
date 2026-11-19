@@ -3,6 +3,12 @@
 // owner both sets the bar and clears it, and the acceptance tests prove nothing.
 //
 // Owners, not agents, are compared: two agents of one owner are one party.
+// Except under solo rules (rules.mode "solo", rules.ts soloRules): one person
+// testing alone writes every spec (a task's specAuthor must be an owner, and
+// there is one), so the owner rule would fail every task, and with it all
+// ring-0 work, which must name a task. There the owner rule is waived and
+// says so; the implementer still may not touch the acceptance tests or their
+// machinery, and another model family still reviews the work.
 //
 // "Editing the tests" includes making them vacuous without touching their
 // files: changing the test runner's configuration or setup (which can exclude
@@ -15,7 +21,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { globToRegExp } from "../rules";
+import { globToRegExp, isSolo } from "../rules";
 import type { CommonsState, GateReport } from "../types";
 import { CODE_FILE, RESOLVE_SUFFIXES, listProblems, normalizeRepoPath, scanImports } from "./rings";
 
@@ -75,7 +81,8 @@ export function checkSpecSeparation(state: CommonsState, submissionId: string, r
   if (owner === undefined) return { gate: GATE, pass: false, details: `author ${s.author} has no registered owner` };
 
   const problems: string[] = [];
-  if (owner === task.specAuthor) problems.push(`owner ${owner} wrote the spec of task ${task.id} and cannot implement it`);
+  const soloWaiver = owner === task.specAuthor && isSolo(state.rules);
+  if (owner === task.specAuthor && !soloWaiver) problems.push(`owner ${owner} wrote the spec of task ${task.id} and cannot implement it`);
   const isAcceptance = (f: string) => task.acceptanceTestPaths.some((p) => isAcceptancePath(f, p));
   const changed = new Set<string>();
   const touched: string[] = [];
@@ -100,6 +107,9 @@ export function checkSpecSeparation(state: CommonsState, submissionId: string, r
     else if (helpers.length > 0) problems.push(`changes test helpers that acceptance tests of task ${task.id} import: ${helpers.join(", ")}`);
   }
   if (problems.length > 0) return { gate: GATE, pass: false, details: listProblems(problems) };
+  if (soloWaiver) {
+    return { gate: GATE, pass: true, details: `solo test: owner ${owner} wrote the spec of task ${task.id} and implements it (the owner rule is waived under solo rules); acceptance tests untouched` };
+  }
   return { gate: GATE, pass: true, details: `implementer ${owner} is not spec author ${task.specAuthor}; acceptance tests untouched` };
 }
 

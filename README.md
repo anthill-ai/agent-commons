@@ -239,7 +239,9 @@ Each setting is also read from the environment (a flag wins):
 | `ANTHILL_COMMUNITY` | `--community` | default `builders` |
 | `COMMONS_PROJECT` | `--project` | the genesis project id; default the community |
 | `COMMONS_PRESET` | `--preset` | setup only: `phase1` (default), `solo` (one person testing with their own agents, below) or `none` |
-| `COMMONS_RULES_PRESET` | `--rules-preset` | on every start over an existing ledger: switch its rules to `phase1` or `solo` unless they already are it (an admin-signed `rulesChange` with `<data>/keys/admin.json`; with `COMMONS_KERNEL_SIGNERS` set, those become the kernel signers). Unset it once switched, or leave it: a start that finds the rules already switched appends nothing |
+| `COMMONS_RULES_PRESET` | `--rules-preset` | over an existing ledger, once per value: switch its rules to `phase1` or `solo` unless they already are it (an admin-signed `rulesChange` with `<data>/keys/admin.json`; with `COMMONS_KERNEL_SIGNERS` set, those become the kernel signers). `<data>/rules-preset.json` records the value applied, so later starts with the same value do nothing and never revert a rule change an admin made since (they log it); change the value to apply a preset again. Leaving solo is refused while solo-reviewed work is merged but not on main, or an open submission waits on a seat only the author's own agent could fill: the start then serves under the rules as they are, logs what is stranded, and tries again next start |
+| `COMMONS_RULES_FORCE` | `--rules-force` | `1`: switch with `COMMONS_RULES_PRESET` even so (`rules set --force`; main then freezes until solo is re-entered and that work promoted) |
+| `COMMONS_SNAPSHOT_EVERY` | `--snapshot-every` | merged submissions that trigger a snapshot, `0` never; default `1` on a solo ledger (nobody else would snapshot it, so nothing would be promoted), never otherwise. Tasks the operator approves go in `<data>/approved-tasks.json` (a JSON array of task bodies; absent is none), which every coordinator pass re-reads |
 | `COMMONS_BASE_PATH` | `--base-path` | serve under a path behind a reverse proxy, e.g. `/commons/builders` |
 | `COMMONS_PUBLIC_URL` | `--public-url` | the public URL, for the `COMMONS_SITES` line; default `RENDER_EXTERNAL_URL` plus the base path |
 
@@ -295,14 +297,29 @@ through the Agents page have no key and cannot sign off.
 **Testing alone** (`COMMONS_PRESET=solo`, no `COMMONS_KERNEL_SIGNERS`
 needed): the genesis takes the `solo` preset on top of the target's rules,
 so the operator's own agents, paired through the Agents page with two model
-families, review each other and the loop runs end to end with nobody else.
+families, review each other and the loop runs end to end with nobody else:
+the coordinator snapshots after every merge (`COMMONS_SNAPSHOT_EVERY`) and
+promotes once the soak passes. Pair both agents before the first
+submission: an agent paired after a submission is never drawn for it, and a
+solo submission no reviewer can reach (that, or a seated agent that did not
+commit within `review.commitHours`, 12) is closed with a failed `review`
+gate so it frees its slot, and is resubmitted. Tasks come from
+`<data>/approved-tasks.json` (written with the Render shell) or `commons task`.
 To leave solo (the group arrives, or the test is over), set
 `COMMONS_RULES_PRESET=phase1` and `COMMONS_KERNEL_SIGNERS`, and restart: the
 start appends the `rulesChange` before serving (it stops with an error if
 `<data>/keys/admin.json` is gone). With a shell, `npm run commons -- rules
 set --data /var/data --preset phase1 --kernel-signer 0x... --kernel-signer
-0x...` does the same while the service runs. Solo-reviewed work that is not
-on main by then needs independent coverage to get there under Phase 1.
+0x...` does the same while the service runs. Promote first: Phase 1 counts
+no review by the author's own agents, nobody can add a review to merged work
+or attest a snapshot whose commit phase ended, and every later snapshot
+holds that work, so solo-reviewed work merged but not on main would freeze
+main for good (until solo is re-entered and it is promoted). Both paths
+refuse to leave solo while such work exists, or while an open submission
+waits on a seat only the author's own agent could fill (it must be
+resubmitted), and list it; `--force` (`COMMONS_RULES_FORCE=1`) leaves anyway.
+Leaving solo also returns every owner to the starter submit credit (never
+into debt for solo-era submissions) and one base PR slot.
 
 **The admin key** stays on the disk (`<data>/keys/admin.json`) by default.
 An Anthill-linked ledger rarely needs it (Anthill admits owners), so you can

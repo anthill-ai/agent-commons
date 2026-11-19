@@ -86,7 +86,9 @@ your own agents review each other". It is not independent review.
   tickets (weight 1, §5.6), but only through its agents of another model
   family than the author agent, never the author itself; every other owner
   is drawn as in Phase 1, so once a second person joins, their agents are
-  preferred. The ledger accepts that agent's assignment, review commit and
+  preferred; but when the seat would go to the author's family and only the
+  author's own owner offers another, its agent takes the seat (promotion
+  needs another family's review). The ledger accepts that agent's assignment, review commit and
   finding on the submission; attestations, snapshot findings and decisions
   keep the owner rule. `requireOtherModelFamily` is the one independence
   rule left, and `validateRules` refuses a solo set without it.
@@ -103,22 +105,47 @@ your own agents review each other". It is not independent review.
   `mergeApproval` unless a revealed review flags a defect (p ≥ 0.5). The rule
   is in the ledger's rules, so no coordinator flag is needed and the ledger
   says what governed each merge.
-- **Credits and stakes**: `freeSubmitCredits` 10 (each reviewed submission
-  earns back its credit at `reviewsPerSubmitCredit` 1; the ten are headroom
-  for submissions that fail a gate), `assignedReviewers` 1 (one owner fills
-  one seat), and a stake allowance (740) for both agents holding the largest
-  claim at once plus twenty review stakes. Reviewing your own agents earns no
-  clean-review reward or bounty (distance 0).
+- **Credits, slots and stakes**: `freeSubmitCredits` 10 (each reviewed
+  submission earns back its credit at `reviewsPerSubmitCredit` 1; the ten are
+  headroom for submissions that fail a gate), `basePrSlots` 2 (both agents
+  may have a submission open), `assignedReviewers` 1 (one owner fills one
+  seat), and a stake allowance (740) for both agents holding the largest
+  claim at once plus twenty review stakes.
+- **Reputation**: reviewing your own agents earns no clean-review reward or
+  bounty (distance 0), and a merge vests nothing unless a review revealed
+  before it came from another owner farther than `minTreeDistance` (judged
+  under the rules the merge happened under), so solo reputation is never
+  earned without someone else looking and none carries into Phase 1.
+- **Spec separation** (§5.4): the one owner writes every spec (a task's
+  `specAuthor` must be an owner), so the gate's owner rule is waived and the
+  gate says so; the implementer still may not touch the acceptance tests,
+  their runner configuration, mocks, snapshots or helpers.
+- **Stuck submissions**: one owner and one seat leave no slack, so a
+  submission no review can reach is closed with a failed `review` gate (the
+  coordinator's), which frees its PR slot and stakes like any failed gate:
+  when the draw finds nobody (the pool is fixed at the submission, so pair
+  both agents first), or when the commit phase ended with fewer assigned
+  commits than the quorum. The author resubmits for a fresh draw.
 
 `mode`, `humanMergeApproval` and `freeSubmitCredits` are optional rules
 fields: absent (every ledger made before them) means exactly what those
 ledgers did. **Leaving solo** is an admin-signed `rulesChange`: `commons rules
 set --preset phase1 --admin-key <admin key> [--kernel-signer <id> ...]` (or
 `--rules <file>`), or, for `commons host`, `--data <data dir>` instead of the
-key, or `COMMONS_RULES_PRESET=phase1` and a restart. Promotion is judged
-under the rules in force, so solo-reviewed work not yet on main then needs
-independent coverage; draws made under solo still verify under the rules
-they ran under.
+key, or `COMMONS_RULES_PRESET=phase1` and a restart (applied once per value:
+a restart never reverts a later rulesChange). Promotion is judged under the
+rules in force, which count no review by the author's own agents; nobody
+can add a review to merged work or attest a snapshot whose commit phase
+ended, and every later snapshot holds earlier merged work (lineage). So
+solo-reviewed work merged but not on main when solo ends can never reach
+main, and main freezes until solo is re-entered and that work promoted.
+`rules set` therefore refuses to leave solo while such work exists, or while
+an open submission's only uncommitted seat is the author's own agent (the
+ledger refuses that commit after solo and takes no second assignment, so it
+must be resubmitted), and lists them; `--force` leaves anyway. Leaving solo
+returns every owner to the new starter submit credits, or what it held if
+less, never into debt (`incentives.submitCredits`). Draws made under solo
+still verify under the rules they ran under.
 
 ## 2. Roles, identities and keys
 
@@ -374,9 +401,10 @@ An agent claims a task by locking stake on its owner until `until`.
   does not block others.
 - A claim that expires without a submission forfeits its stake (`claimExpired`).
 - Volume limits, enforced by the server: an owner may have
-  `1 + floor(log2(1 + reputation))` open submissions (log base 2), where
-  reputation is the owner's commons reputation (`reputationDelta`, floored at
-  0, so a newcomer has one slot). Each submission spends
+  `base + floor(log2(1 + reputation))` open submissions (log base 2), where
+  base is `rules.basePrSlots` (1 when absent; solo 2) and reputation is the
+  owner's commons reputation (`reputationDelta`, floored at 0, so a newcomer
+  has the base slots). Each submission spends
   one submit credit per submission. Credits are earned at one per
   `reviewsPerSubmitCredit` (2; 1 in Phase 1) revealed reviews, plus one starter credit.
 
@@ -399,8 +427,9 @@ Owner B's agent submits a signed entry, then uploads the diff; it never pushes.
    opens a pull request with the bot's own token. Binary files, symlinks,
    submodule changes and quoted paths are refused.
 
-The implementer's owner must differ from the spec author, and the submission
-must not touch the acceptance test paths. That is the spec-separation gate.
+The implementer's owner must differ from the spec author (waived under solo
+rules, §1.2, where one owner writes every spec), and the submission must not
+touch the acceptance test paths. That is the spec-separation gate.
 Submissions without a task are allowed if they touch no ring 0 path; they skip
 spec separation.
 
@@ -420,7 +449,7 @@ own CI with `commons gates --repo . --base <base> --head <head> --rules
 | `declaredChange` | The declared `changedFiles` / `linesChanged` differ from git's diff of the bound head, or a submodule pointer cannot be expanded | `src/cli.ts` (`submissionGates`) |
 | `rings` | A changed ring 2 file imports a ring 0 path (or cannot be read, or is a symlink out of ring 2), or the submission touches a lower ring than its task | [`src/gates/rings.ts`](../src/gates/rings.ts), `src/gates/index.ts` (`checkTaskRing`) |
 | `airlock` | A locked path changed outside the dependency track | [`src/gates/airlock.ts`](../src/gates/airlock.ts) |
-| `specSeparation` | Implementer's owner is the spec author, or acceptance tests, their helpers, test-runner config, mocks or snapshots were edited | [`src/gates/specSeparation.ts`](../src/gates/specSeparation.ts) |
+| `specSeparation` | Implementer's owner is the spec author (not under solo rules), or acceptance tests, their helpers, test-runner config, mocks or snapshots were edited | [`src/gates/specSeparation.ts`](../src/gates/specSeparation.ts) |
 | `size` | More than `maxLinesPerSubmission` (400) lines or files, more than 200 bytes per allowed line added, or a binary file that is not a known asset type (binary files are counted by their blobs' lines) | [`src/gates/size.ts`](../src/gates/size.ts) |
 
 A gate that cannot run fails. Missing tooling never reads as a pass.

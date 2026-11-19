@@ -44,7 +44,9 @@ import { readFileSync } from "node:fs";
 import { canonical } from "./crypto";
 import { blocksTarget, findingStatus, isConfirmedDefect } from "./findingStatus";
 import { LEDGER_LIMITS, taskMerged } from "./ledger";
-import { CATCH_THRESHOLD, reviewWindowCloseSeq } from "./plants";
+import { memberTree } from "./members";
+import { CATCH_THRESHOLD, commitDeadlineMs, reviewWindowCloseSeq } from "./plants";
+import { isSolo } from "./rules";
 import { uploadExists } from "./server";
 import type {
   CommitSha,
@@ -118,6 +120,17 @@ export const BINDING_GATE = "patch";
 // (ledger.submissionDead); the author resubmits on the new dev.
 export const MERGE_GATE = "merge";
 
+// Reserved gate name, solo rules only (rules.mode "solo"), for a submission
+// whose review can never happen: the draw finds no eligible reviewer (the pool
+// is fixed at the submission, so an agent of another model family paired
+// after it is never drawn for it), or the assigned reviewers' commit phase
+// ended below quorum (the ledger takes no second assignment). With one owner
+// and one seat there is no slack, and such a submission would hold the
+// owner's PR slot for good. The failed gate makes it dead, as MERGE_GATE
+// does; the author resubmits and gets a fresh draw. Other ledgers keep
+// waiting, as they always did.
+export const REVIEW_GATE = "review";
+
 // What a bridge throws when the head does not merge cleanly onto dev (and
 // only then: any other error is retried on the next pass).
 export class MergeConflictError extends Error {
@@ -186,6 +199,8 @@ export type Action =
   // the ledger (reviewWindowClosed), which closes the window for plants.ts, so
   // the merge waits a plant-reveal grace after it. `missing` never revealed.
   | { kind: "closeReviewWindow"; submissionId: string; missing: KeyId[] }
+  // Solo only: a failed REVIEW_GATE for a submission no review can reach.
+  | { kind: "closeUnreviewable"; submissionId: string; reason: string }
   | { kind: "merge"; submissionId: string }
   | { kind: "snapshot"; id: string; commit: CommitSha; previousSnapshotId: string | null; submissionIds: string[] }
   | { kind: "promote"; snapshotId: string; commit: CommitSha };
@@ -247,6 +262,26 @@ const DAY = 24 * HOUR;
 // reviewWindowClosed entry records it yet; the planner appends one first.
 export type MergeReadiness = { ready: boolean; missing: KeyId[]; waiting: string[]; closeWindow?: boolean };
 
+// Revealed assigned reviews a merge needs (PlanOptions.reviewQuorum).
+function reviewQuorum(assigned: number, opts: Pick<PlanOptions, "reviewQuorum">): number {
+  return Math.min(assigned, Math.max(1, opts.reviewQuorum ?? assigned - 1));
+}
+
+// Solo only (REVIEW_GATE): why the submission's assigned review can never
+// reach quorum, or null. Commits close at the end of the commit phase (or
+// once a review is revealed, which needs that end or every seat committed);
+// a seat that committed may still reveal, so commits, not reveals, count.
+export function soloUnreviewable(state: CommonsState, submissionId: string, nowIso: string, opts: Pick<PlanOptions, "reviewQuorum">): string | null {
+  const s = state.submissions.get(submissionId);
+  if (!s || s.merged || !s.assignment || !isSolo(state.rules)) return null;
+  const assigned = s.assignment.reviewers;
+  const quorum = reviewQuorum(assigned.length, opts);
+  const committed = assigned.filter((r) => s.reviews.some((v) => v.reviewer === r)).length;
+  if (committed >= quorum) return null;
+  if (Date.parse(nowIso) < commitDeadlineMs(state.rules, s.assignment.at)) return null;
+  return `solo: review quorum can never be met: ${committed} of ${quorum} assigned reviewers committed before the commit phase ended (the ledger takes no second assignment); resubmit for a fresh draw`;
+}
+
 // Why a submission can or cannot merge now. `waiting` lists every unmet rule.
 // Everything it reads is on the ledger (approvals, decisions, the window's
 // close) except the clock and the entries' times, so `commons merge` and the
@@ -278,7 +313,7 @@ export function mergeReadiness(
     const verdicts = assigned.flatMap((r) => s.reviews.find((v) => v.reviewer === r && v.verdict !== undefined)?.verdict ?? []);
     const revealed = assigned.filter((r) => s.reviews.some((v) => v.reviewer === r && v.verdict !== undefined));
     const unrevealed = assigned.filter((r) => !revealed.includes(r));
-    const quorum = Math.min(assigned.length, Math.max(1, opts.reviewQuorum ?? assigned.length - 1));
+    const quorum = reviewQuorum(assigned.length, opts);
     // What the reviewers said matters: a majority flag sends the merge to a human.
     flagged = verdicts.filter((v) => v.defectProbability >= CATCH_THRESHOLD).length * 2 > verdicts.length;
     if (unrevealed.length > 0) {
@@ -597,6 +632,11 @@ export function planActions(state: CommonsState, nowIso: string, opts: PlanOptio
       actions.push({ kind: "assignReviewers", submissionId: s.id });
       continue;
     }
+    const stuck = soloUnreviewable(state, s.id, nowIso, opts);
+    if (stuck !== null) {
+      actions.push({ kind: "closeUnreviewable", submissionId: s.id, reason: stuck });
+      continue;
+    }
     const r = mergeReadiness(state, s.id, nowIso, opts);
     if (r.closeWindow) actions.push({ kind: "closeReviewWindow", submissionId: s.id, missing: r.missing });
     if (!r.ready) continue;
@@ -898,7 +938,28 @@ async function execute(action: Action, deps: ExecuteDeps, append: Append): Promi
       let note = "";
       await append((state) => {
         const picked = selection.drawAssignment(state, action.submissionId, entropy);
-        if (picked.reviewers.length === 0) fail(`no eligible reviewers (${picked.notes.join("; ")})`);
+        if (picked.reviewers.length === 0) {
+          // Solo: the pool is fixed at the submission and only shrinks, so
+          // nobody will ever be drawn; close it (REVIEW_GATE) rather than
+          // hold the owner's PR slot. Not when the author is outside the
+          // pinned Anthill tree: a later pin can bring them in.
+          const s = state.submissions.get(action.submissionId);
+          const authorOwner = s && state.agents.get(s.author)?.owner;
+          const outsideTree = state.anthill !== undefined && (authorOwner === undefined || !memberTree(state).has(authorOwner));
+          if (s && isSolo(state.rules) && !outsideTree) {
+            note = `closed: no eligible reviewer (${picked.notes.join("; ")})`;
+            return {
+              kind: "gateResult",
+              submissionId: s.id,
+              gate: REVIEW_GATE,
+              pass: false,
+              details: gateDetails(
+                `solo: no eligible reviewer, and none can join this submission's pool (agents paired after it are not drawn for it): pair an agent of another model family than the author's, then resubmit (${picked.notes.join("; ")})`,
+              ),
+            };
+          }
+          fail(`no eligible reviewers (${picked.notes.join("; ")})`);
+        }
         note = `entropy ${JSON.stringify(entropy)}; beacon ${picked.body.beacon}; ${picked.reviewers.length} of ${picked.candidates} candidates${picked.notes.length ? `; ${picked.notes.join("; ")}` : ""}`;
         return picked.body;
       });
@@ -910,6 +971,16 @@ async function execute(action: Action, deps: ExecuteDeps, append: Append): Promi
         return { kind: "reviewWindowClosed", submissionId: action.submissionId, missing: action.missing };
       });
       return `review window closed; missing reviewers: ${action.missing.join(", ")}`;
+    }
+    case "closeUnreviewable": {
+      let reason = action.reason;
+      await append((state) => {
+        const now = soloUnreviewable(state, action.submissionId, deps.recheck.clock(), deps.recheck.opts);
+        if (now === null) fail("the submission's review can still reach quorum");
+        reason = now;
+        return { kind: "gateResult", submissionId: action.submissionId, gate: REVIEW_GATE, pass: false, details: gateDetails(now) };
+      });
+      return `closed: ${reason}`;
     }
     case "merge": {
       // The whole merge rule, re-checked under the store lock against live

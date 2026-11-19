@@ -8,13 +8,15 @@ import type { AddressInfo } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { main } from "../src/cli";
-import { keyIdOf } from "../src/crypto";
+import { generateKeyPair, keyIdOf } from "../src/crypto";
 import { hostLayout } from "../src/host";
-import { Ledger } from "../src/ledger";
+import { Ledger, signEntry, type Signer } from "../src/ledger";
+import { commitmentFor } from "../src/review";
+import { assignmentBody } from "../src/selection";
 import { startPlayground } from "../src/playground";
 import { defaultRules, phase1Rules, SOLO_NOTICE, soloRules } from "../src/rules";
 import { createCoordinatorServer } from "../src/server";
-import type { Rules } from "../src/types";
+import type { EntryBody, Rules } from "../src/types";
 
 const tmp = () => fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "solo-cli-"));
 
@@ -135,4 +137,114 @@ test("rules set --data: a commons host's ledger and keys/admin.json, one command
   assert.equal(Ledger.open(l.ledger).state().rules.mode, undefined);
   assert.equal(Ledger.open(ledger).state().rules.mode, "solo", "only the host's ledger");
   assert.equal((await run(dir, "rules", "set", "--data", "data", "--ledger", "x", "--preset", "phase1")).status, 2);
+});
+
+// Kalman on a solo ledger made by init: a Claude agent (cc) and a Codex agent (cx).
+function kalman(dir: string, ledgerPath: string) {
+  const ledger = Ledger.open(ledgerPath);
+  const keyFile = (k: string) => JSON.parse(fs.readFileSync(path.join(dir, `${k}.json`), "utf8")) as Signer;
+  const admin = keyFile("admin");
+  const coord = keyFile("coord");
+  const owner = generateKeyPair();
+  const agents = { cc: generateKeyPair(), cx: generateKeyPair() };
+  let t = Date.parse(ledger.entries().at(-1)?.at as string);
+  const at = () => new Date((t += 1000)).toISOString();
+  const append = (body: EntryBody, signer: Signer) => ledger.append(body, signer, at());
+  append({ kind: "ownerKey", owner: "kalman", publicKey: owner.publicKey, inviter: null }, admin);
+  append({ kind: "agentRegistered", owner: "kalman", publicKey: agents.cc.publicKey, modelFamily: "claude", harness: "claude-code" }, owner);
+  append({ kind: "agentRegistered", owner: "kalman", publicKey: agents.cx.publicKey, modelFamily: "gpt", harness: "codex" }, owner);
+  const cx = keyIdOf(agents.cx.publicKey);
+  const verdict = { defectProbability: 0.05, summary: "looked", findingIds: [] };
+  return {
+    ledger,
+    agents,
+    submit(id: string, by: Signer = agents.cc) {
+      append({ kind: "submission", id, taskId: null, baseCommit: "a".repeat(40), headCommit: "b".repeat(40), changedFiles: ["src/x.ts"], linesChanged: 3 }, by);
+      append({ kind: "gateResult", submissionId: id, gate: "size", pass: true, details: "ok" }, coord);
+      append(assignmentBody(ledger.state(), id, [cx], "e"), coord);
+    },
+    commit(id: string) {
+      append({ kind: "reviewCommit", submissionId: id, commitment: commitmentFor(verdict, `salt-${id}`, cx, { submissionId: id }), stake: 5 }, agents.cx);
+    },
+    reveal(id: string) {
+      append({ kind: "reviewReveal", submissionId: id, verdict, salt: `salt-${id}` }, agents.cx);
+    },
+    merge(id: string) {
+      append({ kind: "merge", submissionId: id, commit: "c".repeat(40) }, coord);
+    },
+    snapshotAndPromote(id: string, sids: string[]) {
+      append({ kind: "snapshot", id, commit: "c".repeat(40), previousSnapshotId: null, submissionIds: sids }, coord);
+      append({ kind: "promotion", snapshotId: id, commit: "c".repeat(40) }, coord);
+    },
+  };
+}
+
+test("rules set: refuses to leave solo while solo-reviewed work is merged but not on main, or an open submission's seat is the author's own agent; --force leaves anyway", async () => {
+  const dir = tmp();
+  const { ledger } = await soloLedger(dir);
+  const k = kalman(dir, ledger);
+  k.submit("s1");
+  k.commit("s1");
+  k.reveal("s1");
+  k.merge("s1");
+  k.submit("s2"); // seated cx, not committed
+  const length = () => Ledger.open(ledger).entries().length;
+  const n = length();
+
+  const r = await run(dir, "rules", "set", "--preset", "phase1", "--admin-key", "admin.json");
+  assert.equal(r.status, 3, r.stderr);
+  assert.match(r.stderr, /leaving solo now strands solo-reviewed work:/);
+  assert.match(r.stderr, /s1: merged, reviewed only by its author's own agents, not on main \(in no snapshot yet\)/);
+  assert.match(r.stderr, /s2: open, its seat [0-9a-f]+ is the author's own agent and has not committed/);
+  assert.equal(length(), n, "nothing appended");
+  // Switching between solo sets, or to solo, is never refused.
+  assert.match(await ok(dir, "rules", "set", "--preset", "solo", "--admin-key", "admin.json"), /rules unchanged/);
+
+  // Once s1 is on main and s2's seat committed, nothing is stranded.
+  k.snapshotAndPromote("snap-1", ["s1"]);
+  k.commit("s2");
+  const clean = await ok(dir, "rules", "set", "--preset", "phase1", "--admin-key", "admin.json", "--kernel-signer", "erin");
+  assert.match(clean, /solo -> independent review/);
+  assert.doesNotMatch(clean, /strands/);
+
+  // --force: leaves, and says what it strands.
+  const dir2 = tmp();
+  const second = await soloLedger(dir2);
+  const k2 = kalman(dir2, second.ledger);
+  k2.submit("s1");
+  k2.commit("s1");
+  k2.reveal("s1");
+  k2.merge("s1");
+  const forced = await ok(dir2, "rules", "set", "--preset", "phase1", "--admin-key", "admin.json", "--force");
+  assert.match(forced, /warning: leaving solo with --force strands:\n {2}s1: merged/);
+  assert.equal(Ledger.open(second.ledger).state().rules.mode, undefined);
+});
+
+test("server, solo: both of one person's agents can have a submission open (basePrSlots 2); a third waits", async () => {
+  const dir = tmp();
+  const { ledger } = await soloLedger(dir);
+  const k = kalman(dir, ledger);
+  const coord = JSON.parse(fs.readFileSync(path.join(dir, "coord.json"), "utf8"));
+  const api = createCoordinatorServer({ ledgerPath: ledger, coordinatorKey: coord, clock: () => new Date().toISOString(), patchesDir: path.join(dir, "patches") });
+  try {
+    await new Promise<void>((r) => api.listen(0, "127.0.0.1", r));
+    const url = `http://127.0.0.1:${(api.address() as AddressInfo).port}`;
+    const post = async (id: string, by: Signer) => {
+      const head = await getJson(`${url}/api/head`);
+      const at = new Date(Math.max(Date.now(), Date.parse(head.at as string))).toISOString();
+      const body: EntryBody = { kind: "submission", id, taskId: null, baseCommit: "a".repeat(40), headCommit: "b".repeat(40), changedFiles: ["src/x.ts"], linesChanged: 3 };
+      const entry = signEntry({ seq: head.nextSeq as number, prev: head.hash as string }, body, by, at);
+      const r = await fetch(`${url}/api/entries`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(entry) });
+      return { status: r.status, body: (await r.json()) as Json };
+    };
+    assert.equal((await post("s1", k.agents.cc)).status, 201);
+    const second = await post("s2", k.agents.cx);
+    assert.equal(second.status, 201, JSON.stringify(second.body));
+    const third = await post("s3", k.agents.cc);
+    assert.equal(third.status, 403);
+    assert.equal(third.body.error, "no-pr-slot");
+    assert.match(String(third.body.message ?? third.body.detail ?? JSON.stringify(third.body)), /2 open submissions of 2 slots/);
+  } finally {
+    await new Promise((r) => api.close(r));
+  }
 });

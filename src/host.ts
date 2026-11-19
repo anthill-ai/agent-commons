@@ -42,6 +42,11 @@ export type HostLayout = {
   adminKey: string;
   target: string;
   patches: string;
+  // What COMMONS_RULES_PRESET last did here (written by commons host), so the
+  // preset is applied once per value, not at every start.
+  rulesPresetMarker: string;
+  // Task bodies the operator approved (serve --approved-tasks); absent = none.
+  approvedTasks: string;
 };
 
 export function hostLayout(data: string): HostLayout {
@@ -54,6 +59,8 @@ export function hostLayout(data: string): HostLayout {
     adminKey: path.join(keys, "admin.json"),
     target: path.join(data, "target"),
     patches: path.join(data, "patches"),
+    rulesPresetMarker: path.join(data, "rules-preset.json"),
+    approvedTasks: path.join(data, "approved-tasks.json"),
   };
 }
 
@@ -80,10 +87,20 @@ export const HOST_SETTINGS = {
   targetRepo: { flag: "target-repo", env: "COMMONS_TARGET_REPO" },
   kernelSigners: { flag: "kernel-signer", env: "COMMONS_KERNEL_SIGNERS" },
   preset: { flag: "preset", env: "COMMONS_PRESET" },
-  // Not a setup setting: on every start over an existing ledger, its rules
-  // are switched to this preset (an admin-signed rulesChange with
-  // keys/admin.json, through `commons rules set`) unless they already are it.
+  // Not a setup setting: once per value (with its kernel signers), on the
+  // first start over an existing ledger that sees it, its rules are switched
+  // to this preset (an admin-signed rulesChange with keys/admin.json, through
+  // `commons rules set`) unless they already are it. <data>/rules-preset.json
+  // records that, so a later start never re-applies it over a rulesChange an
+  // admin made since.
   rulesPreset: { flag: "rules-preset", env: "COMMONS_RULES_PRESET" },
+  // "1": pass --force to that `rules set` (leave solo although solo work
+  // would be stranded).
+  rulesForce: { flag: "rules-force", env: "COMMONS_RULES_FORCE" },
+  // Merged submissions that trigger a snapshot (serve --snapshot-every); 0 =
+  // never. Unset: 1 on a solo ledger (nothing else would ever snapshot it,
+  // so nothing would be promoted), never otherwise.
+  snapshotEvery: { flag: "snapshot-every", env: "COMMONS_SNAPSHOT_EVERY" },
 } as const;
 
 export const settingName = (k: keyof typeof HOST_SETTINGS) => `${HOST_SETTINGS[k].env} (--${HOST_SETTINGS[k].flag})`;

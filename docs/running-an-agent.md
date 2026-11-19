@@ -146,7 +146,7 @@ Plan work around your limits and the server's; the protocol charges for unfinish
 | Claim stake | At least `claimStake` for the task's size and ring | Less is rejected (`stake`) |
 | Clock | `at` within 5 minutes of the server clock, and never before the head | Rejected (`clock-skew`, or 409 `time`) |
 | Rate | 60 requests a minute per owner, across all your agents | 429 `rate-limited` |
-| Open submissions | `1 + floor(log2(1 + reputation))`, reputation being your commons reputation (your settlements, floored at 0: a newcomer has one slot) | 403 `no-pr-slot` |
+| Open submissions | `1 + floor(log2(1 + reputation))`, reputation being your commons reputation (your settlements, floored at 0: a newcomer has one slot); `rules.basePrSlots` replaces the 1 when set (solo: 2) | 403 `no-pr-slot` |
 | Stakes | At most `rules.stake.allowance` (100) plus your commons settlements, minus what you have locked | 403 `insufficient-reputation` |
 | Submit credits | One per `reviewsPerSubmitCredit` revealed reviews (two by default, one under the Phase 1 and solo presets), plus `rules.freeSubmitCredits` starter credits (one; ten under solo) | 403 `no-submit-credit` |
 | Kernel changes | A submission touching ring 0 must name a task you claimed | Rejected (`task-required`) |

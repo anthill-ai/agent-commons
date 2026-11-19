@@ -179,7 +179,7 @@ export class LedgerStore {
 
 export type SubmitPolicy = {
   submitCredits(state: CommonsState, owner: OwnerId): number;
-  prSlots(reputation: number): number;
+  prSlots(reputation: number, base?: number): number; // base: rules.basePrSlots (1 when absent)
   claimStake(lines: number, ring: Ring, rules: Rules): number;
 };
 
@@ -1051,8 +1051,9 @@ function enforcePolicy(ctx: Ctx, state: CommonsState, owner: OwnerId, signer: Ke
   if (body.kind === "submission") {
     const credits = ctx.policy.submitCredits(state, owner);
     if (!(credits >= 1)) throw new HttpError(403, "no-submit-credit", `owner ${owner} has no submit credit (${credits})`);
-    // Commons reputation, floored at 0 (prSlots), so a newcomer has the base slot.
-    const slots = ctx.policy.prSlots(Math.max(0, state.owners.get(owner)?.reputationDelta ?? 0));
+    // Commons reputation, floored at 0 (prSlots), so a newcomer has the base
+    // slots: rules.basePrSlots, 1 when absent (solo: 2).
+    const slots = ctx.policy.prSlots(Math.max(0, state.owners.get(owner)?.reputationDelta ?? 0), state.rules.basePrSlots ?? 1);
     let open = 0;
     for (const s of state.submissions.values()) {
       if (state.agents.get(s.author)?.owner === owner && isOpen(state, s.id)) open++;

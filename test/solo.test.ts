@@ -8,10 +8,11 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { mergeReadiness } from "../src/coordinator";
+import { type Action, executeActions, mergeReadiness, planActions, type PlanOptions, REVIEW_GATE, soloUnreviewable } from "../src/coordinator";
+import { checkSpecSeparation } from "../src/gates/specSeparation";
 import { generateKeyPair, keyIdOf } from "../src/crypto";
-import { settleCleanReviews, submitCredits } from "../src/incentives";
-import { Ledger, LedgerError } from "../src/ledger";
+import { prSlots, settleCleanReviews, settleMerge, submitCredits } from "../src/incentives";
+import { Ledger, LedgerError, submissionDead } from "../src/ledger";
 import { plantCommitment } from "../src/plants";
 import { evaluatePromotion } from "../src/promotion";
 import { commitmentFor } from "../src/review";
@@ -189,6 +190,29 @@ test("selection, solo: a second person's agents outweigh the author's own (weigh
   assert.deepEqual(new Set(selectReviewers(two.state, "s1", "b").reviewers), new Set([two.id("cx"), two.id("f1")]));
 });
 
+test("selection, solo: when the seat goes to a friend of the author's family, the author's own other-family agent takes it, so one seat can meet two families", () => {
+  // The friend runs only Claude, like the author: alone, their seat (won
+  // about two draws in three) could never give promotion a second family.
+  const w = kalman().owner("friend").agent("f1", "friend", "claude").submit("s1", "cc");
+  const seated = new Set<string>();
+  for (const b of beacons(300)) {
+    const d = selectReviewers(w.state, "s1", b);
+    assert.deepEqual(d.reviewers, [w.id("cx")], d.notes.join("; "));
+    seated.add(d.notes.join("; "));
+  }
+  assert.ok([...seated].some((n) => /solo: seat given to the author's own .* \(gpt\), the only model family other than claude/.test(n)), [...seated].join(" | "));
+  w.assign("s1");
+  assert.ok(verifyAssignmentInLedger(w.ledger.entries(), "s1"), "the forced seat verifies");
+  // A friend of another family still wins their share of draws.
+  const g = kalman().owner("friend").agent("f1", "friend", "gpt").submit("s1", "cc");
+  const r = new Set(beacons(100).map((b) => selectReviewers(g.state, "s1", b).reviewers[0]));
+  assert.deepEqual(r, new Set([g.id("f1"), g.id("cx")]));
+  // Outside solo nothing changes: the author's owner is never drawn.
+  const p = new World(phase1Rules(project())).owner("kalman").agent("cc", "kalman", "claude").agent("cx", "kalman", "gpt");
+  p.owner("friend").agent("f1", "friend", "claude").submit("s1", "cc");
+  assert.match(selectReviewers(p.state, "s1", "b").notes.join("; "), /no eligible reviewer has a model family other than the author's|no seat is forced/);
+});
+
 // --- the ledger ------------------------------------------------------------------
 
 test("ledger, solo: an assignment, a review and a finding by the author's other-family agent are accepted; by the author or its family refused", () => {
@@ -296,7 +320,8 @@ test("promotion, solo: a review by the author's own family covers nothing, and a
   const w = new World(soloRules(project())).owner("kalman").agent("cc", "kalman", "claude").agent("cx", "kalman", "gpt");
   w.owner("friend").agent("f1", "friend", "claude");
   w.submit("s1", "cc");
-  w.assign("s1", "f1");
+  // Forced: the draw itself now seats cx here (selection, solo: ... the author's own other-family agent takes the seat).
+  w.append(assignmentBody(w.state, "s1", [w.id("f1")], "e"), w.coord);
   w.review("s1", "f1", 0.05); // another owner, but the author's family
   w.merge("s1");
   w.snapshot("snap-1", ["s1"]);
@@ -396,4 +421,151 @@ test("incentives, solo: reviewing your own agents earns no clean-review reward",
   p.append({ kind: "promotion", snapshotId: "snap-1", commit: "snap-snap-1" }, p.coord);
   const paid = settleCleanReviews(p.state, "snap-1", p.now(24 * 40)).filter((x) => x.reason === "cleanReview");
   assert.deepEqual(paid.map((x) => [x.owner, x.delta]), [["b", 2]]);
+});
+
+test("incentives, solo: a merge reviewed only by the author's own agents vests nothing, before or after leaving solo; one a friend reviewed does", () => {
+  const w = kalman().owner("friend").agent("f1", "friend", "gpt");
+  w.submit("s1", "cc", ["src/feature.ts"], w.task("t1", 1, "cc", "kalman"));
+  w.append(assignmentBody(w.state, "s1", [w.id("cx")], "e"), w.coord);
+  w.review("s1", "cx", 0.05);
+  w.merge("s1");
+  assert.deepEqual(settleMerge(w.state, "s1", 1, w.now()), [], "self-reviewed: no merge vest");
+  w.submit("s2", "cc", ["src/other.ts"], w.task("t2", 1, "cc", "kalman"));
+  w.append(assignmentBody(w.state, "s2", [w.id("f1")], "e"), w.coord);
+  w.review("s2", "f1", 0.05);
+  w.merge("s2");
+  assert.deepEqual(settleMerge(w.state, "s2", 1, w.now()).map((b) => [b.owner, b.reason, b.delta]), [["kalman", "mergeVest", 10]]);
+  // Judged by the rules it merged under: leaving solo pays nothing late.
+  w.rulesChange(phase1Rules(project()));
+  assert.deepEqual(settleMerge(w.state, "s1", 1, w.now()), []);
+  assert.equal(settleMerge(w.state, "s2", 1, w.now()).length, 1);
+  // Phase 1 merges vest as they always did.
+  const p = new World(phase1Rules(project())).owner("a").agent("a1", "a", "claude").owner("b").agent("b1", "b", "gpt");
+  p.submit("s1", "a1", ["src/feature.ts"], p.task("t1", 1, "a1", "a"));
+  p.assign("s1", "b1");
+  p.review("s1", "b1", 0.05);
+  p.merge("s1");
+  assert.equal(settleMerge(p.state, "s1", 1, p.now()).length, 1);
+});
+
+test("incentives, solo: leaving solo puts nobody in debt for solo-era submissions; it returns them to the starter credit", () => {
+  const w = kalman();
+  for (const id of ["g1", "g2", "g3"]) {
+    w.submit(id, "cc");
+    w.append({ kind: "gateResult", submissionId: id, gate: "size", pass: false, details: "too big" }, w.coord);
+  }
+  for (const id of ["s1", "s2"]) {
+    w.submit(id, "cc");
+    w.append(assignmentBody(w.state, id, [w.id("cx")], "e"), w.coord);
+    w.review(id, "cx", 0.05);
+  }
+  assert.equal(submitCredits(w.state, "kalman"), 7, "2 reviews + 10 free - 5 submissions");
+  w.rulesChange(phase1Rules(project()));
+  assert.equal(submitCredits(w.state, "kalman"), 1, "not 2 + 1 - 5 = -2: the starter credit");
+  // Later activity counts from there, and unrelated rulesChanges keep it.
+  w.submit("s3", "cc");
+  assert.equal(submitCredits(w.state, "kalman"), 0);
+  w.rulesChange({ ...phase1Rules(project()), kernelSigners: ["erin"] });
+  assert.equal(submitCredits(w.state, "kalman"), 0);
+  // An owner already below the new allowance keeps what it had, no less.
+  const low = kalman();
+  for (let i = 0; i < 10; i++) low.submit(`x${i}`, "cc");
+  assert.equal(submitCredits(low.state, "kalman"), 0);
+  low.rulesChange(phase1Rules(project()));
+  assert.equal(submitCredits(low.state, "kalman"), 0, "not -9");
+  // Re-entering solo gives the larger allowance again.
+  low.rulesChange(soloRules(project()));
+  assert.equal(submitCredits(low.state, "kalman"), 0);
+});
+
+test("incentives, solo: two base PR slots, so both agents can have work open; Phase 1 and the defaults keep one", () => {
+  assert.equal(soloRules(project()).basePrSlots, 2);
+  assert.equal(phase1Rules(soloRules(project())).basePrSlots, undefined, "leaving solo drops it");
+  assert.equal(project().basePrSlots, undefined);
+  assert.equal(prSlots(0, 2), 2);
+  assert.equal(prSlots(1, 2), 3);
+  assert.equal(prSlots(0), 1);
+  assert.equal(prSlots(0, 0), 1, "a bad base is the default");
+});
+
+test("gates, solo: specSeparation waives the owner rule (one person writes every spec), not the acceptance tests; Phase 1 unchanged", () => {
+  const w = kalman();
+  w.submit("s1", "cc", [KERNEL], w.task("t1", 0, "cc", "kalman"));
+  const g = checkSpecSeparation(w.state, "s1");
+  assert.equal(g.pass, true, g.details);
+  assert.match(g.details, /^solo test: owner kalman wrote the spec of task t1 and implements it/);
+  w.append({ kind: "gateResult", submissionId: "s1", gate: g.gate, pass: g.pass, details: g.details }, w.coord);
+  w.assign("s1", "cx");
+  w.review("s1", "cx", 0.05);
+  w.merge("s1");
+  w.snapshot("snap-1", ["s1"]);
+  assert.ok(evaluatePromotion(w.state, "snap-1", w.now(25)).pass, "tasked ring-0 work merges and promotes alone");
+  // Editing the acceptance tests still fails.
+  w.submit("s2", "cx", ["src/feature.ts", "test/acceptance.test.ts"], w.task("t2", 1, "cx", "kalman"));
+  const bad = checkSpecSeparation(w.state, "s2");
+  assert.equal(bad.pass, false);
+  assert.match(bad.details, /changes acceptance tests of task t2/);
+  // Phase 1: the spec author's own agent still cannot implement it.
+  const p = new World(phase1Rules(project())).owner("a").agent("a1", "a", "claude");
+  p.submit("s1", "a1", [KERNEL], p.task("t1", 0, "a1", "a"));
+  const r = checkSpecSeparation(p.state, "s1");
+  assert.equal(r.pass, false);
+  assert.match(r.details, /owner a wrote the spec of task t1 and cannot implement it/);
+});
+
+// The coordinator against the World's ledger, signing as the coordinator.
+function coordinatorDeps(w: World, opts: PlanOptions) {
+  return {
+    state: () => w.state,
+    append: async (body: EntryBody | ((s: typeof w.state) => EntryBody | Promise<EntryBody>)) => w.append(typeof body === "function" ? await body(w.state) : body, w.coord),
+    recheck: { clock: () => new Date(w.t).toISOString(), opts },
+    entropy: () => "entropy",
+    runGates: async () => [],
+    reproduce: async () => null,
+    bridge: { merge: async () => "merge", fastForwardMain: async () => {} },
+  };
+}
+const planOpts = (w: World): PlanOptions => ({ reviewWindowHours: 48, entries: w.ledger.entries(), headBinding: "declared", requiredGates: ["tests"] });
+
+test("coordinator, solo: a submission no reviewer can ever reach is closed (its PR slot freed), not left holding it", async () => {
+  // Case 1: the Codex agent was paired after the Claude agent submitted.
+  const w = new World(soloRules(project())).owner("kalman").agent("cc", "kalman", "claude");
+  w.submit("s1", "cc");
+  w.agent("cx", "kalman", "gpt");
+  const plan = planActions(w.state, new Date(w.t).toISOString(), planOpts(w));
+  assert.deepEqual(plan, [{ kind: "assignReviewers", submissionId: "s1" }]);
+  const log = await executeActions(plan, coordinatorDeps(w, planOpts(w)) as never);
+  assert.ok(log[0]?.ok, log[0]?.detail);
+  const gate = w.state.submissions.get("s1")?.gates.find((x) => x.gate === REVIEW_GATE);
+  assert.equal(gate?.pass, false);
+  assert.match(gate?.details ?? "", /solo: no eligible reviewer.*pair an agent of another model family than the author's, then resubmit/);
+  assert.ok(submissionDead(w.state, "s1"), "dead: the slot and stakes are released");
+  // The resubmission draws the Codex agent.
+  w.submit("s2", "cc");
+  assert.deepEqual(selectReviewers(w.state, "s2", "b").reviewers, [w.id("cx")]);
+
+  // Case 2: the seated agent never committed before the commit phase ended.
+  const k = kalman().submit("s1", "cc");
+  k.assign("s1", "cx");
+  const before = new Date(k.t + 11 * HOUR).toISOString();
+  assert.equal(soloUnreviewable(k.state, "s1", before, {}), null, "still inside the commit phase");
+  k.t += 13 * HOUR;
+  const actions = planActions(k.state, new Date(k.t).toISOString(), planOpts(k));
+  assert.deepEqual(actions.map((a: Action) => a.kind), ["closeUnreviewable"]);
+  const out = await executeActions(actions, coordinatorDeps(k, planOpts(k)) as never);
+  assert.ok(out[0]?.ok, out[0]?.detail);
+  assert.match(k.state.submissions.get("s1")?.gates.find((x) => x.gate === REVIEW_GATE)?.details ?? "", /review quorum can never be met: 0 of 1/);
+  assert.ok(submissionDead(k.state, "s1"));
+  // A seat that committed in time may still reveal: nothing is closed.
+  const c = kalman().submit("s1", "cc");
+  c.assign("s1", "cx");
+  c.commit("s1", "cx");
+  c.t += 13 * HOUR;
+  assert.equal(soloUnreviewable(c.state, "s1", new Date(c.t).toISOString(), {}), null);
+  // Phase 1 keeps waiting, as it always did.
+  const p = new World(phase1Rules(project())).owner("a").agent("a1", "a", "claude").owner("b").agent("b1", "b", "gpt").submit("s1", "a1");
+  p.assign("s1", "b1");
+  p.t += 13 * HOUR;
+  assert.equal(soloUnreviewable(p.state, "s1", new Date(p.t).toISOString(), {}), null);
+  assert.ok(!planActions(p.state, new Date(p.t).toISOString(), planOpts(p)).some((a: Action) => a.kind === "closeUnreviewable"));
 });

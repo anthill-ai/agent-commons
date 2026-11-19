@@ -71,14 +71,17 @@
 // drawn too, with weight 1 (as a lineal relative: the fewest tickets), but
 // represented only by its agents of a model family other than the author
 // agent's; the author agent itself never is. Every other owner is drawn as
-// above. Without mode "solo" (every ledger before it existed) the author's
+// above. When the seats went to the author's family and the author's own
+// owner is the only one offering another, its agent takes the lowest seat
+// (requireOtherModelFamily), so one seat can always meet promotion's two
+// families. Without mode "solo" (every ledger before it existed) the author's
 // owner is never drawn.
 
 import { sha256hex } from "./crypto";
 import { replay } from "./ledger";
 import { memberDigest, memberTree } from "./members";
 import { assignmentBeacon } from "./review";
-import { isSolo } from "./rules";
+import { isSolo, rulesAt } from "./rules";
 import type { AgentState, CommonsState, EntryBody, KeyId, LedgerEntry, OwnerId, OwnerState, SubmissionState } from "./types";
 
 export type Selection = { reviewers: KeyId[]; candidates: number; notes: string[] };
@@ -282,6 +285,16 @@ export function selectReviewers(state: CommonsState, submissionId: string, beaco
       picks[picks.length - 1] = other;
       picks.sort(byScore);
       notes.push(`seat given to ${other.keyId} (${other.family}) for a model family other than ${authorFamily}`);
+    } else if (solo && otherOwners.length === 1 && otherOwners[0] === authorOwner) {
+      // Solo: the only other family is the author's own owner's, whose
+      // seat the draw gave to someone of the author's family. Promotion needs
+      // another family's review, so that agent takes the lowest seat. The
+      // rule below does not apply: solo already lets that owner review, and
+      // its declaration buys nothing it could not have through its draw.
+      const own = eligible.find((c) => c.owner === authorOwner && c.family !== authorFamily) as Candidate;
+      picks[picks.length - 1] = own;
+      picks.sort(byScore);
+      notes.push(`solo: seat given to the author's own ${own.keyId} (${own.family}), the only model family other than ${authorFamily}`);
     } else if (otherOwners.length === 1) {
       // Families are self-declared and agents are free: if the only owner
       // offering another family always won the forced seat, one declaration
@@ -322,7 +335,7 @@ function stateAt(state: CommonsState, seq: number, submissionId: string): Common
     const active = a.registeredSeq === undefined ? a.active : a.revokedSeq === undefined || a.revokedSeq > seq;
     agents.set(k, { ...a, active });
   }
-  const rules = state.rulesHistory?.filter((r) => r.seq < seq).at(-1)?.rules ?? state.rules;
+  const rules = rulesAt(state, seq);
   const submissions = new Map(state.submissions);
   const s = state.submissions.get(submissionId);
   if (s) submissions.set(submissionId, { ...s, reviews: s.reviews.filter((r) => r.committedSeq < seq) });

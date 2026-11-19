@@ -271,6 +271,7 @@ export function phase1Rules(base: Rules = defaultRules()): Rules {
   delete r.mode;
   delete r.humanMergeApproval;
   delete r.freeSubmitCredits;
+  delete r.basePrSlots;
   return r;
 }
 
@@ -279,6 +280,13 @@ export function phase1Rules(base: Rules = defaultRules()): Rules {
 export const SOLO_NOTICE = "solo test: your own agents review each other";
 
 export const isSolo = (rules: Pick<Rules, "mode">): boolean => rules.mode === "solo";
+
+// The rules in force when the entry at `seq` was appended: the last
+// rulesChange (or the genesis) before it. Replay records rulesHistory; a
+// hand-built state without it is taken under its current rules.
+export function rulesAt(state: { rules: Rules; rulesHistory?: { seq: number; rules: Rules }[] }, seq: number): Rules {
+  return state.rulesHistory?.filter((r) => r.seq < seq).at(-1)?.rules ?? state.rules;
+}
 
 // The solo preset: one person testing the commons alone, with their own
 // agents of at least two model families (say a Claude Code agent and a Codex
@@ -315,11 +323,24 @@ export const isSolo = (rules: Pick<Rules, "mode">): boolean => rules.mode === "s
 //   back the credit it spent, at reviewsPerSubmitCredit 1, so the ten are
 //   headroom for submissions that fail a gate), and stake.allowance covers
 //   both agents holding the largest claim at once plus twenty review stakes
-//   (740 at the defaults): one owner backs every stake.
+//   (740 at the defaults): one owner backs every stake. basePrSlots 2: the
+//   two agents may each have a submission open (prSlots), since one owner's
+//   commons reputation stays where it is in solo (below).
+// - Merge vests: a merge reviewed only by the author's own agents vests
+//   nothing (incentives.settleMerge), so solo reputation is never earned
+//   without someone else looking, and none carries into Phase 1.
+// - Spec separation: the one owner writes every spec, so the gate's owner
+//   rule is waived; the implementer still may not touch the acceptance tests
+//   or their machinery (gates/specSeparation.ts).
 //
 // Leaving solo is an admin-signed rulesChange (commons rules set --preset
-// phase1). Promotion is judged by the rules in force, so solo-reviewed work
-// that is not on main by then needs independent coverage under Phase 1.
+// phase1). Promotion is judged by the rules in force, and nobody can add a
+// review to merged work or attest a snapshot whose commit phase ended, so
+// solo-reviewed work that is merged but not on main by then can never reach
+// main under Phase 1, and every later snapshot holds it: main freezes until
+// solo is re-entered and that work promoted. `rules set` refuses to leave
+// solo while such work exists (or while a submission waits on a seat only
+// the author's own agent can fill) unless --force.
 export function soloRules(base: Rules = defaultRules()): Rules {
   const r = phase1Rules(base);
   r.mode = "solo";
@@ -327,6 +348,7 @@ export function soloRules(base: Rules = defaultRules()): Rules {
   r.assignedReviewers = 1;
   r.reviewsPerSubmitCredit = 1;
   r.freeSubmitCredits = 10;
+  r.basePrSlots = 2;
   r.stake.allowance = Math.max(r.stake.allowance, 2 * claimStake(r.maxLinesPerSubmission, 0, r) + 20 * r.stake.review);
   r.promotion = {
     ...r.promotion,
@@ -360,7 +382,7 @@ export function claimStake(lines: number, ring: Ring, rules: Rules): number {
 // first checks the shape against defaultRules() (same keys, same leaf types,
 // every number finite and >= 0) and only then the relations between values.
 //
-// The optional fields (mode, humanMergeApproval, freeSubmitCredits) are not
+// The optional fields (mode, humanMergeApproval, freeSubmitCredits, basePrSlots) are not
 // in the template: a rules object without them, as every ledger made before
 // they existed has, is checked exactly as before.
 export function validateRules(rules: Rules): string[] {
@@ -458,7 +480,7 @@ export function validateRules(rules: Rules): string[] {
   return problems;
 }
 
-const OPTIONAL_FIELDS = ["mode", "humanMergeApproval", "freeSubmitCredits"] as const;
+const OPTIONAL_FIELDS = ["mode", "humanMergeApproval", "freeSubmitCredits", "basePrSlots"] as const;
 
 // The optional fields, and what a solo set must keep. An undefined value is
 // absent, as checkShape treats it.
@@ -470,6 +492,9 @@ function checkOptional(r: Rules, problems: string[]): void {
   }
   if (raw.freeSubmitCredits !== undefined && !(Number.isInteger(raw.freeSubmitCredits) && (raw.freeSubmitCredits as number) >= 1)) {
     problems.push("rules.freeSubmitCredits must be an integer >= 1 or absent");
+  }
+  if (raw.basePrSlots !== undefined && !(Number.isInteger(raw.basePrSlots) && (raw.basePrSlots as number) >= 1)) {
+    problems.push("rules.basePrSlots must be an integer >= 1 or absent");
   }
   if (raw.mode !== "solo") return;
   // Solo lets the author's own owner review: the model family is then the

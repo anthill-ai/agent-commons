@@ -313,6 +313,9 @@ export type Rules = {
   // Submit credits every owner starts with before reviewing (incentives.
   // submitCredits). Absent: 1.
   freeSubmitCredits?: number;
+  // Open-submission slots every owner has at 0 reputation (incentives.
+  // prSlots). Absent: 1.
+  basePrSlots?: number;
 };
 
 // ---------------------------------------------------------------------------
