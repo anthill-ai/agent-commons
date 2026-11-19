@@ -373,6 +373,21 @@ test("default rings put what coding-agent harnesses load (instructions, settings
     "web/.vscode/launch.json",
     ".idea/workspace.xml",
     "server/.idea/runConfigurations/x.xml",
+    "GEMINI.md",
+    "web/GEMINI.md",
+    ".gemini/settings.json",
+    "web/.gemini/commands/x.toml",
+    ".windsurf/rules/style.md",
+    "web/.windsurf/workflows/x.md",
+    ".clinerules",
+    "web/.clinerules",
+    ".clinerules/style.md",
+    "web/.clinerules/hooks/x.md",
+    ".continue/config.yaml",
+    "web/.continue/rules/x.md",
+    ".aider.conf.yml",
+    ".aiderignore",
+    "web/.aider.model.settings.yml",
     // Matched ignoring case, as every glob is (a case-insensitive checkout).
     "claude.md",
     "Agents.md",
@@ -380,7 +395,7 @@ test("default rings put what coding-agent harnesses load (instructions, settings
     assert.equal(ringOf(p, r), 0, p);
   }
   // Near misses stay ring 1.
-  for (const p of ["docs/CLAUDE.md.txt", "docs/claude-notes.md", "AGENTS.markdown", "src/claude/client.ts", "mcp.json", "docs/vscode.md", "web/idea/x.ts", "README.md"]) {
+  for (const p of ["docs/CLAUDE.md.txt", "docs/claude-notes.md", "AGENTS.markdown", "src/claude/client.ts", "mcp.json", "docs/vscode.md", "web/idea/x.ts", "docs/GEMINI.md.bak", "docs/aider.md", "src/continue/x.ts", "clinerules.md", "README.md"]) {
     assert.equal(ringOf(p, r), 1, p);
   }
 });

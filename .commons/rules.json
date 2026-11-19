@@ -78,6 +78,10 @@
       "ring": 0
     },
     {
+      "glob": "src/gitHost.ts",
+      "ring": 0
+    },
+    {
       "glob": "src/host.ts",
       "ring": 0
     },
@@ -359,6 +363,34 @@
     },
     {
       "glob": "**/.idea/**",
+      "ring": 0
+    },
+    {
+      "glob": "**/GEMINI.md",
+      "ring": 0
+    },
+    {
+      "glob": "**/.gemini/**",
+      "ring": 0
+    },
+    {
+      "glob": "**/.windsurf/**",
+      "ring": 0
+    },
+    {
+      "glob": "**/.clinerules",
+      "ring": 0
+    },
+    {
+      "glob": "**/.clinerules/**",
+      "ring": 0
+    },
+    {
+      "glob": "**/.continue/**",
+      "ring": 0
+    },
+    {
+      "glob": "**/.aider*",
       "ring": 0
     }
   ],

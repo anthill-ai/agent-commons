@@ -54,8 +54,10 @@ export const FAMILY_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 //   runs a root binding.gyp as `node-gyp rebuild` on install, and gyp's
 //   `<!(cmd)` runs shell);
 // - what coding-agent harnesses load as instructions or settings (CLAUDE.md,
-//   CLAUDE.local.md, AGENTS.md, .claude/**, .mcp.json, .codex/**, .cursor/**,
-//   .cursorrules, .windsurfrules, .github/copilot-instructions.md, and the
+//   CLAUDE.local.md, AGENTS.md, GEMINI.md, .claude/**, .mcp.json, .codex/**,
+//   .gemini/**, .cursor/**, .cursorrules, .windsurf/**, .windsurfrules,
+//   .clinerules (a file or a directory), .continue/**, .aider* (aider's
+//   config and ignore files), .github/copilot-instructions.md, and the
 //   editors' .vscode/** and .idea/**): an agent whose session starts in a
 //   checkout of the project loads them, and hooks or MCP servers named there
 //   run with that agent's environment, its key included.
@@ -130,6 +132,13 @@ export function defaultRules(): Rules {
       { glob: "**/.github/copilot-instructions.md", ring: 0 },
       { glob: "**/.vscode/**", ring: 0 },
       { glob: "**/.idea/**", ring: 0 },
+      { glob: "**/GEMINI.md", ring: 0 },
+      { glob: "**/.gemini/**", ring: 0 },
+      { glob: "**/.windsurf/**", ring: 0 },
+      { glob: "**/.clinerules", ring: 0 },
+      { glob: "**/.clinerules/**", ring: 0 },
+      { glob: "**/.continue/**", ring: 0 },
+      { glob: "**/.aider*", ring: 0 },
     ],
     // What the package manager installs or runs at install: manifests and
     // lockfiles (JS and the common other ecosystems), registry and toolchain

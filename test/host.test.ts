@@ -117,6 +117,7 @@ test("agent-commons' own .commons/rules.json: valid, and its kernel is ring 0", 
     "tsconfig.json",
     ".commons/rules.json",
     "src/mirror.ts",
+    "src/gitHost.ts",
     // What a coding agent's session loads from a checkout of this repository.
     "CLAUDE.md",
     "AGENTS.md",
@@ -124,6 +125,11 @@ test("agent-commons' own .commons/rules.json: valid, and its kernel is ring 0", 
     ".mcp.json",
     "agent-kit/.codex/config.toml",
     ".vscode/settings.json",
+    "GEMINI.md",
+    ".gemini/settings.json",
+    ".clinerules",
+    ".clinerules/x.md",
+    ".aider.conf.yml",
   ]) {
     assert.equal(ringOf(f, rules), 0, f);
   }
