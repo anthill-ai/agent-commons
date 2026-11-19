@@ -54,6 +54,9 @@ export type FetchLike = (
 
 export type GitHubOptions = {
   token?: string; // default: process.env.COMMONS_GITHUB_TOKEN
+  // Without a token, send GET requests unauthenticated instead of refusing
+  // them (public repositories' metadata: the fork check). Writes still need one.
+  anonymous?: boolean;
   fetch?: FetchLike; // default: global fetch
   apiBase?: string; // default: https://api.github.com
   timeoutMs?: number; // per request, including reading the body; default 30s
@@ -63,12 +66,20 @@ export type GitHubOptions = {
 // status is the HTTP status, or 0 when no HTTP status applies (no token,
 // network failure, timeout, a response that is not the shape GitHub documents,
 // a guard the bridge checks itself).
+// `info`: what a caller decides on besides the status. location: a
+// redirect's target (never followed here). acceptedPermissions: GitHub's
+// X-Accepted-GitHub-Permissions on a refusal, naming what the token lacks.
+// rateLimited: a 403 or 429 that is GitHub's rate limit, not a refusal.
+export type GitHubErrorInfo = { location?: string; acceptedPermissions?: string; rateLimited?: boolean };
+
 export class GitHubError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  readonly info: GitHubErrorInfo;
+  constructor(status: number, message: string, info: GitHubErrorInfo = {}) {
     super(message);
     this.name = "GitHubError";
     this.status = status;
+    this.info = info;
   }
 }
 
@@ -147,8 +158,37 @@ export type MergeOptions = {
   expectedBase?: string;
 };
 
+// A repository as GET /repos/{owner}/{repo} describes it. parent: what it was
+// forked from; source: the root of its fork network (both only for forks).
+export type RepositoryInfo = {
+  id: number;
+  fullName: string;
+  fork: boolean;
+  parent: { id: number; fullName: string } | null;
+  source: { id: number; fullName: string } | null;
+};
+
+export type BranchPullRequestArgs = {
+  owner: string; // the base repository
+  repo: string;
+  base: string; // base branch, e.g. dev
+  headOwner: string; // whose repository holds the branch (owner itself for a branch in the base repository)
+  headRepo: string;
+  branch: string;
+  title: string;
+  body: string; // participant text in here must be fenced by the caller (fenceUntrusted)
+};
+
 export type GitHub = {
   openPullRequest(args: OpenPullRequestArgs): Promise<OpenedPullRequest>;
+  // GET /repos/{owner}/{repo}, following one redirect to /repositories/{id}
+  // (a renamed or transferred repository) and no other.
+  getRepository(owner: string, repo: string): Promise<RepositoryInfo>;
+  // A pull request from an existing branch (a member's fork, or the base
+  // repository itself); never pushes. An open one for the same head and base
+  // is returned instead of a second.
+  openBranchPullRequest(args: BranchPullRequestArgs): Promise<PullRequestInfo>;
+  closePullRequest(owner: string, repo: string, prNumber: number): Promise<void>;
   // The PR for commons/<submissionId> from headOwner (default: owner), or null.
   // Prefers a merged PR, then an open one, then the newest.
   findPullRequest(owner: string, repo: string, submissionId: string, headOwner?: string): Promise<PullRequestInfo | null>;
@@ -172,13 +212,13 @@ export function createGitHub(opts: GitHubOptions = {}): GitHub {
   type Reply = { status: number; data: unknown; link: string | null };
 
   async function request(method: string, path: string, body?: unknown): Promise<Reply> {
-    if (token === "") throw new GitHubError(0, `no GitHub token: set ${TOKEN_ENV} or pass options.token`);
+    if (token === "" && !(opts.anonymous === true && method === "GET")) throw new GitHubError(0, `no GitHub token: set ${TOKEN_ENV} or pass options.token`);
     const headers: Record<string, string> = {
       Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${token}`,
       "User-Agent": "agent-commons",
       "X-GitHub-Api-Version": "2022-11-28",
     };
+    if (token !== "") headers.Authorization = `Bearer ${token}`;
     const controller = new AbortController();
     const init: Parameters<FetchLike>[1] = { method, headers, redirect: "manual", signal: controller.signal };
     if (body !== undefined) {
@@ -212,7 +252,8 @@ export function createGitHub(opts: GitHubOptions = {}): GitHub {
     }
     log(`${method} ${path} ${res.status}`);
     if (res.status >= 300 && res.status <= 399) {
-      throw new GitHubError(res.status, `${method} ${path} -> ${res.status}: redirect not followed (repository renamed or moved?)`);
+      const location = res.headers.get("location");
+      throw new GitHubError(res.status, `${method} ${path} -> ${res.status}: redirect not followed (repository renamed or moved?)`, location === null ? {} : { location });
     }
     let data: unknown = null;
     let parsed = true;
@@ -224,7 +265,13 @@ export function createGitHub(opts: GitHubOptions = {}): GitHub {
       }
     }
     if (res.status < 200 || res.status > 299) {
-      throw new GitHubError(res.status, redact(`${method} ${path} -> ${res.status}: ${errorText(data, text, parsed)}`));
+      const info: GitHubErrorInfo = {};
+      const accepted = res.headers.get("x-accepted-github-permissions");
+      if (accepted !== null) info.acceptedPermissions = accepted.slice(0, 200);
+      if ((res.status === 403 || res.status === 429) && (res.headers.get("x-ratelimit-remaining") === "0" || res.headers.get("retry-after") !== null)) {
+        info.rateLimited = true;
+      }
+      throw new GitHubError(res.status, redact(`${method} ${path} -> ${res.status}: ${errorText(data, text, parsed)}`), info);
     }
     if (!parsed) throw new GitHubError(res.status, redact(`${method} ${path}: response is not JSON`));
     return { status: res.status, data, link: res.headers.get("link") };
@@ -550,7 +597,73 @@ export function createGitHub(opts: GitHubOptions = {}): GitHub {
     return { id: getNumber(r.data, "id"), url: getString(r.data, "html_url") };
   }
 
-  return { openPullRequest, findPullRequest, listChangedFiles, mergePullRequest, fastForward, commentOnPullRequest };
+  async function getRepository(owner: string, repo: string): Promise<RepositoryInfo> {
+    const rp = repoPath(owner, repo);
+    let r: Reply;
+    try {
+      r = await request("GET", rp);
+    } catch (e) {
+      // A moved repository answers 301 to /repositories/<id>. Followed only
+      // to that path on this API host: the path is built here from the id.
+      const loc = e instanceof GitHubError && (e.status === 301 || e.status === 307 || e.status === 308) ? e.info.location : undefined;
+      const rel = loc !== undefined && loc.startsWith(`${apiBase}/`) ? loc.slice(apiBase.length) : null;
+      const id = rel === null ? null : /^\/repositories\/(\d{1,15})$/.exec(rel)?.[1];
+      if (id === null || id === undefined) throw e;
+      r = await request("GET", `/repositories/${id}`);
+    }
+    const link = (v: unknown): { id: number; fullName: string } | null =>
+      v === undefined || v === null ? null : { id: getNumber(v, "id"), fullName: getString(v, "full_name") };
+    return {
+      id: getNumber(r.data, "id"),
+      fullName: getString(r.data, "full_name"),
+      fork: get(r.data, "fork") === true,
+      parent: link(get(r.data, "parent")),
+      source: link(get(r.data, "source")),
+    };
+  }
+
+  async function openBranchPullRequest(a: BranchPullRequestArgs): Promise<PullRequestInfo> {
+    const rp = repoPath(a.owner, a.repo);
+    repoPath(a.headOwner, a.headRepo); // validates the head repository
+    checkBranch(a.base);
+    checkBranch(a.branch);
+    checkTitle(a.title);
+    const sameRepo = a.headOwner.toLowerCase() === a.owner.toLowerCase() && a.headRepo.toLowerCase() === a.repo.toLowerCase();
+    const label = `${a.headOwner}:${a.branch}`;
+    // maintainer_can_modify is left out: only the fork's owner may grant it,
+    // and the coordinator never pushes to anyone's fork.
+    const body: Record<string, string> = { title: a.title, head: sameRepo ? a.branch : label, base: a.base, body: a.body };
+    // GitHub needs head_repo for a cross-repository PR within one owner.
+    if (!sameRepo && a.headOwner.toLowerCase() === a.owner.toLowerCase()) body.head_repo = a.headRepo;
+    try {
+      return pullInfo((await request("POST", `${rp}/pulls`, body)).data);
+    } catch (e) {
+      // 422 "already exists" (an earlier attempt opened it, its reply lost).
+      if (!(e instanceof GitHubError) || (e.status !== 0 && e.status !== 422)) throw e;
+      const r = await request("GET", `${rp}/pulls?head=${encodeURIComponent(label)}&base=${encodeURIComponent(a.base)}&state=open&per_page=100`).catch(() => null);
+      const found = r !== null && Array.isArray(r.data) ? r.data.map(pullInfo).find((p) => p.headLabel.toLowerCase() === label.toLowerCase() && p.baseRef === a.base) : undefined;
+      if (found === undefined) throw e;
+      return found;
+    }
+  }
+
+  async function closePullRequest(owner: string, repo: string, prNumber: number): Promise<void> {
+    const rp = repoPath(owner, repo);
+    checkPrNumber(prNumber);
+    await request("PATCH", `${rp}/pulls/${prNumber}`, { state: "closed" });
+  }
+
+  return {
+    openPullRequest,
+    getRepository,
+    openBranchPullRequest,
+    closePullRequest,
+    findPullRequest,
+    listChangedFiles,
+    mergePullRequest,
+    fastForward,
+    commentOnPullRequest,
+  };
 }
 
 // One-shot forms of the client methods, for callers that do not keep a client.

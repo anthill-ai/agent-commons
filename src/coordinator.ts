@@ -18,6 +18,14 @@
 // use that bound head; the declared head is used only with
 // `headBinding: "declared"` (an operator's own trusted repository).
 //
+// A fork source (forks.ts). An author may also push its head commit to its
+// owner's fork and register where it is. Then, after the binding, the
+// coordinator verifies it (the "source" gate: that branch's tip is the
+// signed headCommit, one commit on baseCommit with the bound head's tree),
+// and the merge lands that commit itself, so the pull request opened from it
+// on GitHub shows as merged once dev is pushed. Without a registration
+// nothing of this is planned.
+//
 // executeActions(actions, deps) performs them with injected effects: ledger
 // appends as the coordinator, the patch binder, the gate runner, the
 // reproduction harness, the GitHub bridge and the entropy source. Each action
@@ -47,6 +55,7 @@ import { LEDGER_LIMITS, taskMerged } from "./ledger";
 import { memberTree } from "./members";
 import { CATCH_THRESHOLD, commitDeadlineMs, reviewWindowCloseSeq } from "./plants";
 import { isSolo } from "./rules";
+import { SOURCE_GATE, sourceDetails, sourceExists, sourceOf, type SourceVerdict } from "./forks";
 import { uploadExists } from "./server";
 import type {
   CommitSha,
@@ -112,6 +121,8 @@ function load<T>(name: "incentives" | "promotion" | "selection"): T {
 
 // Reserved gate name for the binding; a gate runner may not report it.
 export const BINDING_GATE = "patch";
+
+export { SOURCE_GATE } from "./forks";
 
 // Reserved gate name for a merge the bridge refused because the bound head
 // conflicts with dev. Without a record the submission could never merge and
@@ -202,6 +213,8 @@ export type Action =
   // reproduced, so its stake settles and it stops blocking the submission.
   | { kind: "voidFinding"; findingId: string; reason: VoidReason }
   | { kind: "bindPatch"; submissionId: string }
+  // A registered fork source, checked against the bound head (forks.ts).
+  | { kind: "verifySource"; submissionId: string; headCommit: CommitSha }
   | { kind: "runGates"; submissionId: string; headCommit: CommitSha; gates: string[] | null }
   | { kind: "assignReviewers"; submissionId: string }
   // The review window's time ran out with a quorum of reveals: record it on
@@ -238,6 +251,10 @@ export type PlanOptions = {
   snapshotEvery?: number; // merged, unsnapshotted submissions that trigger a snapshot; absent = never
   // Binding and gates need the patch; while this says false they are not planned.
   patchAvailable?: (submissionId: string) => boolean;
+  // true = the author registered a fork source (forks.ts): it is verified
+  // after the binding, before gates, and a merge waits for that. Absent or
+  // false: no source, the submission goes as it always did.
+  sourceRegistered?: (submissionId: string) => boolean;
   // false = the finder's test is not uploaded (or can never be). After
   // findingGraceHours such a finding is voided. Absent = unknown, never voided for it.
   findingTestAvailable?: (findingId: string) => boolean;
@@ -438,7 +455,9 @@ function gateProblems(s: SubmissionState, opts: PlanOptions): string[] {
 function missingGates(s: SubmissionState, opts: PlanOptions): string[] | null {
   if (s.gates.some((g) => !g.pass && g.gate !== BINDING_GATE)) return [];
   if (opts.requiredGates) return opts.requiredGates.filter((name) => !s.gates.some((g) => g.gate === name));
-  return s.gates.some((g) => g.gate !== BINDING_GATE) ? [] : null;
+  // The binding and a verified source are the coordinator's own records, not
+  // the runner's: neither stands for the gates having run.
+  return s.gates.some((g) => g.gate !== BINDING_GATE && g.gate !== SOURCE_GATE) ? [] : null;
 }
 
 // A gate's details as the ledger takes them: at most LEDGER_LIMITS.text
@@ -672,6 +691,12 @@ export function planActions(state: CommonsState, nowIso: string, opts: PlanOptio
     }
     const head = codeHead(s, opts);
     if (head === null) continue; // the binding failed: the patch does not apply
+    // A registered source is checked before gates run on it (a failure
+    // closes the submission), and nothing merges around it.
+    if (opts.sourceRegistered?.(s.id) === true && !s.gates.some((g) => g.gate === SOURCE_GATE || !g.pass)) {
+      actions.push({ kind: "verifySource", submissionId: s.id, headCommit: head });
+      continue;
+    }
     const missing = missingGates(s, opts);
     if (missing === null || missing.length > 0) {
       if (opts.patchAvailable?.(s.id) !== false) {
@@ -762,7 +787,9 @@ export type GithubBridge = {
   // `expectedHead` is the bound code head: the bridge must pass it as the
   // merge's sha guard (mergePullRequest's sha) and refuse if the PR head moved.
   // Must be idempotent: an already merged PR returns its merge commit.
-  merge(submission: SubmissionState, expectedHead: CommitSha): Promise<CommitSha>;
+  // mergeCommit: make a merge commit even where dev could fast-forward (a
+  // verified source: the merge names the submission on dev).
+  merge(submission: SubmissionState, expectedHead: CommitSha, opts?: { mergeCommit?: boolean }): Promise<CommitSha>;
   // Fast-forwards main to the snapshot commit. Idempotent.
   fastForwardMain(commit: CommitSha): Promise<void>;
   // Optional compensation. The store's lock serialises this process only:
@@ -823,6 +850,10 @@ export type ExecuteDeps = {
   // stored patch file, the bytes GET /api/patches/:id serves to reviewers.
   // null = no patch yet; {error} = the patch does not apply (the "patch" gate fails).
   bindPatch?: (submission: SubmissionState) => Promise<PatchBinding | { error: string } | null>;
+  // Verifies the submission's registered fork source against the bound head
+  // (forks.ts verifySourceLocal). null = nothing registered; {error} = the
+  // "source" gate fails; a throw (GitHub unreachable) is retried next pass.
+  verifySource?: (submission: SubmissionState, boundHead: CommitSha) => Promise<SourceVerdict | { error: string } | null>;
   // Runs the named gates (null = all) on the submission, whose headCommit is
   // the bound code head. A runner that executes submission code must do it
   // in a sandbox outside the coordinator's uid (see the header).
@@ -961,6 +992,20 @@ async function execute(action: Action, deps: ExecuteDeps, append: Append): Promi
       });
       return "error" in b ? `patch does not bind: ${b.error}` : `bound to ${b.head} (patch ${b.patchSha256})`;
     }
+    case "verifySource": {
+      const s = deps.state().submissions.get(action.submissionId) ?? fail(`no submission ${action.submissionId}`);
+      if (codeHead(s, deps.recheck.opts) !== action.headCommit) fail("submission code head changed since planning");
+      if (!deps.verifySource) fail("no source verifier configured (ExecuteDeps.verifySource): a registered fork source cannot be checked");
+      const v = await deps.verifySource(s, action.headCommit);
+      if (v === null) return "skipped: no source registered";
+      await append((state) => {
+        if (state.submissions.get(s.id)?.gates.some((g) => g.gate === SOURCE_GATE)) fail("source already checked");
+        return "error" in v
+          ? { kind: "gateResult", submissionId: s.id, gate: SOURCE_GATE, pass: false, details: gateDetails(v.error) }
+          : { kind: "gateResult", submissionId: s.id, gate: SOURCE_GATE, pass: true, details: sourceDetails(v) };
+      });
+      return "error" in v ? `source refused: ${v.error}` : `source ${v.repo} ${v.branch} at ${v.head}`;
+    }
     case "runGates": {
       const s = deps.state().submissions.get(action.submissionId) ?? fail(`no submission ${action.submissionId}`);
       if (codeHead(s, deps.recheck.opts) !== action.headCommit) fail("submission code head changed since planning");
@@ -970,7 +1015,7 @@ async function execute(action: Action, deps: ExecuteDeps, append: Append): Promi
       const wanted = action.gates === null ? null : new Set(action.gates);
       let n = 0;
       for (const r of reports) {
-        if (r.gate === BINDING_GATE || recorded.has(r.gate) || (wanted && !wanted.has(r.gate))) continue;
+        if (r.gate === BINDING_GATE || r.gate === SOURCE_GATE || recorded.has(r.gate) || (wanted && !wanted.has(r.gate))) continue;
         recorded.add(r.gate);
         await append({ kind: "gateResult", submissionId: s.id, gate: r.gate, pass: r.pass, details: gateDetails(r.details) });
         n++;
@@ -1044,11 +1089,20 @@ async function execute(action: Action, deps: ExecuteDeps, append: Append): Promi
           const s = state.submissions.get(action.submissionId) ?? fail(`no submission ${action.submissionId}`);
           const r = mergeReadiness(state, s.id, deps.recheck.clock(), deps.recheck.opts);
           if (!r.ready) fail(`not mergeable: ${r.waiting.join("; ")}`);
-          const head = codeHead(s, deps.recheck.opts) ?? fail("patch not bound");
+          const bound = codeHead(s, deps.recheck.opts) ?? fail("patch not bound");
+          // A source registered after planning is verified first.
+          if (deps.recheck.opts.sourceRegistered?.(s.id) === true && !s.gates.some((g) => g.gate === SOURCE_GATE)) {
+            fail("its fork source is registered but not verified yet");
+          }
+          // A verified source merges its own commit: the same change as the
+          // bound head (one commit on the base, the same tree), so what lands
+          // is what was gated and reviewed, and the GitHub PR's head is on dev.
+          const source = sourceOf(s);
+          const head = source?.head ?? bound;
           const before = await deps.bridge.tip?.("dev");
           let commit: string;
           try {
-            commit = await deps.bridge.merge({ ...s, headCommit: head }, head);
+            commit = await deps.bridge.merge({ ...s, headCommit: head }, head, source === null ? undefined : { mergeCommit: true });
           } catch (e) {
             if (!(e instanceof MergeConflictError)) throw e;
             detail = `does not merge: ${e.message} (recorded; the author resubmits on the new dev)`;
@@ -1127,6 +1181,7 @@ export async function runOnce(deps: RunDeps): Promise<{ actions: Action[]; log: 
       ? {}
       : {
           patchAvailable: (sid: string) => uploadExists(dir, "patch", sid),
+          sourceRegistered: (sid: string) => sourceExists(dir, sid),
           findingTestAvailable: (fid: string) => uploadExists(dir, "findingTest", fid),
         }),
     ...deps.plan,

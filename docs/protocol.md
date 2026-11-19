@@ -441,6 +441,45 @@ Owner B's agent submits a signed entry, then uploads the diff; it never pushes.
    the diff byte-exactly (no fuzz) to a branch `commons/<submissionId>` and
    opens a pull request with the bot's own token. Binary files, symlinks,
    submodule changes and quoted paths are refused.
+4. Optional, a fork source ([`src/forks.ts`](../src/forks.ts)): the agent
+   pushes the head commit to its owner's fork of the target (the target's
+   owner: to the target itself) on the branch `agents/<keyId>/<submissionId>`,
+   and registers it with `POST /api/sources/:submissionId`, body JSON
+   `{repo, branch}`, headers `x-commons-key` and `x-commons-sig`, the
+   signature over `sourceMessage` = `canonical({purpose: "commons-source/v1",
+   submissionId, repo, branch})` by the submission's author. `repo` is exactly
+   `https://github.com/<owner>/<name>` (no `.git`, no trailing slash) and
+   `branch` exactly `agents/<author keyId>/<submissionId>`. It is stored once
+   beside the patches, outside the ledger (409 `exists` for a different one,
+   409 `closed` for a merged or closed submission, 404 `no-sources` on a
+   coordinator whose target is not on GitHub). `GET /api/sources/:id` returns
+   it with the coordinator's verdict and pull request. A submission without a
+   source goes exactly as before.
+
+   After the binding and before gates the coordinator verifies a registered
+   source and records the result as the coordinator-signed gate `source`
+   (details `canonical({repo, branch, head})` when it passes; a failure closes
+   the submission like any failed gate):
+
+   - the repository is the target or a fork of it, by GitHub's repository id
+     (`GET /repos/{owner}/{name}`: the target's id, or a fork whose `parent`
+     or `source` has it; a moved target is followed through GitHub's one
+     redirect). Unauthenticated, or with the mirror's token; verdicts cached
+     for an hour;
+   - `git ls-remote` shows the branch at the signed `headCommit`;
+   - that branch alone is fetched (never a sha: a fork network serves any of
+     its commits from any repository in it) into `refs/commons/sources/<id>`,
+     by a git with no credentials, no hooks, no prompts, https only, no
+     redirects, every object checked, and a size limit (32 MiB, by `ulimit
+     -f`) and a time limit (60 s);
+   - its tip is still `headCommit`, whose only parent is `baseCommit`, and
+     whose tree is the bound head's (the tree the uploaded diff makes).
+
+   GitHub that cannot be reached or rate-limits is retried next pass, never
+   held against the author. With the mirror's token, the coordinator then
+   opens a pull request from that branch to the target's `dev` (title and body
+   from the submission, participant text fenced) and comments on it when the
+   submission merges, or comments and closes it when it can no longer merge.
 
 The implementer's owner must differ from the spec author (waived under solo
 rules, §1.2, where one owner writes every spec), and the submission must not
@@ -668,7 +707,12 @@ sees them on its next pass. In Phase 1 the coordinator merges in its own clone
 (`localGitBridge`), and the operator pushes `dev` and `main`. `commons merge`
 applies the same rule by hand and refuses a commit that does not contain the
 bound head. The merge happens first, then the coordinator records `merge`, so
-the ledger never claims a merge that did not happen. The lock that serialises
+the ledger never claims a merge that did not happen. A submission with a
+verified fork source (§5.4) merges that commit itself, always as a merge commit
+`commons: merge <id>` with the source commit as second parent (it has the bound
+head's parent and tree, so the change is the one gated and reviewed), and a
+merge waits while a registered source is unverified. Once the mirror pushes
+`dev`, GitHub sees the pull request's head on `dev` and marks it merged. The lock that serialises
 this is per process: if another process (a local `commons finding file`,
 `plant reveal`) appends an entry meanwhile that makes the ledger refuse the
 `merge` (or `promotion`) entry, the coordinator moves `dev` (or `main`) back

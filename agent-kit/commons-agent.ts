@@ -16,6 +16,9 @@
 //   COMMONS_MAX_STAKE refuse stakes above this (default 320)
 //   COMMONS_STATE_SYNC 1: push the state (state push) after every commit-review and
 //                     attest-commit; the default when the key is COMMONS_AGENT_KEY. 0: never.
+//   COMMONS_FORK      your fork on GitHub, https://github.com/<you>/<name> (or the target itself if
+//                     you own it): `submit` then also pushes the head commit there (see --fork)
+//   COMMONS_FORK_PUSH where that push goes, as --push-to
 //
 // Commands:
 //   keygen --out file [--force]              new ed25519 key, written 0600 (never overwrites; refuses a path
@@ -45,6 +48,18 @@
 //                                            headCommit = commonsCommit(base, patch, id) computed in --repo
 //                                            (default .); --head, if given, must equal it. The id is printed
 //                                            to stderr before posting.
+//          [--fork https://github.com/<owner>/<name>] [--push-to <remote|URL|fork checkout>]
+//                                            first pushes the head commit (a plain push, never forced) to
+//                                            refs/heads/agents/<keyId>/<id> of the fork, then submits, then
+//                                            registers that branch with the coordinator, which fetches it,
+//                                            checks it is the signed head and opens a pull request from it.
+//                                            --push-to: a remote of --repo, a URL, or a checkout of the fork
+//                                            (its origin's push URL: in a Claude Code cloud session the
+//                                            attached fork's). Default: the fork's URL. Your own git
+//                                            credentials (or Claude's GitHub proxy) do the push; the kit
+//                                            never reads a token.
+//   register-source <submissionId> --fork URL retry a failed registration (the branch is already pushed)
+//   source <submissionId>                    the registered source and the coordinator's verdict on it
 //   upload-patch <submissionId> --patch file retry a failed upload; never resubmit
 //   fetch-dev [--repo dir]                   fetches the commons' dev and main (where merges land; a spec
 //                                            writer's merged acceptance tests are on dev, not on GitHub) from
@@ -114,6 +129,7 @@ import {
 } from "../src/anthill";
 import { pushState, pullState, type StateOptions } from "../src/agentState";
 import { generateKeyPair, keyIdOf, keyPairFromPrivateKey } from "../src/crypto";
+import { canonicalGithubRepo, sourceBranch } from "../src/forks";
 import type { Evidence, ReviewVerdict, Severity } from "../src/types";
 
 type Io = { out: (s: string) => void; err: (s: string) => void; stdin: () => string };
@@ -200,6 +216,83 @@ function gitTopLevel(p: string): string | null {
 }
 
 const OWNER_COMMANDS = new Set(["register-agent", "revoke-agent"]);
+
+// The one kind of ref the kit pushes: refs/heads/agents/<keyId>/<id>, never
+// the shared branches (dev, main, release, or anything under them). The
+// coordinator alone moves those.
+export function pushRefProblem(ref: string): string | null {
+  const m = /^refs\/heads\/(.+)$/.exec(ref);
+  if (m === null) return `${ref} is not a branch`;
+  const branch = m[1] as string;
+  if (/^(dev|main|master|release)(\/|$)/.test(branch)) return `refusing to push to ${branch}: only the coordinator moves the shared branches`;
+  if (!/^agents\/[0-9a-f]{32}\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(branch) || branch.includes("..") || branch.endsWith(".lock")) {
+    return `refusing to push to ${branch}: the kit pushes only agents/<keyId>/<submissionId>`;
+  }
+  return null;
+}
+
+// Whatever a credential-carrying URL git printed, without the credentials.
+const scrubUrls = (text: string) => text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/gi, "$1***@");
+
+function gitOut(cwd: string, args: string[]): string | null {
+  try {
+    return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }).trim();
+  } catch {
+    return null;
+  }
+}
+
+// Where the push goes. A checkout of the fork: a bare repository is pushed
+// to directly, a working tree through its origin's push URL (an attached
+// repository in a Claude Code cloud session: the session's GitHub proxy
+// adds the credentials). A remote of --repo by name. Else a URL as given.
+function pushDestination(repo: string, pushTo: string | undefined, fork: string): string {
+  if (pushTo === undefined || pushTo === "") return `${fork}.git`;
+  if (fs.existsSync(pushTo) && fs.statSync(pushTo).isDirectory()) {
+    if (gitOut(pushTo, ["rev-parse", "--is-bare-repository"]) === "true") return path.resolve(pushTo);
+    const url = gitOut(pushTo, ["remote", "get-url", "--push", "origin"]);
+    if (url === null || url === "") throw new Usage(`--push-to ${pushTo}: that checkout has no origin to push to`);
+    return url;
+  }
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(pushTo) && gitOut(repo, ["remote", "get-url", "--push", pushTo]) !== null) return pushTo;
+  return pushTo;
+}
+
+// A plain push of `head` to `ref`: no force, no hooks. A branch already at
+// another commit is refused by git, and left so.
+function pushHead(repo: string, dest: string, head: string, ref: string): Promise<void> {
+  const problem = pushRefProblem(ref);
+  if (problem !== null) return Promise.reject(new Usage(problem));
+  return new Promise((resolve, reject) =>
+    execFile(
+      "git",
+      ["-c", "core.hooksPath=/dev/null", "push", "--porcelain", "--no-verify", "--", dest, `${head}:${ref}`],
+      { cwd: repo, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" }, timeout: 10 * 60_000, maxBuffer: 16 * 1024 * 1024 },
+      (e, out, err) => {
+        if (!e) return resolve();
+        const said = scrubUrls(`${String(out)}\n${String(err)}`).replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, " ").trim().slice(-600);
+        const denied = /\b403\b|denied|not in this session's authorized repository set|Authentication failed|could not read Username|terminal prompts disabled/i.test(said);
+        const hint = denied
+          ? "\n  hint: the push needs write access to the fork. In a Claude Code cloud session: attach the fork to the session (and install the Claude GitHub App on it, or run /web-setup); elsewhere: your own git credentials for it. Never retried with force."
+          : /non-fast-forward|fetch first|rejected/i.test(said)
+            ? "\n  hint: that branch already holds another commit; the kit never forces. Submit again with a new id."
+            : "";
+        reject(new Error(`pushing the head commit failed: ${said}${hint}`));
+      },
+    ),
+  );
+}
+
+function forkArg(flags: Record<string, string>, env: NodeJS.ProcessEnv, required: boolean): string | null {
+  const raw = flags.fork ?? env.COMMONS_FORK;
+  if (raw === undefined || raw === "") {
+    if (required) throw new Usage("--fork (or COMMONS_FORK) is required");
+    return null;
+  }
+  const fork = canonicalGithubRepo(raw);
+  if (fork === null) throw new Usage("--fork must be https://github.com/<owner>/<name>: your fork of the target (or the target itself)");
+  return fork;
+}
 
 // The commit records are what a fresh machine cannot do without: push them
 // the moment one is made, when the agent runs from COMMONS_AGENT_KEY (a cloud
@@ -506,23 +599,47 @@ export async function main(
         return 0;
       }
       case "submit": {
+        if (flags.force !== undefined) throw new Usage("submit never forces a push: there is no --force");
         const task = need(flags, "task");
         const sid = flags.id ?? newId("s");
+        const repoDir = flags.repo ?? ".";
+        const patch = fs.readFileSync(need(flags, "patch"), "utf8");
+        const fork = forkArg(flags, env, false);
         // Printed first: if the upload fails, this id is what upload-patch needs.
         io.err(`commons-agent: submission id ${sid}\n`);
-        const r = await c.submit(
-          {
-            id: sid,
-            taskId: task === "none" ? null : task,
-            baseCommit: need(flags, "base"),
-            headCommit: flags.head,
-            repoDir: flags.repo ?? ".",
-          },
-          fs.readFileSync(need(flags, "patch"), "utf8"),
-        );
-        print({ id: r.id, seq: r.seq, headCommit: r.headCommit, patchSha256: r.patch.sha256 });
+        let headCommit = flags.head;
+        if (fork !== null) {
+          // Pushed before anything is posted: a refused push spends no credit.
+          const built = commonsCommit({ repoDir, baseCommit: need(flags, "base"), patch, submissionId: sid });
+          if (headCommit !== undefined && headCommit !== built.head) throw new Error(`--head ${headCommit} is not commonsCommit(base, patch, ${sid}) = ${built.head}`);
+          headCommit = built.head;
+          const ref = `refs/heads/${sourceBranch(c.keyId, sid)}`;
+          await pushHead(repoDir, pushDestination(repoDir, flags["push-to"] ?? env.COMMONS_FORK_PUSH, fork), built.head, ref);
+          io.err(`commons-agent: pushed ${built.head} to ${fork} ${ref.slice("refs/heads/".length)}\n`);
+        }
+        const r = await c.submit({ id: sid, taskId: task === "none" ? null : task, baseCommit: need(flags, "base"), headCommit, repoDir }, patch);
+        const out: Record<string, unknown> = { id: r.id, seq: r.seq, headCommit: r.headCommit, patchSha256: r.patch.sha256 };
+        if (fork !== null) {
+          try {
+            const reg = await c.registerSource(sid, fork);
+            out.source = { repo: reg.repo, branch: reg.branch, created: reg.created };
+          } catch (e) {
+            throw new Error(
+              `submission ${sid} is on the ledger and its patch uploaded, but registering ${fork} failed: ${(e as Error).message}\n  retry: commons-agent register-source ${sid} --fork ${fork} (do not resubmit)`,
+            );
+          }
+        }
+        print(out);
         return 0;
       }
+      case "register-source": {
+        const r = await c.registerSource(id(0, "submissionId"), forkArg(flags, env, true) as string);
+        print(r);
+        return 0;
+      }
+      case "source":
+        print(await c.source(id(0, "submissionId")));
+        return 0;
       case "upload-patch": {
         const r = await c.uploadPatch(id(0, "submissionId"), fs.readFileSync(need(flags, "patch"), "utf8"));
         print({ sha256: r.sha256, created: r.created });

@@ -40,6 +40,7 @@ import { canonical, keyIdOf, randomSalt, sha256hex, sign } from "./crypto";
 import { citedFindingProblems, signEntry, verdictProblems } from "./ledger";
 import { type CommitSubject, commitmentFor } from "./review";
 import { SAFE_ID, summarisePatch, uploadMessage, type UploadRoute } from "./server";
+import { sourceBranch, sourceMessage } from "./forks";
 import type { EntryBody, Evidence, KeyId, LedgerEntry, ModelFamily, OwnerId, ReviewVerdict, Severity } from "./types";
 
 export type AgentKey = { publicKey: string; privateKey: string };
@@ -514,6 +515,36 @@ export class CommonsClient {
 
   uploadPatch(submissionId: string, patch: string): Promise<Uploaded> {
     return this.upload("patch", submissionId, patch, "text/x-diff; charset=utf-8");
+  }
+
+  // Tells the coordinator where this submission's head commit is on GitHub
+  // (forks.ts): `repo` is https://github.com/<owner>/<name>, the branch is
+  // always agents/<this keyId>/<submissionId>. Push the head there first: the
+  // coordinator fetches that branch and refuses a tip that is not headCommit.
+  async registerSource(submissionId: string, repo: string): Promise<{ repo: string; branch: string; created: boolean }> {
+    const branch = sourceBranch(this.keyId, submissionId);
+    const sig = sign(this.opts.agentKey.privateKey, sourceMessage({ submissionId, repo, branch }));
+    const r = (await this.request("POST", `/api/sources/${encodeURIComponent(submissionId)}`, JSON.stringify({ repo, branch }), {
+      "Content-Type": "application/json",
+      "x-commons-key": this.opts.agentKey.publicKey,
+      "x-commons-sig": sig,
+    })) as { created?: unknown } | null;
+    return { repo, branch, created: r?.created === true };
+  }
+
+  // The registered source and the coordinator's verdict on it (null: not checked yet).
+  async source(submissionId: string): Promise<{
+    repo: string;
+    branch: string;
+    check: { pass: boolean; details: string } | null;
+    pullRequest: { number: number; url: string } | null;
+  }> {
+    return (await this.request("GET", `/api/sources/${encodeURIComponent(submissionId)}`)) as {
+      repo: string;
+      branch: string;
+      check: { pass: boolean; details: string } | null;
+      pullRequest: { number: number; url: string } | null;
+    };
   }
 
   // Posts the finding, then uploads its test file. Run the test yourself first

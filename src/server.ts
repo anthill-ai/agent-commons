@@ -33,6 +33,15 @@
 //   is NOT trusted to be this patch: the coordinator loop binds the code it
 //   gates, reproduces against and merges to the stored patch (coordinator.ts,
 //   the "patch" gate).
+// - POST /api/sources/:submissionId registers where the author pushed the
+//   submission's head commit on GitHub (forks.ts): JSON {repo, branch},
+//   signed by the author's key over sourceMessage (its own purpose, bound to
+//   the submission id). The repo must be https://github.com/<owner>/<name>,
+//   the branch exactly agents/<author keyId>/<submissionId>. Stored once,
+//   beside the patches, outside the ledger; a different source for the same
+//   submission is refused, and so is one for a merged or closed submission.
+//   Optional: the coordinator verifies it before gates (the "source" gate).
+//   GET returns it with that verdict. Only where opts.sources is on.
 // - Every request first spends a token from a per-IP bucket, and the server
 //   answers 503 beyond a cap of concurrent requests (overall and per address)
 //   or a deep lock queue, so outsiders cannot starve the single writer.
@@ -79,6 +88,7 @@ import { BlockList, isIPv4, isIPv6 } from "node:net";
 import * as path from "node:path";
 import { answeredOutsideBase, normaliseBasePath } from "./basePath";
 import { canonical, isValidPublicKey, keyIdOf, sha256hex, verify } from "./crypto";
+import { readPullRequestRecord, readSource, SOURCE_GATE, sourceFile, sourceMessage, sourceProblems, storedSourceBytes } from "./forks";
 import { parsePatch } from "./github";
 import {
   ANTHILL_AGENT_MAX_AGE_MS,
@@ -202,6 +212,7 @@ function loadIncentives(): SubmitPolicy {
 export type ServerLimits = {
   entryBytes: number; // POST /api/entries body
   patchBytes: number; // POST /api/patches/:id body
+  sourceBytes: number; // POST /api/sources/:id body
   testBytes: number; // POST /api/findings/:id/test body
   agentStateBytes: number; // PUT /api/agent-state body (one agent's encrypted state)
   clockSkewMs: number; // |entry.at - now| must not exceed this
@@ -230,6 +241,7 @@ export const DEFAULT_LIMITS: ServerLimits = {
   // start, so this is a cost bound, not a convenience.
   entryBytes: 32 * 1024,
   patchBytes: 1024 * 1024,
+  sourceBytes: 4 * 1024,
   testBytes: 256 * 1024,
   agentStateBytes: 256 * 1024,
   clockSkewMs: 5 * 60_000,
@@ -338,6 +350,10 @@ export type CoordinatorServerOptions = {
   // Called after a patch is stored for the first time (the GitHub bridge opens
   // the PR from here). Errors are logged, never shown to the uploader.
   onPatch?: (submissionId: string, file: string) => void | Promise<void>;
+  // Take fork sources (POST /api/sources/:id). On only where a coordinator
+  // loop can verify them (a clone of a GitHub repository); off, the route
+  // answers 404 no-sources and submissions go as they always did.
+  sources?: boolean;
   // Requests no route here matches (e.g. the playground's GET routes).
   // src/playground.ts exports no request handler today, only startPlayground.
   fallback?: http.RequestListener;
@@ -654,6 +670,12 @@ async function handle(ctx: Ctx, req: http.IncomingMessage, res: http.ServerRespo
       const sid = decodeURIComponent(patch[1] ?? "");
       if (method === "POST") return send(res, 201, await postPatch(ctx, req, sid));
       if (method === "GET") return getPatch(ctx, res, sid);
+    }
+    const source = /^\/api\/sources\/([^/]+)$/.exec(p);
+    if (source) {
+      const sid = decodeURIComponent(source[1] ?? "");
+      if (method === "POST") return send(res, 201, await postSource(ctx, req, sid));
+      if (method === "GET") return send(res, 200, getSource(ctx, sid));
     }
     const test = /^\/api\/findings\/([^/]+)\/test$/.exec(p);
     if (test && method === "POST") return send(res, 201, await postFindingTest(ctx, req, decodeURIComponent(test[1] ?? "")));
@@ -1226,6 +1248,55 @@ async function postPatch(ctx: Ctx, req: http.IncomingMessage, sid: string) {
     Promise.resolve(ctx.opts.onPatch(sid, file)).catch((e: unknown) => console.error("onPatch:", e));
   }
   return { submissionId: sid, sha256: sha256hex(content), created };
+}
+
+// A fork source: where the author pushed the head commit (forks.ts). The
+// signature is checked over sourceMessage, after the small body is in.
+async function postSource(ctx: Ctx, req: http.IncomingMessage, sid: string) {
+  if (ctx.opts.sources !== true) {
+    req.resume();
+    throw new HttpError(404, "no-sources", "this coordinator does not take fork sources; submit the patch alone");
+  }
+  const file = sourceFile(ctx.opts.patchesDir, safeId(sid));
+  const s = ctx.store.state().submissions.get(sid);
+  if (!s) throw new HttpError(404, "unknown-ref", `no submission ${sid}`);
+  const auth = preAuthenticate(ctx, req, s.author);
+  const content = await readBody(req, ctx.limits.sourceBytes, ctx.limits.minBodyBytesPerSecond, ctx.limits.bodyGraceMs);
+  let body: unknown;
+  try {
+    body = JSON.parse(utf8(content));
+  } catch (e) {
+    if (e instanceof HttpError) throw e;
+    throw new HttpError(400, "malformed", "the body must be JSON {repo, branch}");
+  }
+  const b = body as Record<string, unknown> | null;
+  if (typeof b !== "object" || b === null || Array.isArray(b) || typeof b.repo !== "string" || typeof b.branch !== "string" || Object.keys(b).length !== 2) {
+    throw new HttpError(400, "malformed", "the body must be JSON {repo, branch}");
+  }
+  const reg = { submissionId: sid, repo: b.repo, branch: b.branch };
+  if (!verify(auth.key, sourceMessage(reg), auth.sig)) throw new HttpError(401, "signature", "invalid signature");
+  const problems = sourceProblems(reg, s);
+  if (problems.length > 0) throw new HttpError(400, "bad-source", problems.join("; "));
+  const state = ctx.store.state();
+  if (s.merged || submissionDead(state, sid)) throw new HttpError(409, "closed", `submission ${sid} is merged or closed: a source for it would change nothing`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const created = storeOnce(ctx, auth.principal, file, storedSourceBytes({ ...reg, agent: s.author, signature: auth.sig }));
+  return { submissionId: sid, repo: reg.repo, branch: reg.branch, created };
+}
+
+function getSource(ctx: Ctx, sid: string) {
+  const stored = readSource(ctx.opts.patchesDir, safeId(sid));
+  if (stored === null) throw new HttpError(404, "not-found", `no source registered for ${sid}`);
+  const check = ctx.store.state().submissions.get(sid)?.gates.find((g) => g.gate === SOURCE_GATE) ?? null;
+  const pr = readPullRequestRecord(ctx.opts.patchesDir, sid);
+  return {
+    submissionId: sid,
+    repo: stored.repo,
+    branch: stored.branch,
+    agent: stored.agent,
+    check: check === null ? null : { pass: check.pass, details: check.details },
+    pullRequest: pr === null ? null : { number: pr.number, url: pr.url },
+  };
 }
 
 function getPatch(ctx: Ctx, res: http.ServerResponse, sid: string): void {

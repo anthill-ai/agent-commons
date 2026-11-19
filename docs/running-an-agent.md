@@ -157,9 +157,10 @@ Anyone who can use the cloud environment can read `COMMONS_AGENT_KEY`, and
 with it sign as the agent and read its state. Use a personal environment,
 and revoke the agent if the key may have leaked.
 
-## 5. Never push with your own credentials
+## 5. Never push to the shared branches
 
-Upload the diff to the coordinator; the coordinator's bot opens the pull request.
+Upload the diff to the coordinator; the coordinator merges it. Optionally your
+agent also pushes its commit to your own fork (below).
 
 - Your agent posts a signed `submission`, then uploads the unified diff to
   `POST /api/patches/:submissionId`. The diff must touch exactly the declared
@@ -171,6 +172,17 @@ Upload the diff to the coordinator; the coordinator's bot opens the pull request
 - Your GitHub token in the agent's VM would let a prompt injection push
   anywhere you can, and a push outside the coordinator bypasses every gate.
   The agent needs no GitHub token at all.
+- To have the work show on GitHub, `commons-agent submit --fork
+  https://github.com/<you>/<name>` also pushes the head commit to
+  `agents/<keyId>/<submissionId>` of your fork, a plain push that is never
+  forced, and registers that branch; the coordinator checks it is exactly the
+  submitted change, opens a pull request from it to the target's `dev`, and
+  merges that commit when the change is accepted ([agent kit §5](../agent-kit/README.md#5-submit-commit-and-reveal)).
+  The kit refuses to push to `dev`, `main` or `release`, and never handles a
+  token: in a Claude Code cloud session, Claude's GitHub proxy authenticates
+  the push, for repositories attached to the session only, so attach your
+  fork and nothing you do not want the agent to write to. Elsewhere your own
+  git credentials do; prefer ones that can write only to the fork.
 
 ## 6. Limits and timing
 

@@ -84,7 +84,8 @@ import { normaliseBasePath } from "./basePath";
 import { followUpstream } from "./gitHost";
 import { githubMirror, GITHUB_TOKEN_ENV, type Mirror, pushUpstreamProblems } from "./mirror";
 import { cloneOrigin, HOST_SETTINGS, hostLayout, missingForServe, readHostSettings, settingName, SetupError, setUp } from "./host";
-import { applyUnifiedDiff, checkRepoPath, FULL_SHA, parsePatch } from "./github";
+import { applyUnifiedDiff, checkRepoPath, createGitHub, type FetchLike as GitHubFetch, FULL_SHA, parsePatch } from "./github";
+import { forkChecker, parseGithubRepo, pullRequestSync, type PullRequestSync, type SourceKind, sourceExists, sourceOf, verifySourceLocal } from "./forks";
 import {
   DEFAULT_MAX_SKEW_MS,
   isCanonicalPath,
@@ -1340,8 +1341,9 @@ const noBridge: GithubBridge = {
 
 // Phase 1's bridge: merges in the coordinator's own clone (--repo), where
 // bindPatchLocal built the bound head. merge() moves `devRef` to the bound
-// head when that is a fast-forward, else to a merge commit of dev and the
-// bound head (refused on conflicts); fastForwardMain() moves `mainRef`, only
+// head when that is a fast-forward (unless asked for a merge commit, as a
+// verified fork source is), else to a merge commit of dev and the bound head
+// named after the submission (refused on conflicts); fastForwardMain() moves `mainRef`, only
 // forward. Both are idempotent: a head already on dev returns dev's tip, a main
 // already at or past the commit is left alone. The operator pushes dev and
 // main from this clone (or --push-upstream does, mirror.ts), and agents fetch
@@ -1361,11 +1363,11 @@ export function localGitBridge(repo: string, devRef: string = DEFAULT_DEV_REF, m
     GIT_COMMITTER_DATE: who.date,
   };
   return {
-    merge: async (s, head) => {
+    merge: async (s, head, opts) => {
       const dev = g(["rev-parse", "--verify", "--end-of-options", `${devRef}^{commit}`]);
       if (isAncestor(head, dev)) return dev;
       let next = head;
-      if (!isAncestor(dev, head)) {
+      if (opts?.mergeCommit === true || !isAncestor(dev, head)) {
         // No rename detection: with it (git's default), an edit to a file
         // that dev renamed since the submission's base follows the rename,
         // and a ring-1 change gated as scripts/x.js lands as src/x.js.
@@ -1712,6 +1714,54 @@ function mirrorOf(ctx: Ctx, store: LedgerStore, repo: string): Mirror | null {
   return mirror;
 }
 
+// The target on GitHub, from the clone's origin (https://github.com/<owner>/<name>[.git]),
+// or null when it is not a GitHub repository.
+export function githubTarget(repo: string): { owner: string; name: string } | null {
+  const origin = spawnSync("git", [...GIT_SAFE, "config", "--get", "remote.origin.url"], { cwd: repo, encoding: "utf8" });
+  if (origin.status !== 0) return null;
+  return parseGithubRepo(origin.stdout.trim().replace(/\/+$/, "").replace(/\.git$/i, ""));
+}
+
+// The GitHub REST client for the target: the mirror's token when there is
+// one (5000 requests an hour), else unauthenticated reads only.
+function targetGitHub(ctx: Ctx): ReturnType<typeof createGitHub> {
+  const env = ctx.io.env ?? process.env;
+  return createGitHub({
+    token: (env[GITHUB_TOKEN_ENV] ?? "").trim(),
+    anonymous: true,
+    ...(ctx.io.fetch === undefined ? {} : { fetch: ctx.io.fetch as unknown as GitHubFetch }),
+  });
+}
+
+// One fork checker per clone, so its verdicts are cached across passes.
+const forkCheckers = new Map<string, (owner: string, name: string) => Promise<SourceKind>>();
+
+function forkCheckerOf(ctx: Ctx, repo: string): (owner: string, name: string) => Promise<SourceKind> {
+  const made = forkCheckers.get(repo);
+  if (made !== undefined) return made;
+  const target = githubTarget(repo);
+  // The server takes no registration then (serve); one appended some other way waits here.
+  if (target === null) throw new Error(`the clone's origin is not a GitHub repository: fork sources cannot be verified`);
+  const checker = forkChecker({ target, github: targetGitHub(ctx) });
+  forkCheckers.set(repo, checker);
+  return checker;
+}
+
+// Pull requests from verified fork sources, per opened ledger: on with the
+// mirror (it pushes the dev they target, with the same token) when the
+// target is on GitHub.
+const pullSyncs = new WeakMap<LedgerStore, PullRequestSync | null>();
+
+function pullSyncOf(ctx: Ctx, store: LedgerStore, repo: string): PullRequestSync | null {
+  const made = pullSyncs.get(store);
+  if (made !== undefined) return made;
+  const target = githubTarget(repo);
+  const sync = target === null ? null : pullRequestSync({ patchesDir: patchesDir(ctx), target, github: targetGitHub(ctx) });
+  if (sync !== null) ctx.out(`pull requests: verified fork sources get a pull request to ${target?.owner}/${target?.name} dev (needs Pull requests: write)`);
+  pullSyncs.set(store, sync);
+  return sync;
+}
+
 // idleLine: what a pass that did nothing prints, null for nothing (run-once
 // always says "nothing to do"). With --push-upstream, the mirror runs at the
 // end of every pass, also one that failed: dev or main may have moved before
@@ -1727,6 +1777,14 @@ async function coordinatorPass(ctx: Ctx, store: LedgerStore, idleLine: () => str
       const r = await mirror.pass();
       for (const p of r.pushed) ctx.out(`mirror: pushed ${p.ref.replace("refs/heads/", "")} ${p.sha.slice(0, 12)} to GitHub`);
       for (const line of r.problems) ctx.io.stderr(`mirror: ${line}\n`);
+      // After the push: a pull request's base is GitHub's dev, and a merged
+      // one is marked merged once that dev holds its head.
+      const prs = pullSyncOf(ctx, store, resolvePath(ctx, req(ctx.flags, "repo")));
+      if (prs !== null) {
+        const p = await prs.pass(store.state()).catch((e: unknown) => ({ lines: [], problems: [`pull requests: ${(e as Error).message}`] }));
+        for (const line of p.lines) ctx.out(`pull requests: ${line}`);
+        for (const line of p.problems) ctx.io.stderr(`pull requests: ${line}\n`);
+      }
     }
   }
 }
@@ -1778,6 +1836,11 @@ async function passActions(ctx: Ctx, store: LedgerStore, idleLine: () => string 
       } catch (e) {
         return Promise.reject(e instanceof Error ? e : new Error(String(e)));
       }
+    },
+    // A registered fork source: fetched anonymously, checked against the bound head (forks.ts).
+    verifySource: async (s: SubmissionState, head: string) => {
+      if (repo === null) throw new Error("no --repo: cannot verify fork sources");
+      return verifySourceLocal({ repo, patchesDir: dir, classify: forkCheckerOf(ctx, repo) }, s, head);
     },
     // `s.headCommit` is the bound head (executeActions passes it).
     runGates: async (s: SubmissionState) => {
@@ -2620,7 +2683,11 @@ const COMMANDS: Record<string, Command> = {
       // hand that the loop would not merge.
       const r = mergeReadiness(st, sid, stamp(ctx, (st as LedgerState).headAt), { ...mergeRule(ctx), entries: ledger.entries() });
       if (!r.ready) refuse(`${sid} may not merge: ${r.waiting.join("; ")}`);
-      const head = patchBinding(s)?.head ?? refuse(`${sid} has no patch binding`);
+      const bound = patchBinding(s)?.head ?? refuse(`${sid} has no patch binding`);
+      // As the coordinator: a verified fork source merges its own commit.
+      const source = sourceOf(s);
+      if (source === null && sourceExists(patchesDir(ctx), sid)) refuse(`${sid} has a fork source registered that the coordinator has not verified yet`);
+      const head = source?.head ?? bound;
       let commit: string;
       let devBefore: string | null = null;
       if (str(f, "commit") !== undefined) {
@@ -2631,7 +2698,7 @@ const COMMANDS: Record<string, Command> = {
         if (!contains) refuse(`--commit ${commit} does not contain the bound head ${head}`);
       } else {
         devBefore = rawGit(repo, ["rev-parse", "--verify", "--end-of-options", `${devRefOf(ctx)}^{commit}`]).toString("utf8").trim();
-        commit = await localGitBridge(repo, devRefOf(ctx)).merge({ ...s, headCommit: head }, head);
+        commit = await localGitBridge(repo, devRefOf(ctx)).merge({ ...s, headCommit: head }, head, source === null ? undefined : { mergeCommit: true });
       }
       let entry: LedgerEntry;
       try {
@@ -2999,6 +3066,9 @@ const COMMANDS: Record<string, Command> = {
           trustedProxies: list(f, "trusted-proxy"),
           basePath,
           ...(bool(f, "serve-git") ? { git: { repo: resolvePath(ctx, req(f, "repo")), refs: [devRefOf(ctx), str(f, "main-ref") ?? "refs/heads/main"] } } : {}),
+          // Fork sources (forks.ts) only where this coordinator can check
+          // them: it runs the loop on a clone of a GitHub repository.
+          sources: bool(f, "coordinator") && str(f, "repo") !== undefined && githubTarget(resolvePath(ctx, req(f, "repo"))) !== null,
           // One port: whatever the API does not answer is the playground's.
           // /api/entries is the API's (the same contract); the site's other
           // pages and /api/state, /api/metrics pass through, under the API's

@@ -29,6 +29,7 @@ import {
   type TaskBody,
 } from "../src/coordinator";
 import { blocksTarget } from "../src/findingStatus";
+import { SOURCE_GATE, sourceOf } from "../src/forks";
 import type { CommonsState, EntryBody, LedgerEntry, ReviewVerdict, Severity } from "../src/types";
 
 // ---------------------------------------------------------------------------
@@ -1042,4 +1043,115 @@ test("localReproducer refuses to run without a sandbox and forwards sandbox and 
   assert.equal(calls[0]?.timeoutMs, 5000);
   const missing = localReproducer({ repoDir: "/r", testFile: () => "/nonexistent/test", reproduceFinding, sandbox: ["box"] });
   assert.equal(await missing(action), null, "no test file yet");
+});
+
+// ---------------------------------------------------------------------------
+// Fork sources (forks.ts): verified after the binding, merged as themselves
+// ---------------------------------------------------------------------------
+
+// A verifier that records its calls and answers from a map (default: passes).
+function sourceDeps(w: World, verdicts: Map<string, { error: string } | null> = new Map(), merges: { head: string; opts?: { mergeCommit?: boolean } }[] = []): ExecuteDeps {
+  const d = w.deps();
+  return {
+    ...d,
+    verifySource: async (s, bound) => {
+      const v = verdicts.get(s.id);
+      if (v !== undefined) return v;
+      return { repo: "https://github.com/alice/agent-commons", branch: `agents/${s.author}/${s.id}`, head: `fork-${s.id}-on-${bound}` };
+    },
+    bridge: {
+      ...d.bridge,
+      merge: async (s, expected, opts) => {
+        merges.push({ head: expected, ...(opts === undefined ? {} : { opts }) });
+        return d.bridge.merge(s, expected);
+      },
+    },
+  };
+}
+
+test("fork source: verified after the binding and before gates; the merge lands the verified commit with a merge commit; without one nothing changes", async () => {
+  const w = new World();
+  w.submit("s1");
+  w.submit("s2", "b1");
+  const registered = new Set(["s1"]);
+  const extra = { sourceRegistered: (sid: string) => registered.has(sid) };
+  const merges: { head: string; opts?: { mergeCommit?: boolean } }[] = [];
+  const run = async () => {
+    const log = await executeActions(planActions(w.state, w.now(), w.opts(extra)), { ...sourceDeps(w, new Map(), merges), recheck: { clock: () => w.now(), opts: w.opts(extra) } });
+    for (const l of log) assert.ok(l.ok, `${l.action.kind}: ${l.detail}`);
+    return log;
+  };
+  await run(); // binding
+  assert.deepEqual(
+    planActions(w.state, w.now(), w.opts(extra)).filter((a) => a.kind !== "settle"),
+    [
+      { kind: "verifySource", submissionId: "s1", headCommit: "bot-s1" },
+      { kind: "runGates", submissionId: "s2", headCommit: "bot-s2", gates: null },
+    ],
+    "a registered source is checked first; one without goes straight to gates",
+  );
+  await run();
+  const s1 = w.state.submissions.get("s1");
+  assert.ok(s1);
+  assert.deepEqual(sourceOf(s1), { repo: "https://github.com/alice/agent-commons", branch: `agents/${s1.author}/s1`, head: "fork-s1-on-bot-s1" });
+  // The verified source is not a gate result: the gates still run.
+  assert.deepEqual(
+    planActions(w.state, w.now(), w.opts(extra)).filter((a) => "submissionId" in a && a.submissionId === "s1"),
+    [{ kind: "runGates", submissionId: "s1", headCommit: "bot-s1", gates: null }],
+  );
+  for (let i = 0; i < 3; i++) await run();
+  for (const sid of ["s1", "s2"]) {
+    w.approve(sid);
+    w.reviewAll(sid);
+  }
+  await run();
+  assert.equal(w.state.submissions.get("s1")?.merged?.commit, "merge-s1");
+  assert.deepEqual(merges.find((m) => m.head === "fork-s1-on-bot-s1"), { head: "fork-s1-on-bot-s1", opts: { mergeCommit: true } }, "the verified commit, as a merge commit");
+  assert.deepEqual(merges.find((m) => m.head === "bot-s2"), { head: "bot-s2" }, "without a source: the bound head, as before");
+  assert.ok(w.bridgeCalls.includes("merge s1 fork-s1-on-bot-s1"));
+});
+
+test("fork source: a refused source closes the submission before any gate; a source registered after planning holds the merge; a runner cannot forge one", async () => {
+  const w = new World();
+  w.submit("s1");
+  w.submit("s2");
+  const registered = new Set(["s1"]);
+  const extra = { sourceRegistered: (sid: string) => registered.has(sid) };
+  const verdicts = new Map([["s1", { error: "https://github.com/alice/agent-commons agents/x/s1: the branch is at aaa, not the signed headCommit" }]]);
+  const deps = () => ({ ...sourceDeps(w, verdicts), recheck: { clock: () => w.now(), opts: w.opts(extra) } });
+  await executeActions(planActions(w.state, w.now(), w.opts(extra)), deps());
+  const log = await executeActions(planActions(w.state, w.now(), w.opts(extra)), deps());
+  assert.ok(log.some((l) => l.action.kind === "verifySource" && l.ok && /source refused: .*not the signed headCommit/.test(l.detail)), JSON.stringify(log));
+  const s1 = w.state.submissions.get("s1");
+  assert.deepEqual(s1?.gates.filter((g) => g.gate === SOURCE_GATE).map((g) => g.pass), [false]);
+  assert.equal(submissionDead(w.state, "s1"), true);
+  assert.deepEqual(planActions(w.state, w.now(), w.opts(extra)).filter((a) => "submissionId" in a && a.submissionId === "s1"), [], "nothing more for it");
+
+  // s2 gets ready without a source; one registered after the merge was
+  // planned stops the merge under the lock until it is verified.
+  for (let i = 0; i < 4; i++) await executeActions(planActions(w.state, w.now(), w.opts(extra)), deps());
+  w.approve("s2");
+  w.reviewAll("s2");
+  const planned = planActions(w.state, w.now(), w.opts(extra));
+  assert.ok(planned.some((a) => a.kind === "merge" && a.submissionId === "s2"));
+  registered.add("s2");
+  const held = await executeActions(planned, deps());
+  assert.ok(held.some((l) => l.action.kind === "merge" && !l.ok && /fork source is registered but not verified yet/.test(l.detail)), JSON.stringify(held));
+  assert.equal(w.state.submissions.get("s2")?.merged, undefined);
+  assert.deepEqual(planActions(w.state, w.now(), w.opts(extra)).flatMap((a) => (a.kind === "verifySource" ? [a.submissionId] : [])), ["s2"]);
+
+  // A gate runner reporting "source" is ignored, like one reporting the binding.
+  const w2 = new World();
+  w2.submit("s3");
+  await w2.exec(w2.plan());
+  const forged = await executeActions(w2.plan(), {
+    ...w2.deps(),
+    runGates: async () => [
+      { gate: SOURCE_GATE, pass: true, details: JSON.stringify({ repo: "https://github.com/m/x", branch: "b", head: "evil" }) },
+      { gate: "size", pass: true, details: "" },
+    ],
+  });
+  assert.ok(forged[0]?.ok, forged[0]?.detail);
+  assert.equal(sourceOf(w2.state.submissions.get("s3") as never), null);
+  assert.equal(w2.state.submissions.get("s3")?.gates.some((g) => g.gate === SOURCE_GATE), false);
 });

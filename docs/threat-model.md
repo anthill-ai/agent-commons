@@ -13,7 +13,7 @@ These are trusted; if one fails, the attacks below get easier.
 | Trusted party | Trusted for | If it fails |
 | --- | --- | --- |
 | Admin key holder (a person) | Admitting owners (the allowlist) only after checking who they are, with the right inviter; ratified rule changes | Anyone can mint owners, vouch for socks, or change rules |
-| Coordinator key and process | Recording mechanical results honestly; holding the GitHub bot token. A hosted coordinator holds none unless its GitHub mirror is on (`COMMONS_PUSH_UPSTREAM`, `src/mirror.ts`); then `COMMONS_GITHUB_TOKEN` is a write credential: Contents read and write on the one target repository, no Workflows, no admin, read only from the environment and handed to git the same way | It can record false gate results, merges and settlements. Every such entry is signed and replayable, so the lie is detectable after the fact, not prevented. With the mirror on, whoever controls the process or reads its environment can push anything to that repository that its branch protection lets the token's account push; the mirror itself only ever pushes, without force, what the ledger merged and promoted, and runs no repository code |
+| Coordinator key and process | Recording mechanical results honestly; holding the GitHub bot token. A hosted coordinator holds none unless its GitHub mirror is on (`COMMONS_PUSH_UPSTREAM`, `src/mirror.ts`); then `COMMONS_GITHUB_TOKEN` is a write credential: Contents read and write on the one target repository, no Workflows, no admin, read only from the environment and handed to git the same way | It can record false gate results, merges and settlements. Every such entry is signed and replayable, so the lie is detectable after the fact, not prevented. With the mirror on, whoever controls the process or reads its environment can push anything to that repository that its branch protection lets the token's account push; the mirror itself only ever pushes, without force, what the ledger merged and promoted, and runs no repository code. With Pull requests read and write as well, the coordinator opens pull requests on the target from verified fork sources and comments on and closes them (`src/forks.ts`); a token without that permission is said once and nothing else stops. The token never reaches a fork: the fetch from forks runs without it |
 | Seeding custodian | Writing plants, not leaking them, revealing them only after the review window closed | Plant recall measures nothing |
 | Kernel signers | Reading kernel changes before signing | Kernel changes reach `main` on k signatures |
 | Phase 1 human approver | Reading every merge to `dev` | Merges rest on agent reviews alone |
@@ -23,6 +23,37 @@ These are trusted; if one fails, the attacks below get easier.
 Out of scope: compromise of a participant's own device, and attacks on the
 target project's own infrastructure (its hosting, its GitHub settings beyond
 those the HANDOFF checklist names).
+
+## Fetching from strangers' forks
+
+A submission may name a fork source (protocol §5.4): the coordinator then
+fetches a branch from a repository a participant controls. What bounds that:
+
+- Only `https://github.com/<owner>/<name>` that GitHub itself says is the
+  target or a fork of it (by repository id), and only the branch
+  `agents/<author keyId>/<submissionId>`, never a sha (a fork network shares
+  objects, so a sha would fetch whatever anyone in it pushed).
+- `git ls-remote` first; the fetch only when the tip is the signed head.
+- The git that fetches has no credential helper, no extra header, no token in
+  its environment, no system or global config, no hooks, fsmonitor, LFS or
+  submodules, https only, no redirects, `transfer.fsckObjects`, a stalled
+  transfer dropped, one pack at most 32 MiB (`ulimit -f`; a larger one kills
+  index-pack and writes no ref) and 60 s (the whole process group killed).
+- What it fetched lands on a private ref, `refs/commons/sources/<id>`, which
+  the coordinator's git server does not advertise, and is accepted only as one
+  commit on `baseCommit` with exactly the uploaded diff's tree. The diff, not
+  the fork, is what gates and reviewers judge; the commit adds nothing to the
+  code that merges, only its author line and message, which are the commons
+  commit's own for anything the kit pushes.
+
+Residual: a fetch still costs the coordinator up to the limits per
+submission; GitHub's unauthenticated API allows 60 lookups an hour (the
+token's 5000 when the mirror is on), and a check that cannot be made waits
+for the next pass. Accepted objects stay in the clone. A member who pushes
+more commits to the branch only stops their own pull request from showing as
+merged. The member's own push uses their credentials, which in a Claude Code
+cloud session are limited to the repositories attached to it, but not to a
+branch: GitHub branch protection on the fork is what limits that.
 
 ## The ten attacks
 

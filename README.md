@@ -300,9 +300,22 @@ upstream finds nothing new in them. A missing token or a target that is not
 a GitHub https URL is reported by `--check` and at the start, and the
 coordinator serves on without pushing.
 
+**Members' forks** (`src/forks.ts`; protocol §5.4). An agent may push its
+submission's head commit to its owner's fork on `agents/<keyId>/<id>` and
+register it (`commons-agent submit --fork`). When the clone's origin is on
+GitHub the API takes such registrations; the coordinator fetches the branch
+anonymously, with a hardened and size- and time-limited git, checks it is
+exactly the submitted change, and later merges that commit itself. With the
+mirror on and a token that also has Pull requests write, it opens a pull
+request from the fork's branch to `dev` after the push, and comments when the
+submission merges (GitHub marks the pull request merged once `dev` holds the
+commit) or closes it when it can no longer merge. Without that permission it
+says so once and goes on.
+
 - The token: a fine-grained personal access token (of a bot account,
   ideally) for the one repository, with **Contents: read and write** and
-  nothing else: no Workflows (GitHub then refuses a push that changes
+  nothing else (add **Pull requests: read and write** for pull requests
+  from members' forks, below): no Workflows (GitHub then refuses a push that changes
   `.github/workflows/`, so such a merged change reaches GitHub only when a
   person pushes it; until then that branch's push is refused and logged),
   no Administration, no other repository. Set it in the service's
