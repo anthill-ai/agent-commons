@@ -82,6 +82,10 @@
       "ring": 0
     },
     {
+      "glob": "src/mirror.ts",
+      "ring": 0
+    },
+    {
       "glob": "src/cli.ts",
       "ring": 0
     },
@@ -307,6 +311,54 @@
     },
     {
       "glob": "**/*.gypi",
+      "ring": 0
+    },
+    {
+      "glob": "**/CLAUDE.md",
+      "ring": 0
+    },
+    {
+      "glob": "**/CLAUDE.local.md",
+      "ring": 0
+    },
+    {
+      "glob": "**/AGENTS.md",
+      "ring": 0
+    },
+    {
+      "glob": "**/.claude/**",
+      "ring": 0
+    },
+    {
+      "glob": "**/.mcp.json",
+      "ring": 0
+    },
+    {
+      "glob": "**/.codex/**",
+      "ring": 0
+    },
+    {
+      "glob": "**/.cursor/**",
+      "ring": 0
+    },
+    {
+      "glob": "**/.cursorrules",
+      "ring": 0
+    },
+    {
+      "glob": "**/.windsurfrules",
+      "ring": 0
+    },
+    {
+      "glob": "**/.github/copilot-instructions.md",
+      "ring": 0
+    },
+    {
+      "glob": "**/.vscode/**",
+      "ring": 0
+    },
+    {
+      "glob": "**/.idea/**",
       "ring": 0
     }
   ],

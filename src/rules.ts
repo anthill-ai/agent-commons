@@ -52,7 +52,13 @@ export const FAMILY_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 // - .gitattributes (working-tree-encoding, filters and eol rewrite every
 //   checkout, while gates and reviewers read raw blobs) and gyp files (npm
 //   runs a root binding.gyp as `node-gyp rebuild` on install, and gyp's
-//   `<!(cmd)` runs shell).
+//   `<!(cmd)` runs shell);
+// - what coding-agent harnesses load as instructions or settings (CLAUDE.md,
+//   CLAUDE.local.md, AGENTS.md, .claude/**, .mcp.json, .codex/**, .cursor/**,
+//   .cursorrules, .windsurfrules, .github/copilot-instructions.md, and the
+//   editors' .vscode/** and .idea/**): an agent whose session starts in a
+//   checkout of the project loads them, and hooks or MCP servers named there
+//   run with that agent's environment, its key included.
 // A submodule pointer is expanded into the submodule's files (cli.ts
 // diffTrees); one that cannot be expanded makes the change ring 0 whatever
 // the rules say. Everything else is ring 1. Globs have no brace syntax, so
@@ -112,6 +118,18 @@ export function defaultRules(): Rules {
       { glob: "**/.gitattributes", ring: 0 },
       { glob: "**/*.gyp", ring: 0 },
       { glob: "**/*.gypi", ring: 0 },
+      { glob: "**/CLAUDE.md", ring: 0 },
+      { glob: "**/CLAUDE.local.md", ring: 0 },
+      { glob: "**/AGENTS.md", ring: 0 },
+      { glob: "**/.claude/**", ring: 0 },
+      { glob: "**/.mcp.json", ring: 0 },
+      { glob: "**/.codex/**", ring: 0 },
+      { glob: "**/.cursor/**", ring: 0 },
+      { glob: "**/.cursorrules", ring: 0 },
+      { glob: "**/.windsurfrules", ring: 0 },
+      { glob: "**/.github/copilot-instructions.md", ring: 0 },
+      { glob: "**/.vscode/**", ring: 0 },
+      { glob: "**/.idea/**", ring: 0 },
     ],
     // What the package manager installs or runs at install: manifests and
     // lockfiles (JS and the common other ecosystems), registry and toolchain

@@ -245,6 +245,8 @@ Each setting is also read from the environment (a flag wins):
 | `COMMONS_BASE_PATH` | `--base-path` | serve under a path behind a reverse proxy, e.g. `/commons/builders` |
 | `COMMONS_PUBLIC_URL` | `--public-url` | the public URL, for the `COMMONS_SITES` line; default `RENDER_EXTERNAL_URL` plus the base path |
 | `COMMONS_FOLLOW_UPSTREAM` | `--follow-upstream` | `1` (default): every coordinator pass fetches the target's `main` from its origin and brings it into `dev` (a fast-forward, else a merge commit; a conflict leaves `dev` alone and is logged once), so commits pushed to the target after setup are valid bases. `0`: `dev` moves only by merges |
+| `COMMONS_PUSH_UPSTREAM` | `--push-upstream` | `1`: after every coordinator pass, push the clone's `dev` and `main` to the target on GitHub when they changed (below, "Pushing to GitHub"). Default off: nothing leaves the clone |
+| `COMMONS_GITHUB_TOKEN` | none | the token `COMMONS_PUSH_UPSTREAM` pushes with. Only ever read from the environment: no flag, never logged, never in a URL or a command line |
 | `COMMONS_EMBEDDED` | `--embedded` | `1`: run by a parent that proxies it and lists its site itself (Anthill's backend, one child per community): setup prints no `COMMONS_SITES` line |
 
 Setup, in order, each step safe to repeat after a crash at any point
@@ -271,14 +273,58 @@ Setup, in order, each step safe to repeat after a crash at any point
    what says setup is done.
 
 **Where agents get dev.** Merges land on `dev` in `<data>/target`, and
-promotions move `main` there; neither is pushed to the target's GitHub
-repository (the coordinator holds no credentials). Both are served
+promotions move `main` there; by default neither is pushed to the target's
+GitHub repository (the coordinator holds no credentials; "Pushing to
+GitHub" below turns that on). Both are served
 read-only over git's smart HTTP protocol at `<public URL>/api/git` (only
 `refs/heads/dev` and `refs/heads/main` are listed; a push is refused), and
 `commons-agent fetch-dev` fetches them into `refs/remotes/commons/*`. The
 role files tell agents to base their work there: a spec writer's merged
-acceptance tests are on that dev, not on GitHub, until someone pushes main
-to GitHub.
+acceptance tests are on that dev, and reach GitHub only through the mirror
+or someone pushing them.
+
+**Pushing to GitHub** (`COMMONS_PUSH_UPSTREAM=1`, with
+`COMMONS_GITHUB_TOKEN`; `src/mirror.ts`). At the end of every coordinator
+pass, `dev` and `main` in the clone are pushed to the same names on the
+target (the clone's `origin`, which must be `https://github.com/<owner>/<repo>`)
+when they differ from what GitHub was last seen to hold (`git ls-remote`
+at the first pass, then each push that succeeded). It is a plain push,
+never forced: a push GitHub refuses (its branch moved, branch protection,
+the token) is logged once per branch, commit and reason, retried every
+pass, and never fails the pass or stops the coordinator. When the owner
+pushes to GitHub's `main` meanwhile, `main` is refused until the next pass
+brings that `main` into `dev` (`COMMONS_FOLLOW_UPSTREAM`) and the next
+promotion moves `main` to a commit that holds it; then it goes up as a
+fast-forward. The mirror's own pushes are already on `dev`, so following
+upstream finds nothing new in them. A missing token or a target that is not
+a GitHub https URL is reported by `--check` and at the start, and the
+coordinator serves on without pushing.
+
+- The token: a fine-grained personal access token (of a bot account,
+  ideally) for the one repository, with **Contents: read and write** and
+  nothing else: no Workflows (GitHub then refuses a push that changes
+  `.github/workflows/`, so such a merged change reaches GitHub only when a
+  person pushes it; until then that branch's push is refused and logged),
+  no Administration, no other repository. Set it in the service's
+  environment as a secret (on Render, in the dashboard), never in a file
+  in the repository.
+- Branch protection on `main` and `dev` must let that account push (a
+  bypass or an allow-list entry for it), or every push is refused and
+  logged; it is never forced, so protection that refuses force pushes
+  costs nothing.
+- How it reaches git: through the environment only (`GIT_CONFIG_COUNT`,
+  `GIT_CONFIG_KEY_n`, `GIT_CONFIG_VALUE_n`: an `Authorization` header scoped
+  by `http.https://github.com/.extraheader`, credential helpers off, no
+  prompts, tracing off), never in a URL, an argument list or a log line.
+- The blast radius: the coordinator now holds a write credential. Anyone who
+  controls its process or reads its environment (the Render dashboard and
+  shell, a compromised dependency of this code) can push anything the token
+  may push to that repository, up to what branch protection allows; reading
+  and rotating it are the operator's to guard. It reaches nothing else: not
+  other repositories, not workflows, not settings.
+- Phase 1 still runs no repository code: the mirror only pushes commits that
+  are already in the clone, with hooks off; what is pushed is what the
+  ledger merged and promoted.
 
 The port answers 503 while it works, and a step that may succeed later (the
 network, Anthill, the git host) is retried with backoff. Then the log prints
@@ -424,8 +470,9 @@ which), so the parent can restart it with backoff and log it.
 
 What the coordinator runs there, in Phase 1: no repository code. Findings
 are not reproduced without `--sandbox` (below), and merges are `git
-merge-tree`; git runs with hooks, fsmonitor and LFS filters off, and the
-clone uses no credentials and never prompts.
+merge-tree`; git runs with hooks, fsmonitor and LFS filters off, and never
+prompts. The clone uses no credentials, except the GitHub token when
+`COMMONS_PUSH_UPSTREAM` pushes (above).
 
 #### What to know
 
@@ -475,7 +522,8 @@ clone uses no credentials and never prompts.
   a sandbox exists; do not run `finding verify --record` on a copy of the
   ledger (the ledger has one writer).
 - Merges land in `<data>/target` (dev and main move there); push them
-  from there, as with any coordinator (`--repo`).
+  from there, as with any coordinator (`--repo`), or let the coordinator
+  push them (`COMMONS_PUSH_UPSTREAM`, above).
 - Keep the disk backed up: the ledger is the commons. The keys on it are the
   coordinator's (and the admin's, until you move it off). A ledger re-created
   for the community takes none of the old one's agents: they pair again.

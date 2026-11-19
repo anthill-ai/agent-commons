@@ -116,6 +116,14 @@ test("agent-commons' own .commons/rules.json: valid, and its kernel is ring 0", 
     "render.yaml",
     "tsconfig.json",
     ".commons/rules.json",
+    "src/mirror.ts",
+    // What a coding agent's session loads from a checkout of this repository.
+    "CLAUDE.md",
+    "AGENTS.md",
+    ".claude/settings.json",
+    ".mcp.json",
+    "agent-kit/.codex/config.toml",
+    ".vscode/settings.json",
   ]) {
     assert.equal(ringOf(f, rules), 0, f);
   }
@@ -378,6 +386,18 @@ test("host: without its settings it says which are missing; --hold-on-failure an
   assert.equal(await main(["host", "--data", data, "--check"], { ...io, env: { ...io.env, COMMONS_TARGET_REPO: "http://x/y", COMMONS_KERNEL_SIGNERS: SIGNER } }), 2);
   assert.match(err, /must be an https URL/);
   assert.equal(await main(["host", "--data", data, "--check"], { ...io, env: { ...io.env, COMMONS_TARGET_REPO: "https://x.example/y", COMMONS_KERNEL_SIGNERS: SIGNER } }), 0);
+  // The GitHub mirror on, with what it cannot use: said, and no reason not to start.
+  err = "";
+  const settings = { ...io.env, COMMONS_TARGET_REPO: "https://github.com/o/r", COMMONS_KERNEL_SIGNERS: SIGNER, COMMONS_PUSH_UPSTREAM: "1" };
+  assert.equal(await main(["host", "--data", data, "--check"], { ...io, env: settings }), 0);
+  assert.match(err, /warning: COMMONS_PUSH_UPSTREAM \(--push-upstream\) is on, but COMMONS_GITHUB_TOKEN is not set: the coordinator serves without pushing to GitHub/);
+  err = "";
+  assert.equal(await main(["host", "--data", data, "--check"], { ...io, env: { ...settings, COMMONS_TARGET_REPO: "https://x.example/y", COMMONS_GITHUB_TOKEN: "t0ken" } }), 0);
+  assert.match(err, /is on, but the target "https:\/\/x\.example\/y" is not an https:\/\/github\.com\/<owner>\/<repo> URL/);
+  assert.ok(!err.includes("t0ken"));
+  err = "";
+  assert.equal(await main(["host", "--data", data, "--check"], { ...io, env: { ...settings, COMMONS_GITHUB_TOKEN: "t0ken" } }), 0);
+  assert.doesNotMatch(err, /PUSH_UPSTREAM/);
 
   const port = await freePort();
   let stop = () => {};
@@ -389,6 +409,49 @@ test("host: without its settings it says which are missing; --hold-on-failure an
   stop();
   assert.equal(await done, 2);
   assert.ok(!fs.existsSync(path.join(data, "commons-ledger.jsonl")));
+});
+
+test("host: COMMONS_PUSH_UPSTREAM=1 pushes the clone's dev to the target after a pass, with the token from the environment only", { timeout: 60_000 }, async () => {
+  const dir = tmp();
+  const anthill = await fakeAnthill();
+  try {
+    const target = bareTarget(dir);
+    const bare = target.replace(/^file:\/\//, "");
+    const data = path.join(dir, "data");
+    const token = "github_pat_HOSTTEST0123456789";
+    const running = await host(data, anthill.url, target, ["--loop-seconds", "1"], { COMMONS_PRESET: "solo", COMMONS_PUSH_UPSTREAM: "1", COMMONS_GITHUB_TOKEN: token });
+    try {
+      await until200(running.port, "/commons/builders/api/head", running.err);
+      assert.match(running.err(), /every pass pushes dev and main to the target on GitHub when they changed \(COMMONS_PUSH_UPSTREAM \(--push-upstream\)\)/);
+      const end = Date.now() + 30_000;
+      const devOnTarget = () => {
+        try {
+          return git(bare, "rev-parse", "--verify", "refs/heads/dev");
+        } catch {
+          return null;
+        }
+      };
+      while (devOnTarget() === null) {
+        assert.ok(Date.now() < end, running.err());
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      assert.equal(devOnTarget(), git(path.join(data, "target"), "rev-parse", "dev"));
+      assert.ok(!running.err().includes(token));
+    } finally {
+      assert.equal(await running.stop(), 0);
+    }
+    // Without the token: said at the start, and it serves on.
+    const off = await host(data, anthill.url, target, ["--loop-seconds", "1"], { COMMONS_PUSH_UPSTREAM: "1" });
+    try {
+      await until200(off.port, "/commons/builders/api/head", off.err);
+      assert.match(off.err(), /COMMONS_PUSH_UPSTREAM \(--push-upstream\) is on, but COMMONS_GITHUB_TOKEN is not set: the coordinator serves without pushing/);
+      assert.doesNotMatch(off.err(), /every pass pushes/);
+    } finally {
+      assert.equal(await off.stop(), 0);
+    }
+  } finally {
+    await anthill.close();
+  }
 });
 
 // --- solo --------------------------------------------------------------------

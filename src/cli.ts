@@ -82,7 +82,8 @@ import { canonical, generateKeyPair, isValidPublicKey, keyIdOf, randomSalt, sha2
 import { HARNESS_DIR_PREFIX, minimalEnv, reproduceFinding } from "./findings";
 import { normaliseBasePath } from "./basePath";
 import { followUpstream } from "./gitHost";
-import { HOST_SETTINGS, hostLayout, missingForServe, readHostSettings, settingName, SetupError, setUp } from "./host";
+import { githubMirror, GITHUB_TOKEN_ENV, type Mirror, pushUpstreamProblems } from "./mirror";
+import { cloneOrigin, HOST_SETTINGS, hostLayout, missingForServe, readHostSettings, settingName, SetupError, setUp } from "./host";
 import { applyUnifiedDiff, checkRepoPath, FULL_SHA, parsePatch } from "./github";
 import {
   DEFAULT_MAX_SKEW_MS,
@@ -1343,7 +1344,8 @@ const noBridge: GithubBridge = {
 // bound head (refused on conflicts); fastForwardMain() moves `mainRef`, only
 // forward. Both are idempotent: a head already on dev returns dev's tip, a main
 // already at or past the commit is left alone. The operator pushes dev and
-// main from this clone, or agents fetch them from it (serve --serve-git). Refs move with compare-and-swap (update-ref old new),
+// main from this clone (or --push-upstream does, mirror.ts), and agents fetch
+// them from it (serve --serve-git). Refs move with compare-and-swap (update-ref old new),
 // so a concurrent writer makes the call fail instead of losing a commit.
 export function localGitBridge(repo: string, devRef: string = DEFAULT_DEV_REF, mainRef = "refs/heads/main"): GithubBridge {
   const g = (args: string[], env: Record<string, string> = {}) => rawGit(repo, args, { env }).toString("utf8").trim();
@@ -1451,6 +1453,10 @@ const COORDINATOR_FLAGS: Record<string, FlagSpec> = {
   "follow-upstream": {
     type: "boolean",
     help: "each pass first fetches --repo's origin main and brings it into dev (a fast-forward, else a merge commit; a conflict leaves dev alone), so commits pushed upstream after setup are valid bases",
+  },
+  "push-upstream": {
+    type: "boolean",
+    help: `after each pass, push --repo's dev and main to its origin on GitHub when they changed (a plain push, never forced; a refusal is logged once and retried); the token comes only from env ${GITHUB_TOKEN_ENV}`,
   },
   "timeout-ms": { type: "string", help: "per finding-test run (default the harness's)" },
   "snapshot-every": { type: "string", help: "merged submissions that trigger a snapshot (default: never)" },
@@ -1681,9 +1687,51 @@ const IDLE_LINE_EVERY_MS = 10 * 60_000;
 // The last upstream problem said for each clone (coordinatorPass).
 const upstreamSaid = new Map<string, string>();
 
+// The GitHub mirror of each opened ledger (--push-upstream), made on its
+// first pass so it remembers across passes what GitHub holds and what it
+// said. null: off, and why was said once.
+const mirrors = new WeakMap<LedgerStore, Mirror | null>();
+
+function mirrorOf(ctx: Ctx, store: LedgerStore, repo: string): Mirror | null {
+  const made = mirrors.get(store);
+  if (made !== undefined) return made;
+  const env = ctx.io.env ?? process.env;
+  const origin = spawnSync("git", [...GIT_SAFE, "config", "--get", "remote.origin.url"], { cwd: repo, encoding: "utf8" });
+  const url = origin.status === 0 ? origin.stdout.trim() : undefined;
+  const problems = pushUpstreamProblems(url, env, env.COMMONS_TEST_ALLOW_FILE_TARGET === "1");
+  const refs = [devRefOf(ctx), str(ctx.flags, "main-ref") ?? "refs/heads/main"];
+  let mirror: Mirror | null = null;
+  if (problems.length > 0) {
+    ctx.io.stderr(`mirror: --push-upstream is on, but ${problems.join("; ")}: nothing is pushed to GitHub; the coordinator serves on\n`);
+  } else {
+    // The token is read here, from the environment only, and handed to git the same way (mirror.ts).
+    mirror = githubMirror({ repo, url: url as string, token: (env[GITHUB_TOKEN_ENV] as string).trim(), refs });
+    ctx.out(`mirror: after every pass, ${refs.map((r) => r.replace("refs/heads/", "")).join(" and ")} are pushed to ${url} when they changed (never forced)`);
+  }
+  mirrors.set(store, mirror);
+  return mirror;
+}
+
 // idleLine: what a pass that did nothing prints, null for nothing (run-once
-// always says "nothing to do").
+// always says "nothing to do"). With --push-upstream, the mirror runs at the
+// end of every pass, also one that failed: dev or main may have moved before
+// the failure.
 async function coordinatorPass(ctx: Ctx, store: LedgerStore, idleLine: () => string | null = () => "nothing to do"): Promise<number> {
+  if (!bool(ctx.flags, "push-upstream")) return passActions(ctx, store, idleLine);
+  if (str(ctx.flags, "repo") === undefined) usage("--push-upstream needs --repo");
+  const mirror = mirrorOf(ctx, store, resolvePath(ctx, req(ctx.flags, "repo")));
+  try {
+    return await passActions(ctx, store, idleLine);
+  } finally {
+    if (mirror !== null) {
+      const r = await mirror.pass();
+      for (const p of r.pushed) ctx.out(`mirror: pushed ${p.ref.replace("refs/heads/", "")} ${p.sha.slice(0, 12)} to GitHub`);
+      for (const line of r.problems) ctx.io.stderr(`mirror: ${line}\n`);
+    }
+  }
+}
+
+async function passActions(ctx: Ctx, store: LedgerStore, idleLine: () => string | null): Promise<number> {
   const f = ctx.flags;
   const anthillUrl = str(f, "anthill-url");
   if (anthillUrl !== undefined) {
@@ -2922,6 +2970,7 @@ const COMMANDS: Record<string, Command> = {
       if (onePort && !bool(f, "coordinator")) usage("--one-port needs --coordinator: without it the playground already has the port to itself");
       if (onePort && str(f, "api-port") !== undefined) usage("--one-port serves the API on --port; drop --api-port");
       if (bool(f, "serve-git") && (!bool(f, "coordinator") || str(f, "repo") === undefined)) usage("--serve-git needs --coordinator and --repo");
+      if (bool(f, "push-upstream") && (!bool(f, "coordinator") || str(f, "repo") === undefined)) usage("--push-upstream needs --coordinator and --repo");
       try {
         proxyMatcher(list(f, "trusted-proxy"));
       } catch (e) {
@@ -2965,6 +3014,8 @@ const COMMANDS: Record<string, Command> = {
           ),
         );
         servers.push(api);
+        // Said at the start, not at the first pass: whether merged work reaches GitHub.
+        if (bool(f, "push-upstream")) mirrorOf(ctx, store, resolvePath(ctx, req(f, "repo")));
         const every = int(f, "loop-seconds", { min: 1 });
         if (every !== undefined) {
           let running = false;
@@ -3022,6 +3073,10 @@ const COMMANDS: Record<string, Command> = {
       "follow-upstream": {
         type: "string",
         help: "1 (default): every pass fetches the target's main and brings it into dev, so commits pushed upstream after setup are valid bases; 0: dev moves only by merges (env COMMONS_FOLLOW_UPSTREAM)",
+      },
+      "push-upstream": {
+        type: "boolean",
+        help: `after every pass, push the clone's dev and main to the target on GitHub when they changed (never forced), with the token in env ${GITHUB_TOKEN_ENV} (env COMMONS_PUSH_UPSTREAM=1)`,
       },
       "loop-seconds": { type: "string", help: "a coordinator pass this often (default 30)" },
       "setup-retry-seconds": { type: "string", help: "first wait before retrying a setup step that may succeed later (network, Anthill, git host); doubles up to 600 (default 60)" },
@@ -3093,7 +3148,22 @@ const COMMANDS: Record<string, Command> = {
         return 2;
       };
 
+      // The GitHub mirror: on or off for the whole run. A token or target it
+      // cannot use is said (at --check too) and the coordinator serves on
+      // without pushing: the mirror is never a reason not to start.
+      const allowFileTarget = bool(f, "test-allow-file-target") || env.COMMONS_TEST_ALLOW_FILE_TARGET === "1";
+      const pushSetting = bool(f, "push-upstream") ? "1" : (env[HOST_SETTINGS.pushUpstream.env] ?? "").trim();
+      const pushProblems = () => {
+        if (pushSetting === "" || pushSetting === "0") return [];
+        if (pushSetting !== "1") return [`${settingName("pushUpstream")} must be 0 or 1, not ${JSON.stringify(pushSetting.slice(0, 20))}`];
+        const url = cloneOrigin(layout.target) ?? pick("targetRepo")?.trim();
+        return pushUpstreamProblems(url, env, allowFileTarget).map((p) => `${settingName("pushUpstream")} is on, but ${p}`);
+      };
+      const pushNote = (problems: string[]) => `warning: ${problems.join("; ")}: the coordinator serves without pushing to GitHub`;
+
       if (bool(f, "check")) {
+        const push = pushProblems();
+        if (push.length > 0) say(pushNote(push));
         if (!fresh) return 0;
         if (read.missing.length > 0) say(`no ledger yet, and setup needs ${read.missing.join(", ")}`);
         for (const p of read.problems) say(p);
@@ -3245,9 +3315,13 @@ const COMMANDS: Record<string, Command> = {
         return fail("This commons cannot start; the operator has the details in the logs.");
       }
       const follow = followSetting === "1";
+      const pushOff = pushProblems();
+      if (pushOff.length > 0) say(pushNote(pushOff));
+      const push = pushSetting === "1" && pushOff.length === 0;
       say(
         `git: dev and main are served read-only at ${basePath}/api/git (git fetch <this site>/api/git dev); ` +
-          (follow ? "every pass brings the target's upstream main into dev" : `dev moves only by merges (${settingName("followUpstream")} 0)`),
+          (follow ? "every pass brings the target's upstream main into dev" : `dev moves only by merges (${settingName("followUpstream")} 0)`) +
+          (push ? `; every pass pushes dev and main to the target on GitHub when they changed (${settingName("pushUpstream")})` : ""),
       );
       say(`snapshots: ${snapshotEvery === null ? "never (nothing is promoted; set " + settingName("snapshotEvery") + ")" : `every ${snapshotEvery} merged submission${snapshotEvery === 1 ? "" : "s"}`}; approved tasks: ${layout.approvedTasks}${fs.existsSync(layout.approvedTasks) ? "" : " (absent: none)"}`);
       const serveArgv = [
@@ -3264,11 +3338,14 @@ const COMMANDS: Record<string, Command> = {
         "--approved-tasks", layout.approvedTasks,
         "--serve-git",
         ...(follow ? ["--follow-upstream"] : []),
+        ...(push ? ["--push-upstream"] : []),
         ...(snapshotEvery === null ? [] : ["--snapshot-every", String(snapshotEvery)]),
         ...(basePath === "" ? [] : ["--base-path", basePath]),
         ...list(f, "trusted-proxy").flatMap((p) => ["--trusted-proxy", p]),
       ];
-      const code = await main(serveArgv, ctx.io);
+      // serve reads the test allowance from the environment (it has no flag for it).
+      const serveIo = allowFileTarget ? { ...ctx.io, env: { ...env, COMMONS_TEST_ALLOW_FILE_TARGET: "1" } } : ctx.io;
+      const code = await main(serveArgv, serveIo);
       if (code === 0 || stopped) return code;
       say(`serve failed at startup (exit ${code}; its error is above)${bool(f, "hold-on-failure") ? ". The port answers 503 until this is fixed and the process restarted:" : ":"}`);
       say(`  a torn ledger (an interrupted write): npx tsx src/cli.ts ledger repair --ledger ${layout.ledger}`);

@@ -110,6 +110,11 @@ export const HOST_SETTINGS = {
   // repository's owner pushes after setup are valid bases. "0": dev moves
   // only by merges.
   followUpstream: { flag: "follow-upstream", env: "COMMONS_FOLLOW_UPSTREAM" },
+  // "1": after every pass, push the clone's dev and main to the target on
+  // GitHub (serve --push-upstream; mirror.ts), with the token from
+  // COMMONS_GITHUB_TOKEN, which is never a flag. Unset or "0": nothing leaves
+  // the clone.
+  pushUpstream: { flag: "push-upstream", env: "COMMONS_PUSH_UPSTREAM" },
 } as const;
 
 export const settingName = (k: keyof typeof HOST_SETTINGS) => `${HOST_SETTINGS[k].env} (--${HOST_SETTINGS[k].flag})`;
@@ -511,6 +516,13 @@ export async function setUp(l: HostLayout, s: HostSettings, deps: SetupDeps): Pr
 
 export function sitesValue(s: Pick<HostSettings, "community" | "targetRepo">, url: string): string {
   return JSON.stringify({ [s.community]: { coordinator: url, site: url, repo: s.targetRepo } });
+}
+
+// The clone's origin URL (what the mirror pushes to), or undefined without a clone.
+export function cloneOrigin(target: string): string | undefined {
+  if (!exists(path.join(target, ".git"))) return undefined;
+  const r = git(target, ["config", "--get", "remote.origin.url"]);
+  return r.ok && r.out !== "" ? r.out : undefined;
 }
 
 // What a ledger made earlier still needs before it can be served.

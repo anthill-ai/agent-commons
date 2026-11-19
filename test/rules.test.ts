@@ -343,6 +343,48 @@ test("default rings put build, deploy and toolchain config in ring 0", () => {
   assert.equal(ringOf("web/src/main.tsx", r), 1);
 });
 
+test("default rings put what coding-agent harnesses load (instructions, settings, hooks, MCP servers) in ring 0, at any depth", () => {
+  const r = defaultRules();
+  for (const p of [
+    "CLAUDE.md",
+    "web/CLAUDE.md",
+    "CLAUDE.local.md",
+    "server/CLAUDE.local.md",
+    "AGENTS.md",
+    "packages/api/AGENTS.md",
+    ".claude/settings.json",
+    ".claude/hooks/pre-tool.sh",
+    ".claude/commands/review.md",
+    "web/.claude/settings.local.json",
+    ".mcp.json",
+    "server/.mcp.json",
+    ".codex/config.toml",
+    "web/.codex/prompts/x.md",
+    ".cursor/rules/style.mdc",
+    "web/.cursor/mcp.json",
+    ".cursorrules",
+    "web/.cursorrules",
+    ".windsurfrules",
+    "web/.windsurfrules",
+    ".github/copilot-instructions.md",
+    "web/.github/copilot-instructions.md",
+    ".vscode/settings.json",
+    ".vscode/tasks.json",
+    "web/.vscode/launch.json",
+    ".idea/workspace.xml",
+    "server/.idea/runConfigurations/x.xml",
+    // Matched ignoring case, as every glob is (a case-insensitive checkout).
+    "claude.md",
+    "Agents.md",
+  ]) {
+    assert.equal(ringOf(p, r), 0, p);
+  }
+  // Near misses stay ring 1.
+  for (const p of ["docs/CLAUDE.md.txt", "docs/claude-notes.md", "AGENTS.markdown", "src/claude/client.ts", "mcp.json", "docs/vscode.md", "web/idea/x.ts", "README.md"]) {
+    assert.equal(ringOf(p, r), 1, p);
+  }
+});
+
 test("default locked paths cover registry and toolchain overrides", () => {
   const locked = defaultRules().lockedPaths.map(globToRegExp);
   for (const p of [".npmrc", "server/.npmrc", "web/.yarnrc.yml", ".yarnrc", "server/.nvmrc"]) {
